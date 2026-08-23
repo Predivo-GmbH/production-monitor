@@ -30,8 +30,20 @@ jobs:
           # this fleet already uses: the Metanet cert is issued for tertia.sui-inter.net,
           # not for the FTP_HOST value, so verification fails with curl exit 60. The
           # control channel is still TLS; only name verification is skipped.
-          OUT=$(curl -sS --ssl-reqd --insecure --max-time 30 --user "$FTP_USER:$FTP_PASS" "ftp://$FTP_HOST/" 2>&1)
-          RC=$?
+          # One slow answer from a busy FTP server is not a bad password. Retry the
+          # transport, never the credential: curl 67 ("Access denied: 530") is final,
+          # because a wrong password does not become right on attempt two. Added after
+          # 15 simultaneous fleet deploys made this step time out at 30s (curl 28).
+          n=0
+          while :; do
+            OUT=$(curl -sS --ssl-reqd --insecure --connect-timeout 20 --max-time 90 --user "$FTP_USER:$FTP_PASS" "ftp://$FTP_HOST/" 2>&1)
+            RC=$?
+            if [ "$RC" -eq 0 ] || [ "$RC" -eq 67 ]; then break; fi
+            n=$((n+1))
+            if [ "$n" -ge 3 ]; then break; fi
+            echo "FTP pre-flight attempt $n failed (curl exit $RC) - retrying in $((n*10))s"
+            sleep $((n*10))
+          done
           set -e
           if [ "$RC" -eq 67 ]; then
             echo "::error::FTP login denied (530) for $FTP_USER@$FTP_HOST - the FTP password secret is stale. Nothing was deployed."
@@ -97,8 +109,20 @@ jobs:
           # this fleet already uses: the Metanet cert is issued for tertia.sui-inter.net,
           # not for the FTP_HOST value, so verification fails with curl exit 60. The
           # control channel is still TLS; only name verification is skipped.
-          OUT=$(curl -sS --ssl-reqd --insecure --max-time 30 --user "$FTP_USER:$FTP_PASS" "ftp://$FTP_HOST/" 2>&1)
-          RC=$?
+          # One slow answer from a busy FTP server is not a bad password. Retry the
+          # transport, never the credential: curl 67 ("Access denied: 530") is final,
+          # because a wrong password does not become right on attempt two. Added after
+          # 15 simultaneous fleet deploys made this step time out at 30s (curl 28).
+          n=0
+          while :; do
+            OUT=$(curl -sS --ssl-reqd --insecure --connect-timeout 20 --max-time 90 --user "$FTP_USER:$FTP_PASS" "ftp://$FTP_HOST/" 2>&1)
+            RC=$?
+            if [ "$RC" -eq 0 ] || [ "$RC" -eq 67 ]; then break; fi
+            n=$((n+1))
+            if [ "$n" -ge 3 ]; then break; fi
+            echo "FTP pre-flight attempt $n failed (curl exit $RC) - retrying in $((n*10))s"
+            sleep $((n*10))
+          done
           set -e
           if [ "$RC" -eq 67 ]; then
             echo "::error::FTP login denied (530) for $FTP_USER@$FTP_HOST - the FTP password secret is stale. Nothing was deployed."
