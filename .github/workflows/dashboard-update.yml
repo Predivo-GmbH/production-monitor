@@ -12,6 +12,38 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      - name: Verify FTP credentials (fail fast on a stale secret)
+        # A stale FTP secret used to surface late and confusingly. The site-id guard
+        # tests `[ -n "$REMOTE_ID" ]`, and a 530 leaves REMOTE_ID empty - so the guard
+        # printed "guard passed (remote='')" at the exact moment auth broke, and the run
+        # only failed later inside the mirror, after up to 4 retries. This logs in once,
+        # up front, and names the failure. curl exit 67 == FTP login denied; curl needs
+        # no lftp, so this can run before checkout. (Added 2026-08-23 after the whole
+        # fleet's FTP_PASS went stale at once.)
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASS: ${{ secrets.FTP_PASS }}
+        run: |
+          set +e
+          # --insecure mirrors `set ssl:verify-certificate no`, which every lftp call in
+          # this fleet already uses: the Metanet cert is issued for tertia.sui-inter.net,
+          # not for the FTP_HOST value, so verification fails with curl exit 60. The
+          # control channel is still TLS; only name verification is skipped.
+          OUT=$(curl -sS --ssl-reqd --insecure --max-time 30 --user "$FTP_USER:$FTP_PASS" "ftp://$FTP_HOST/" 2>&1)
+          RC=$?
+          set -e
+          if [ "$RC" -eq 67 ]; then
+            echo "::error::FTP login denied (530) for $FTP_USER@$FTP_HOST - the FTP password secret is stale. Nothing was deployed."
+            exit 1
+          fi
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::FTP connection failed (curl exit $RC) for $FTP_USER@$FTP_HOST. Nothing was deployed."
+            printf '%s\n' "$OUT" | head -5
+            exit 1
+          fi
+          echo "FTP auth OK - $(printf '%s\n' "$OUT" | grep -c '') entries at the account root."
+
       - uses: actions/checkout@v5
 
       - uses: actions/setup-node@v5
@@ -47,6 +79,38 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Verify FTP credentials (fail fast on a stale secret)
+        # A stale FTP secret used to surface late and confusingly. The site-id guard
+        # tests `[ -n "$REMOTE_ID" ]`, and a 530 leaves REMOTE_ID empty - so the guard
+        # printed "guard passed (remote='')" at the exact moment auth broke, and the run
+        # only failed later inside the mirror, after up to 4 retries. This logs in once,
+        # up front, and names the failure. curl exit 67 == FTP login denied; curl needs
+        # no lftp, so this can run before checkout. (Added 2026-08-23 after the whole
+        # fleet's FTP_PASS went stale at once.)
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASS: ${{ secrets.FTP_PASS }}
+        run: |
+          set +e
+          # --insecure mirrors `set ssl:verify-certificate no`, which every lftp call in
+          # this fleet already uses: the Metanet cert is issued for tertia.sui-inter.net,
+          # not for the FTP_HOST value, so verification fails with curl exit 60. The
+          # control channel is still TLS; only name verification is skipped.
+          OUT=$(curl -sS --ssl-reqd --insecure --max-time 30 --user "$FTP_USER:$FTP_PASS" "ftp://$FTP_HOST/" 2>&1)
+          RC=$?
+          set -e
+          if [ "$RC" -eq 67 ]; then
+            echo "::error::FTP login denied (530) for $FTP_USER@$FTP_HOST - the FTP password secret is stale. Nothing was deployed."
+            exit 1
+          fi
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::FTP connection failed (curl exit $RC) for $FTP_USER@$FTP_HOST. Nothing was deployed."
+            printf '%s\n' "$OUT" | head -5
+            exit 1
+          fi
+          echo "FTP auth OK - $(printf '%s\n' "$OUT" | grep -c '') entries at the account root."
+
       - uses: actions/checkout@v5
 
       - uses: actions/setup-node@v5
