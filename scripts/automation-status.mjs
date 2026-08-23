@@ -182,7 +182,11 @@ if (FTP_HOST && FTP_USER && FTP_PASS) {
     )
     console.log('FTP upload complete (automation-status.json).')
   } catch (e) {
-    console.error('FTP upload failed:', e.message)
+    // Was: log and carry on, which left the job green while the published
+    // automation-status.json silently went stale. A failed publish IS a failure.
+    // (2026-08-23)
+    console.error('::error::FTP upload of automation-status.json failed:', e.message)
+    process.exitCode = 1
   }
 } else {
   console.log('FTP creds not set — skipping upload.')

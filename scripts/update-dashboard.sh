@@ -220,8 +220,25 @@ if [ -n "${FTP_HOST:-}" ] && [ -n "${FTP_USER:-}" ] && [ -n "${FTP_PASS:-}" ]; t
   echo "Deploying to backoffice.predivo.ch via FTP..."
   echo "$UPDATED_DATA" | jq '.' > /tmp/data.json
   echo "$CHANGELOG" | jq '.' > /tmp/changelog.json
-  curl -s -T /tmp/data.json "ftp://${FTP_USER}:${FTP_PASS}@${FTP_HOST}/backoffice.predivo.ch/project-data.json"
-  curl -s -T /tmp/changelog.json "ftp://${FTP_USER}:${FTP_PASS}@${FTP_HOST}/backoffice.predivo.ch/project-changelog.json"
+  # `curl -s` alone swallowed the outcome: a 530 printed nothing, the script carried
+  # on and still said "FTP upload complete", so a stale credential would silently
+  # freeze the dashboard while the workflow stayed green. Check every upload.
+  # (2026-08-23)
+  upload() {
+    curl -sS --ssl-reqd --insecure --max-time 120 -T "$1" "ftp://${FTP_USER}:${FTP_PASS}@${FTP_HOST}/backoffice.predivo.ch/$2"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      if [ "$rc" -eq 67 ]; then
+        echo "::error::FTP login denied (530) uploading $2 - the FTP_PASS secret is stale."
+      else
+        echo "::error::FTP upload of $2 failed (curl exit $rc). The dashboard was NOT updated."
+      fi
+      return 1
+    fi
+    echo "  uploaded $2"
+  }
+  upload /tmp/data.json project-data.json || exit 1
+  upload /tmp/changelog.json project-changelog.json || exit 1
   echo "FTP upload complete."
   rm -f /tmp/data.json /tmp/changelog.json
 fi
