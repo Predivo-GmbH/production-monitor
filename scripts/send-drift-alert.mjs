@@ -8,7 +8,7 @@
 // crash before a payload was written), it sends a generic "workflow failed — open the logs"
 // alert rather than going silent. Modeled on send-automation-alert.mjs / send-alert.mjs.
 
-import { createTransport } from 'nodemailer'
+import { createMailTransport } from './lib/smtp.mjs'
 import { readFileSync, existsSync } from 'node:fs'
 
 const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, ALERT_EMAIL, GITHUB_RUN_URL } = process.env
@@ -93,12 +93,11 @@ if (process.env.DRIFT_ALERT_DRYRUN) {
   process.exit(0)
 }
 
-const transporter = createTransport({
+const transporter = await createMailTransport({
   host: SMTP_HOST,
-  port: parseInt(SMTP_PORT || '465'),
-  secure: true,
-  family: 4, // force IPv4: SMTP host resolves to an IPv6 addr unreachable from GH runners (ENETUNREACH)
-  auth: { user: SMTP_USER, pass: SMTP_PASS },
+  port: SMTP_PORT,
+  user: SMTP_USER,
+  pass: SMTP_PASS,
 })
 
 await transporter.sendMail({

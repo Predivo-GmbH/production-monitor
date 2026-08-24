@@ -2,7 +2,7 @@
 // been red longer than the escalation threshold. Reads /tmp/automation-escalations.json
 // produced by automation-status.mjs. Modeled on send-alert.mjs.
 
-import { createTransport } from 'nodemailer'
+import { createMailTransport } from './lib/smtp.mjs'
 import { readFileSync, existsSync } from 'node:fs'
 
 const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, ALERT_EMAIL } = process.env
@@ -63,12 +63,11 @@ const html = `
   </div>
 `
 
-const transporter = createTransport({
+const transporter = await createMailTransport({
   host: SMTP_HOST,
-  port: parseInt(SMTP_PORT || '465'),
-  secure: true,
-  family: 4, // force IPv4: SMTP host resolves to an IPv6 addr unreachable from GH runners (ENETUNREACH)
-  auth: { user: SMTP_USER, pass: SMTP_PASS },
+  port: SMTP_PORT,
+  user: SMTP_USER,
+  pass: SMTP_PASS,
 })
 
 await transporter.sendMail({

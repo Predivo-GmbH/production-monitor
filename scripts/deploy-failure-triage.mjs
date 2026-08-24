@@ -382,8 +382,8 @@ async function sendTriageEmail(items) {
     log(`  (email skipped — SMTP/ALERT_EMAIL not configured; ${items.length} item(s) in deploy-triage.log)`)
     return
   }
-  let createTransport
-  try { ({ createTransport } = await import('nodemailer')) }
+  let createMailTransport
+  try { ({ createMailTransport } = await import('./lib/smtp.mjs')) }
   catch { log('  (email skipped — nodemailer not available)'); return }
 
   const esc = (s) => String(s ?? '').replace(/[<>&]/g, (m) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[m]))
@@ -415,9 +415,8 @@ async function sendTriageEmail(items) {
       </div>
     </div>`
   try {
-    const transporter = createTransport({
-      host: SMTP_HOST, port: parseInt(SMTP_PORT || '465', 10), secure: true, family: 4,
-      auth: { user: SMTP_USER, pass: SMTP_PASS },
+    const transporter = await createMailTransport({
+      host: SMTP_HOST, port: SMTP_PORT, user: SMTP_USER, pass: SMTP_PASS,
     })
     await transporter.sendMail({
       from: `Deploy Triage <${SMTP_USER}>`,
@@ -594,8 +593,8 @@ async function sendPromoEmail(items, { mode = 'alert' } = {}) {
     log(`  (promo email skipped — SMTP/ALERT_EMAIL not configured; ${items.length} item(s) in deploy-triage.log)`)
     return
   }
-  let createTransport
-  try { ({ createTransport } = await import('nodemailer')) }
+  let createMailTransport
+  try { ({ createMailTransport } = await import('./lib/smtp.mjs')) }
   catch { log('  (promo email skipped — nodemailer not available)'); return }
 
   const retriedMode = mode === 'retried'
@@ -635,9 +634,8 @@ async function sendPromoEmail(items, { mode = 'alert' } = {}) {
       </div>
     </div>`
   try {
-    const transporter = createTransport({
-      host: SMTP_HOST, port: parseInt(SMTP_PORT || '465', 10), secure: true, family: 4,
-      auth: { user: SMTP_USER, pass: SMTP_PASS },
+    const transporter = await createMailTransport({
+      host: SMTP_HOST, port: SMTP_PORT, user: SMTP_USER, pass: SMTP_PASS,
     })
     await transporter.sendMail({
       from: `Deploy Triage <${SMTP_USER}>`,

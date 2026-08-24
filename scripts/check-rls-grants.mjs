@@ -321,13 +321,12 @@ async function main() {
   // ── Alert (inline ALERT_SMTP_*, mirroring check-auth-email-config.mjs) ───────
   if (violations.length && process.env.ALERT_SMTP_HOST) {
     try {
-      const nodemailer = await import('nodemailer')
-      const t = nodemailer.createTransport({
+      const { createMailTransport } = await import('./lib/smtp.mjs')
+      const t = await createMailTransport({
         host: process.env.ALERT_SMTP_HOST,
-        port: Number(process.env.ALERT_SMTP_PORT || 465),
-        secure: true,
-        family: 4, // force IPv4: SMTP host resolves to an IPv6 addr unreachable from GH runners (ENETUNREACH)
-        auth: { user: process.env.ALERT_SMTP_USER, pass: process.env.ALERT_SMTP_PASS },
+        port: process.env.ALERT_SMTP_PORT,
+        user: process.env.ALERT_SMTP_USER,
+        pass: process.env.ALERT_SMTP_PASS,
       })
       const items = violations.map((v) => {
         const li = v.findings.map((f) => `<li><b>[${f.check}]</b> ${f.detail}<br><code>${f.fix}</code></li>`).join('')

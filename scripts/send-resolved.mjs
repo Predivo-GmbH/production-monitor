@@ -1,4 +1,4 @@
-import { createTransport } from 'nodemailer'
+import { createMailTransport } from './lib/smtp.mjs'
 import { execSync } from 'child_process'
 
 const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, ALERT_EMAIL, GITHUB_RUN_URL } = process.env
@@ -89,12 +89,11 @@ const html = `
   </div>
 `
 
-const transporter = createTransport({
+const transporter = await createMailTransport({
   host: SMTP_HOST,
-  port: parseInt(SMTP_PORT || '465'),
-  secure: true,
-  family: 4, // force IPv4: SMTP host resolves to an IPv6 addr unreachable from GH runners (ENETUNREACH)
-  auth: { user: SMTP_USER, pass: SMTP_PASS },
+  port: SMTP_PORT,
+  user: SMTP_USER,
+  pass: SMTP_PASS,
 })
 
 await transporter.sendMail({

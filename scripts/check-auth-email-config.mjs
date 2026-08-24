@@ -126,13 +126,12 @@ async function main() {
 
   if (violations.length && process.env.ALERT_SMTP_HOST) {
     try {
-      const nodemailer = await import('nodemailer')
-      const t = nodemailer.createTransport({
+      const { createMailTransport } = await import('./lib/smtp.mjs')
+      const t = await createMailTransport({
         host: process.env.ALERT_SMTP_HOST,
-        port: Number(process.env.ALERT_SMTP_PORT || 465),
-        secure: true,
-        family: 4, // force IPv4: SMTP host resolves to an IPv6 addr unreachable from GH runners (ENETUNREACH)
-        auth: { user: process.env.ALERT_SMTP_USER, pass: process.env.ALERT_SMTP_PASS },
+        port: process.env.ALERT_SMTP_PORT,
+        user: process.env.ALERT_SMTP_USER,
+        pass: process.env.ALERT_SMTP_PASS,
       })
       const list = violations.map((v) => `<li><b>${v.project}</b>: ${v.error}</li>`).join('')
       await t.sendMail({
