@@ -1,0 +1,29 @@
+name: CI Cost Guard
+
+# Fails when CI starts getting expensive again. This is the fourth attempt at bringing the
+# GitHub Actions bill down; the first three were one-time edits with nothing watching them, and
+# each was silently undone - keep-alive.yml deleted 2026-05-22 and re-added 2026-06-08, test.yml
+# deleted 2026-05-22 and re-added 2026-07-09 by a commit titled "working-tree cleanup". Nothing
+# ever failed, so nobody noticed. This is the thing that fails.
+#
+# Free to run: this repository is public.
+
+on:
+  schedule:
+    - cron: '10 7 * * 1' # Mondays 07:10 UTC, after the other fleet guards
+  workflow_dispatch: {}
+
+jobs:
+  budget:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Compare every workflow against its declared cost ceiling
+        run: node scripts/check-ci-budget.mjs
+        env:
+          GH_TOKEN: ${{ secrets.DASHBOARD_PAT }}
+          CI_BUDGET_WINDOW_DAYS: 7

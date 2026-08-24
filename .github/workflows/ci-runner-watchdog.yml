@@ -1,0 +1,38 @@
+name: CI Runner Watchdog
+
+# Watches the self-hosted runners that our CI now runs on, and AUTOMATICALLY falls the whole
+# fleet back to GitHub-hosted runners when that machine is unavailable.
+#
+# Our jobs run on a self-hosted runner in WSL2 on the office PC, because GitHub Actions is rented
+# compute at $0.006/minute and a machine we already own costs nothing. The risk is that the PC is
+# off, so `runs-on` in every migrated workflow reads a repository VARIABLE
+# (`${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}`) and this job moves that variable. Fleet keeps
+# shipping either way; the only consequence of the PC being off is that we pay GitHub for a while.
+#
+# This lives here because production-monitor is PUBLIC, and GitHub does not bill Actions minutes
+# on public repositories - so the watchdog over the cost saver is itself free. For the same
+# reason this repository must NEVER be given a self-hosted runner: a fork pull request on a
+# public repo can run arbitrary code on its runner.
+
+on:
+  schedule:
+    - cron: '*/10 * * * *' # every 10 minutes; a stuck fleet should not wait an hour
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-runner-watchdog
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest   # deliberately GitHub-hosted: it must work when our runners do not
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Check runners and move RUNNER_LABEL if needed
+        run: node scripts/check-ci-runners.mjs
+        env:
+          GH_TOKEN: ${{ secrets.DASHBOARD_PAT }}

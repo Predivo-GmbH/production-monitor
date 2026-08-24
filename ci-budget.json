@@ -1,0 +1,1157 @@
+{
+  "_README": "Declared CI cost ceilings, per repo -> workflow -> job. Generated 2026-08-24 from 5840 measured runs via the GitHub Actions API, billed the way GitHub invoices (per job, rounded up to the minute).",
+  "_fails_when": [
+    "a job exceeds its ceiling_min_per_run (median of the window)",
+    "a workflow runs that is not declared here at all",
+    "the 30-day fleet total exceeds monthly_minute_budget"
+  ],
+  "_why": "The May 2026 CI optimisation was silently undone twice: keep-alive.yml deleted 2026-05-22 and re-added 2026-06-08; test.yml deleted 2026-05-22 and re-added 2026-07-09 by a commit titled \"chore: commit pending docs/CI/assets (working-tree cleanup)\". Nothing failed, so nobody saw it, and the bill came back three times. This file is the thing that fails.",
+  "monthly_minute_budget": 12000,
+  "_budget_note": "12000 x $0.006 = $72/month gross. Measured 30d before this programme: 24870 min = $149.22. GitHub cap is $161 with stop-usage ON, which halts EVERY repo when hit.",
+  "repos": {
+    "backoffice": {
+      "v11 Staging Gates": {
+        "gates": {
+          "median": 13,
+          "p90": 47,
+          "ceiling_min_per_run": 94,
+          "runs_in_window": 65
+        }
+      },
+      "Secret Scan (gitleaks)": {
+        "gitleaks": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 63
+        }
+      },
+      "Deploy": {
+        "validate-staging": {
+          "median": 5,
+          "p90": 5,
+          "ceiling_min_per_run": 10,
+          "runs_in_window": 64
+        },
+        "deploy-staging": {
+          "median": 3,
+          "p90": 4,
+          "ceiling_min_per_run": 8,
+          "runs_in_window": 54
+        },
+        "e2e-staging": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 48
+        },
+        "gate-coverage": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 12
+        },
+        "gate-security": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 16
+        },
+        "deploy": {
+          "median": 8,
+          "p90": 9,
+          "ceiling_min_per_run": 18,
+          "runs_in_window": 16
+        }
+      },
+      "Remediate API Sync Failures": {
+        "remediate": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 160
+        }
+      },
+      "Outreach IMAP Poll": {
+        "poll": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 84
+        }
+      },
+      "Deploy edge functions": {
+        "deploy": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 4
+        }
+      },
+      "Health Monitor": {
+        "health-check": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 28
+        }
+      },
+      "Sync API Usage": {
+        "sync": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 29
+        }
+      },
+      "Bump gate-kit": {
+        "bump": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 2
+        }
+      },
+      "Keep Supabase Alive": {
+        "ping-staging": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 7
+        },
+        "ping-production": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 7
+        }
+      },
+      "Bump a dependency": {
+        "bump": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 1
+        }
+      },
+      "Reminders Check": {
+        "sweep": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 7
+        }
+      },
+      "VAT Return Reminder": {
+        "remind": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 7
+        }
+      },
+      "Outreach Reply Digest": {
+        "digest": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 7
+        }
+      },
+      "Sync Growth Plan": {
+        "sync": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 8
+        }
+      },
+      "Ledger Invariant Monitor": {
+        "check": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 7
+        }
+      },
+      "Weekly Growth Report": {
+        "report": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 1
+        }
+      },
+      "Sync Outreach": {
+        "sync": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 33
+        }
+      },
+      "Critical Path Tests": {
+        "critical-path": {
+          "median": 26,
+          "p90": 26,
+          "ceiling_min_per_run": 52,
+          "runs_in_window": 7
+        }
+      }
+    },
+    "BoatBuddy": {
+      "v11 Staging Gates": {
+        "gates": {
+          "median": 15,
+          "p90": 20,
+          "ceiling_min_per_run": 40,
+          "runs_in_window": 37
+        }
+      },
+      "Deploy": {
+        "deploy-staging": {
+          "median": 3,
+          "p90": 3,
+          "ceiling_min_per_run": 6,
+          "runs_in_window": 29
+        },
+        "gate-integration": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 18
+        },
+        "gate-security": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 18
+        },
+        "gate-e2e": {
+          "median": 16,
+          "p90": 17,
+          "ceiling_min_per_run": 34,
+          "runs_in_window": 18
+        },
+        "deploy": {
+          "median": 3,
+          "p90": 4,
+          "ceiling_min_per_run": 8,
+          "runs_in_window": 9
+        }
+      },
+      "Critical Path Tests": {
+        "critical-path": {
+          "median": 6,
+          "p90": 7,
+          "ceiling_min_per_run": 14,
+          "runs_in_window": 31
+        }
+      },
+      "Secret Scan (gitleaks)": {
+        "gitleaks": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 35
+        }
+      },
+      "Bump gate-kit": {
+        "bump": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 2
+        }
+      },
+      "Keep Supabase Alive": {
+        "ping": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 7
+        }
+      },
+      "Regenerate package-lock on Linux": {
+        "regen": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 1
+        }
+      }
+    },
+    "ChannelMover": {
+      "v11 Staging Gates": {
+        "gates": {
+          "median": 4,
+          "p90": 8,
+          "ceiling_min_per_run": 16,
+          "runs_in_window": 44
+        }
+      },
+      "Deploy to Production": {
+        "deploy-staging": {
+          "median": 8,
+          "p90": 8,
+          "ceiling_min_per_run": 16,
+          "runs_in_window": 28
+        },
+        "gate-e2e": {
+          "median": 10,
+          "p90": 11,
+          "ceiling_min_per_run": 22,
+          "runs_in_window": 19
+        },
+        "gate-security": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 19
+        },
+        "gate-integration": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 19
+        },
+        "deploy": {
+          "median": 10,
+          "p90": 11,
+          "ceiling_min_per_run": 22,
+          "runs_in_window": 12
+        },
+        "prod-smoke": {
+          "median": 2,
+          "p90": 2,
+          "ceiling_min_per_run": 4,
+          "runs_in_window": 12
+        }
+      },
+      "Secret Scan (gitleaks)": {
+        "gitleaks": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 38
+        }
+      },
+      "Bump gate-kit": {
+        "bump": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 3
+        }
+      },
+      "Critical Path Tests": {
+        "critical-path": {
+          "median": 8,
+          "p90": 9,
+          "ceiling_min_per_run": 18,
+          "runs_in_window": 46
+        }
+      },
+      "Keep Supabase Alive": {
+        "ping": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 7
+        }
+      },
+      "Bump a dependency": {
+        "bump": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 1
+        }
+      },
+      "Google Token Refresh Canary": {
+        "refresh-canary": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 3
+        }
+      },
+      "Code Review": {
+        "code-review": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 3
+        }
+      },
+      "Design Review": {
+        "design-review": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 3
+        }
+      },
+      "Security Review": {
+        "security-review": {
+          "median": 1,
+          "p90": 2,
+          "ceiling_min_per_run": 4,
+          "runs_in_window": 3
+        }
+      }
+    },
+    "claude-memory": {
+      "Secret Scan (gitleaks)": {
+        "gitleaks": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 15
+        }
+      }
+    },
+    "cockpit": {
+      "Deploy": {
+        "validate-staging": {
+          "median": 1,
+          "p90": 2,
+          "ceiling_min_per_run": 4,
+          "runs_in_window": 90
+        },
+        "e2e-smoke": {
+          "median": 3,
+          "p90": 4,
+          "ceiling_min_per_run": 8,
+          "runs_in_window": 85
+        },
+        "deploy-staging": {
+          "median": 3,
+          "p90": 4,
+          "ceiling_min_per_run": 8,
+          "runs_in_window": 85
+        },
+        "e2e-staging": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 76
+        },
+        "gate-security": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 39
+        },
+        "deploy": {
+          "median": 3,
+          "p90": 4,
+          "ceiling_min_per_run": 8,
+          "runs_in_window": 39
+        }
+      },
+      "Bump a dependency": {
+        "bump": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 1
+        }
+      },
+      "Continuous-track re-arm (weekly)": {
+        "rearm": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 1
+        }
+      },
+      "Deploy Portal": {
+        "deploy-portal": {
+          "median": 3,
+          "p90": 3,
+          "ceiling_min_per_run": 6,
+          "runs_in_window": 34
+        }
+      }
+    },
+    "Cursor_Arivioo": {
+      "Keep Supabase Alive (staging)": {
+        "ping": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 7
+        }
+      },
+      "Keep Supabase Alive": {
+        "ping": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 7
+        }
+      },
+      "Build & Deploy": {
+        "gate-security": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 9
+        },
+        "deploy": {
+          "median": 6,
+          "p90": 6,
+          "ceiling_min_per_run": 12,
+          "runs_in_window": 9
+        }
+      },
+      "Secret Scan (gitleaks)": {
+        "gitleaks": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 22
+        }
+      },
+      "Deploy to Staging": {
+        "deploy-staging": {
+          "median": 3,
+          "p90": 4,
+          "ceiling_min_per_run": 8,
+          "runs_in_window": 7
+        }
+      },
+      "Critical Path Tests": {
+        "critical-path": {
+          "median": 2,
+          "p90": 3,
+          "ceiling_min_per_run": 6,
+          "runs_in_window": 15
+        }
+      },
+      "Regenerate package-lock on Linux": {
+        "regen": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 1
+        }
+      }
+    },
+    "distribution-os": {
+      "Keep Supabase Alive (staging)": {
+        "ping": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 5
+        }
+      },
+      "Critical Path Tests": {
+        "critical-path": {
+          "median": 2,
+          "p90": 2,
+          "ceiling_min_per_run": 4,
+          "runs_in_window": 14
+        }
+      },
+      "Secret Scan (gitleaks)": {
+        "gitleaks": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 19
+        }
+      },
+      "v11 Staging Gates": {
+        "gates": {
+          "median": 2,
+          "p90": 2,
+          "ceiling_min_per_run": 4,
+          "runs_in_window": 11
+        }
+      },
+      "Deploy to Production": {
+        "gate-security": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 8
+        },
+        "deploy": {
+          "median": 5,
+          "p90": 5,
+          "ceiling_min_per_run": 10,
+          "runs_in_window": 8
+        }
+      },
+      "Deploy to Staging": {
+        "deploy-staging": {
+          "median": 3,
+          "p90": 3,
+          "ceiling_min_per_run": 6,
+          "runs_in_window": 7
+        },
+        "e2e-staging": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 7
+        }
+      }
+    },
+    "gate-kit": {
+      "Publish to GitHub Packages": {
+        "publish": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 21
+        }
+      },
+      "CI": {
+        "rules and conformance (latest)": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 26
+        },
+        "rules and conformance (9.39.1)": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 26
+        },
+        "crawl engine fixtures": {
+          "median": 2,
+          "p90": 3,
+          "ceiling_min_per_run": 6,
+          "runs_in_window": 26
+        },
+        "test (latest)": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 1
+        },
+        "test (9.39.1)": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 1
+        }
+      }
+    },
+    "launchready": {
+      "Keep Supabase Alive": {
+        "ping": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 7
+        }
+      },
+      "Build & Deploy": {
+        "gate-security": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 11
+        },
+        "deploy": {
+          "median": 7,
+          "p90": 7,
+          "ceiling_min_per_run": 14,
+          "runs_in_window": 10
+        }
+      },
+      "Secret Scan (gitleaks)": {
+        "gitleaks": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 27
+        }
+      },
+      "Deploy to Staging": {
+        "deploy-staging": {
+          "median": 3,
+          "p90": 3,
+          "ceiling_min_per_run": 6,
+          "runs_in_window": 14
+        }
+      },
+      "Critical Path Tests": {
+        "critical-path": {
+          "median": 2,
+          "p90": 2,
+          "ceiling_min_per_run": 4,
+          "runs_in_window": 14
+        }
+      },
+      "Weekly Monitoring Audits": {
+        "run-monitoring": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 1
+        }
+      }
+    },
+    "predivo": {
+      "Secret Scan (gitleaks)": {
+        "gitleaks": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 20
+        }
+      },
+      "Build & Deploy": {
+        "gate-security": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 6
+        },
+        "deploy": {
+          "median": 9,
+          "p90": 9,
+          "ceiling_min_per_run": 18,
+          "runs_in_window": 6
+        }
+      },
+      "Deploy to Staging": {
+        "deploy-staging": {
+          "median": 6,
+          "p90": 7,
+          "ceiling_min_per_run": 14,
+          "runs_in_window": 8
+        }
+      },
+      "Critical Path Tests": {
+        "critical-path": {
+          "median": 2,
+          "p90": 2,
+          "ceiling_min_per_run": 4,
+          "runs_in_window": 7
+        }
+      }
+    },
+    "project-dashboard": {
+      "Deploy to Production": {
+        "deploy": {
+          "median": 2,
+          "p90": 3,
+          "ceiling_min_per_run": 6,
+          "runs_in_window": 31
+        }
+      },
+      "Secret Scan (gitleaks)": {
+        "gitleaks": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 29
+        }
+      }
+    },
+    "project-starter": {
+      "Secret Scan (gitleaks)": {
+        "gitleaks": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 3
+        }
+      }
+    },
+    "pull-engine": {
+      "Technical floor (weekly fleet checks)": {
+        "technical-floor": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 1
+        }
+      },
+      "Weekly GSC pull + opportunity report": {
+        "pull-and-report": {
+          "median": 22,
+          "p90": 42,
+          "ceiling_min_per_run": 84,
+          "runs_in_window": 4
+        }
+      },
+      "Alert-channel fire drill": {
+        "drill": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 1
+        }
+      },
+      "Secret Scan (gitleaks)": {
+        "gitleaks": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 7
+        }
+      }
+    },
+    "ReplyFlow": {
+      "v11 Staging Gates": {
+        "gates": {
+          "median": 9,
+          "p90": 25,
+          "ceiling_min_per_run": 50,
+          "runs_in_window": 91
+        },
+        "full": {
+          "median": 25,
+          "p90": 25,
+          "ceiling_min_per_run": 50,
+          "runs_in_window": 1
+        }
+      },
+      "Secret Scan (gitleaks)": {
+        "gitleaks": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 71
+        }
+      },
+      "Deploy to Production": {
+        "deploy-staging": {
+          "median": 7,
+          "p90": 7,
+          "ceiling_min_per_run": 14,
+          "runs_in_window": 70
+        },
+        "typecheck-functions": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 28
+        },
+        "gate-e2e": {
+          "median": 20,
+          "p90": 36,
+          "ceiling_min_per_run": 72,
+          "runs_in_window": 37
+        },
+        "gate-security": {
+          "median": 1,
+          "p90": 2,
+          "ceiling_min_per_run": 4,
+          "runs_in_window": 37
+        },
+        "deploy": {
+          "median": 4,
+          "p90": 5,
+          "ceiling_min_per_run": 10,
+          "runs_in_window": 23
+        },
+        "prod-smoke": {
+          "median": 2,
+          "p90": 2,
+          "ceiling_min_per_run": 4,
+          "runs_in_window": 23
+        }
+      },
+      "Bump gate-kit": {
+        "bump": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 2
+        }
+      },
+      "Keep Supabase Alive": {
+        "ping-production": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 7
+        },
+        "ping-staging": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 7
+        }
+      },
+      "Critical Path Tests": {
+        "prod-cron-behavior": {
+          "median": 2,
+          "p90": 3,
+          "ceiling_min_per_run": 6,
+          "runs_in_window": 7
+        },
+        "critical-path": {
+          "median": 5,
+          "p90": 6,
+          "ceiling_min_per_run": 12,
+          "runs_in_window": 8
+        }
+      },
+      "Design Review": {
+        "design-review": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 1
+        }
+      },
+      "Security Review": {
+        "security-review": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 1
+        }
+      },
+      "Code Review": {
+        "code-review": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 1
+        }
+      }
+    },
+    "ScoutCopilot": {
+      "Keep Supabase Alive": {
+        "ping": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 7
+        }
+      },
+      "Deploy to Production": {
+        "gate-security": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 7
+        },
+        "deploy": {
+          "median": 8,
+          "p90": 9,
+          "ceiling_min_per_run": 18,
+          "runs_in_window": 7
+        }
+      },
+      "Secret Scan (gitleaks)": {
+        "gitleaks": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 20
+        }
+      },
+      "Deploy to Staging": {
+        "deploy-staging": {
+          "median": 3,
+          "p90": 3,
+          "ceiling_min_per_run": 6,
+          "runs_in_window": 6
+        }
+      },
+      "Critical Path Tests": {
+        "critical-path": {
+          "median": 3,
+          "p90": 3,
+          "ceiling_min_per_run": 6,
+          "runs_in_window": 15
+        }
+      }
+    },
+    "signalscore": {
+      "v11 Staging Gates": {
+        "gates": {
+          "median": 5,
+          "p90": 25,
+          "ceiling_min_per_run": 50,
+          "runs_in_window": 50
+        }
+      },
+      "Deploy to Production": {
+        "gate-integration": {
+          "median": 3,
+          "p90": 3,
+          "ceiling_min_per_run": 6,
+          "runs_in_window": 22
+        },
+        "gate-security": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 22
+        },
+        "gate-e2e": {
+          "median": 6,
+          "p90": 6,
+          "ceiling_min_per_run": 12,
+          "runs_in_window": 22
+        },
+        "gate-critical": {
+          "median": 4,
+          "p90": 5,
+          "ceiling_min_per_run": 10,
+          "runs_in_window": 22
+        },
+        "deploy-staging": {
+          "median": 6,
+          "p90": 6,
+          "ceiling_min_per_run": 12,
+          "runs_in_window": 33
+        },
+        "deploy": {
+          "median": 12,
+          "p90": 13,
+          "ceiling_min_per_run": 26,
+          "runs_in_window": 14
+        }
+      },
+      "Secret Scan (gitleaks)": {
+        "gitleaks": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 41
+        }
+      },
+      "Bump gate-kit": {
+        "bump": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 2
+        }
+      },
+      "Keep Supabase Alive": {
+        "ping-staging": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 7
+        },
+        "ping-production": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 7
+        }
+      },
+      "Critical Path Tests": {
+        "edge-fn-tests": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 7
+        },
+        "critical-path": {
+          "median": 4,
+          "p90": 5,
+          "ceiling_min_per_run": 10,
+          "runs_in_window": 7
+        }
+      }
+    },
+    "Valrano": {
+      "v11 Staging Gates": {
+        "gates": {
+          "median": 4,
+          "p90": 35,
+          "ceiling_min_per_run": 70,
+          "runs_in_window": 56
+        }
+      },
+      "Secret Scan (gitleaks)": {
+        "gitleaks": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 37
+        }
+      },
+      "Critical Path Tests": {
+        "critical-path": {
+          "median": 3,
+          "p90": 3,
+          "ceiling_min_per_run": 6,
+          "runs_in_window": 36
+        }
+      },
+      "Deploy to Production": {
+        "deploy-staging": {
+          "median": 6,
+          "p90": 7,
+          "ceiling_min_per_run": 14,
+          "runs_in_window": 36
+        },
+        "gate-integration": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 23
+        },
+        "gate-e2e": {
+          "median": 4,
+          "p90": 4,
+          "ceiling_min_per_run": 8,
+          "runs_in_window": 23
+        },
+        "gate-security": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 23
+        },
+        "deploy": {
+          "median": 10,
+          "p90": 11,
+          "ceiling_min_per_run": 22,
+          "runs_in_window": 14
+        }
+      },
+      "Bump gate-kit": {
+        "bump": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 2
+        }
+      },
+      "Keep Supabase Alive": {
+        "ping-staging": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 7
+        },
+        "ping-production": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 7
+        }
+      },
+      "Regenerate package-lock on Linux": {
+        "regen": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 1
+        }
+      }
+    }
+  },
+  "_emitted_at": "2026-08-24T15:19:34.311Z",
+  "_emitted_window_days": 7
+}
