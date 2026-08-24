@@ -5,7 +5,7 @@
  * Run: node test/board-drainer.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
-import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, isScoutDerived, selectWorkQueue } from '../scripts/board-drainer.mjs'
+import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT } from '../scripts/board-drainer.mjs'
 
 let n = 0
 const t = (name, fn) => { fn(); n++; console.log(`  ok - ${name}`) }
@@ -295,3 +295,35 @@ t('an item one attempt BELOW the ceiling is still dispatched', () => {
 })
 
 console.log(`\n${n} assertions passed.`)
+
+// ── timeoutCostsAnAttempt: a flaky machine must not park a fixable item ───────────────────
+//
+// Roughly 1 in 6 dispatches ends `spawnSync claude.exe ETIMEDOUT`. Before the parking fix that
+// only wasted a run. With parking, a burned attempt is permanent, so a timeout must be free -
+// but not infinitely free, or an item that genuinely cannot finish would retry forever.
+
+t('a single timeout is FREE — it does not cost an attempt', () => {
+  assert.equal(timeoutCostsAnAttempt(1), false)
+})
+t('two timeouts in a row are still free', () => {
+  assert.equal(timeoutCostsAnAttempt(2), false)
+})
+t('the third consecutive timeout DOES cost an attempt — that is the item, not the machine', () => {
+  assert.equal(timeoutCostsAnAttempt(3), true)
+  assert.equal(timeoutCostsAnAttempt(9), true)
+})
+t('TRAP GUARD: the timeout sentinel is TRUTHY, so `!verdict` can never catch it', () => {
+  // This is the actual bug risk in the wiring, not the policy. AGENT_TIMED_OUT is a Symbol;
+  // `if (!verdict)` does NOT fire on it, so main() must test for the sentinel FIRST or it would
+  // hand a Symbol to verdictToUpsert() as though it were a real verdict.
+  assert.ok(AGENT_TIMED_OUT, 'a falsy sentinel would be silently swallowed by the !verdict branch')
+  assert.equal(typeof AGENT_TIMED_OUT, 'symbol')
+  assert.notEqual(AGENT_TIMED_OUT, null)
+})
+t('the free allowance is configurable and respected', () => {
+  assert.equal(timeoutCostsAnAttempt(1, 1), true)
+  assert.equal(timeoutCostsAnAttempt(0, 1), false)
+})
+
+console.log(`
+${n} assertions passed.`)

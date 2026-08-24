@@ -68,6 +68,7 @@ export function meetsThreshold(inc, thresholdRank = THRESHOLD_RANK) {
   if (rank === undefined) return true
   return rank >= thresholdRank
 }
+const MAX_FREE_TIMEOUTS = 3    // consecutive agent timeouts on one key that do NOT cost an attempt
 const MAX_ATTEMPTS = 3         // dedup-stuck: after N failed attempts on a key, escalate as "auto-fix stuck"
 const MODEL = 'claude-opus-4-8'
 const MAX_TURNS = 40
@@ -339,6 +340,7 @@ const WRITE = [
 
 function dispatchAgent(inc, mode) {
   try { if (existsSync(VERDICT_PATH)) rmSync(VERDICT_PATH) } catch { /* noop */ }
+  let timedOut = false
   // FIX mode + LIVE gets write/deploy verbs; VERIFY mode is read-only (can only close-if-green or escalate).
   const canWrite = LIVE && mode === 'fix'
   const allowedTools = (canWrite ? [...READ_ONLY, ...WRITE] : READ_ONLY).join(',')
@@ -365,11 +367,14 @@ function dispatchAgent(inc, mode) {
     })
   } catch (e) {
     log(`  agent errored/timed out: ${(e.message || '').split('\n')[0]}`)
+    timedOut = true
   }
   if (existsSync(VERDICT_PATH)) {
+    // An agent that timed out MAY still have written a verdict before it was killed. A real
+    // verdict always wins over the timeout: it is the work actually done.
     try { return JSON.parse(readFileSync(VERDICT_PATH, 'utf-8')) } catch { /* malformed */ }
   }
-  return null
+  return timedOut ? AGENT_TIMED_OUT : null
 }
 
 // ── write-back: turn the agent verdict into a board state transition ──────────────────────
@@ -403,6 +408,30 @@ export function stuckWhoMustAct(whoMustAct) {
     .trim()
   const owner = HUMAN_HANDS.test(priorAction) ? 'Roger' : 'Claude'
   return { owner, priorAction, value: `${owner} - ${priorAction}` }
+}
+
+/** Returned by dispatchAgent when the agent never got to produce a verdict at all — a 12-minute
+ *  execFileSync timeout or a spawn failure. Distinct from `null`, which means the agent RAN and
+ *  chose to say nothing. */
+export const AGENT_TIMED_OUT = Symbol.for('board-drainer.agent-timed-out')
+
+/**
+ * Should a timed-out dispatch cost the item one of its MAX_ATTEMPTS tries?
+ *
+ * WHY THIS EXISTS (2026-08-24). Roughly 1 in 6 dispatches ends `spawnSync claude.exe ETIMEDOUT`
+ * (open item since 2026-08-15). Before today that only wasted a run: a stuck item was
+ * re-escalated forever, so it would be tried again. Now that stuck items are PARKED — which is
+ * the fix for the 30-hour deadlock — burning an attempt on infrastructure flakiness can park a
+ * perfectly fixable item that was never actually diagnosed. The deadlock fix must not introduce
+ * a quieter version of the same failure.
+ *
+ * So a timeout is FREE, but not infinitely free: after `maxFree` CONSECUTIVE timeouts on the
+ * same key it starts counting. An item whose fix cannot finish inside 12 minutes three times
+ * running is telling us something about the item, not about the machine. A single completed
+ * dispatch resets the counter.
+ */
+export function timeoutCostsAnAttempt(consecutiveTimeouts, maxFree = MAX_FREE_TIMEOUTS) {
+  return consecutiveTimeouts >= maxFree
 }
 
 /**
@@ -481,6 +510,7 @@ async function main() {
   const state = loadState()
   state.attempts = state.attempts || {}
   state.stuck = state.stuck || {}
+  state.timeouts = state.timeouts || {}
   log(`Board Drainer start — mode=${LIVE ? 'LIVE' : 'DRY-RUN'}${FIXTURE ? ' [FIXTURE]' : ''}`)
 
   // Clearing path 3 of 3 for the parked suppression: an operator reset. Runs before anything
@@ -488,7 +518,7 @@ async function main() {
   const reset = (process.env.BOARD_DRAINER_RESET_STUCK || '').trim()
   if (reset) {
     const keys = reset === 'all' ? Object.keys(state.stuck) : [reset]
-    for (const k of keys) { delete state.stuck[k]; delete state.attempts[k] }
+    for (const k of keys) { delete state.stuck[k]; delete state.attempts[k]; delete state.timeouts[k] }
     saveState(state)
     log(`  BOARD_DRAINER_RESET_STUCK=${reset} — cleared ${keys.length} parked item(s): ${keys.join(', ') || '(none)'}`)
   }
@@ -555,7 +585,7 @@ async function main() {
     // sight forever — which is the exact bug this prune was written for in the first place.
     const staleStuck = Object.keys(state.stuck).filter((k) => !live.has(k))
     if (stale.length || staleStuck.length) {
-      for (const k of stale) delete state.attempts[k]
+      for (const k of stale) { delete state.attempts[k]; delete state.timeouts[k] }
       for (const k of staleStuck) delete state.stuck[k]
       saveState(state)
       log(`  pruned ${stale.length} stale attempt counter(s) and ${staleStuck.length} parked marker(s) for incidents no longer open`)
@@ -567,7 +597,7 @@ async function main() {
   // the button would hoist an item to the front of a queue it is still forbidden to enter.
   const revived = priorityKeys.filter((k) => state.stuck[k] || state.attempts[k])
   if (revived.length) {
-    for (const k of revived) { delete state.stuck[k]; delete state.attempts[k] }
+    for (const k of revived) { delete state.stuck[k]; delete state.attempts[k]; delete state.timeouts[k] }
     saveState(state)
     log(`  ${revived.length} item(s) revived by "Hand to Claude" — attempt counter and parked marker cleared: ${revived.join(', ')}`)
   }
@@ -664,6 +694,23 @@ async function main() {
       const attempts = (state.attempts[inc.key] || 0) + 1
       log(`  dispatching agent [${cls.mode}] for ${inc.source}/${inc.key} (attempt ${attempts})...`)
       const verdict = dispatchAgent(inc, cls.mode)
+      // A TIMEOUT is infrastructure, not a failed diagnosis. Note that AGENT_TIMED_OUT is a
+      // Symbol and therefore TRUTHY, so this must be tested BEFORE the `!verdict` branch below
+      // or it would be handed to verdictToUpsert() as if it were a real verdict.
+      if (verdict === AGENT_TIMED_OUT) {
+        const consecutive = (state.timeouts[inc.key] || 0) + 1
+        state.timeouts[inc.key] = consecutive
+        if (timeoutCostsAnAttempt(consecutive)) {
+          state.attempts[inc.key] = attempts
+          log(`  ${inc.key}: timed out ${consecutive}x in a row — that is no longer flakiness, recording attempt ${attempts}.`)
+        } else {
+          log(`  ${inc.key}: agent TIMED OUT (${consecutive} of ${MAX_FREE_TIMEOUTS} free) — attempt NOT charged, it will be retried.`)
+        }
+        saveState(state)
+        continue
+      }
+      // The agent ran to completion and chose to say nothing. That IS a failed attempt.
+      delete state.timeouts[inc.key]
       if (!verdict) {
         state.attempts[inc.key] = attempts
         log(`  no verdict for ${inc.key} — recorded attempt ${attempts}.`)
