@@ -107,6 +107,34 @@ async function readBoard(secret) {
   return res.json()
 }
 
+/** The ONLY manual control over an otherwise fully automatic queue.
+ *
+ *  The board is read `order=opened_at.asc` and the per-run cap takes the head of it, so without
+ *  this there is no way for a human to say "that one, now" — the queue position of an item is
+ *  decided entirely by when it was filed. `/signals` has had a "Hand to Claude" button and a
+ *  `claude_queue()` function since 2026-08-23 and NOTHING read either of them: verified
+ *  2026-08-24, `handed_to_claude_at` was non-null on 0 of 186 rows and `claude_queue()` had no
+ *  caller anywhere in the fleet. A hand-off lane with no consumer is a lie to the user.
+ *
+ *  This is that consumer. A signal Roger hands to Claude is hoisted to the front of the work
+ *  queue AND clears its stuck counter (see selectWorkQueue), which makes the button the escape
+ *  hatch for an item the drainer has given up on.
+ *
+ *  Failure is NOT swallowed into "no priorities": that would silently demote a deliberate human
+ *  instruction back into FIFO order and look identical to Roger never having pressed it. The
+ *  caller logs the failure and, like the scout-queue fetch, records that the picture is partial.
+ */
+async function readPriorityKeys(secret) {
+  const url = `${BO_BASE}/rest/v1/fleet_signals`
+    + `?select=source,key,handed_to_claude_at`
+    + `&handed_to_claude_at=not.is.null&state=eq.open&order=handed_to_claude_at.asc`
+  const res = await fetch(url, {
+    headers: { apikey: secret, Authorization: `Bearer ${secret}`, 'User-Agent': NON_BROWSER_UA },
+  })
+  if (!res.ok) throw new Error(`priority queue read HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`)
+  return (await res.json()).map((r) => r.key)
+}
+
 // One-shot retry on a TRANSPORT error (fetch() throwing, e.g. `TypeError: fetch failed`) — NOT on an
 // HTTP status (those are handled by !res.ok below and are real server rejections, never retried).
 // Root cause (incident board-drainer-upsert-fetch-failed, 2026-08-19): readBoard() opens an undici
@@ -377,6 +405,70 @@ export function stuckWhoMustAct(whoMustAct) {
   return { owner, priorAction, value: `${owner} - ${priorAction}` }
 }
 
+/**
+ * Decide what this run actually works. Split out as a pure function on 2026-08-24 because the
+ * inline version deadlocked the whole loop for 30 hours and nothing noticed.
+ *
+ * ── THE BUG THIS FIXES ──────────────────────────────────────────────────────────────────
+ * The board is read `order=opened_at.asc` (oldest first), the eligible list was sliced to
+ * MAX_PER_RUN=3, and each of those 3 then hit `attempts > MAX_ATTEMPTS` and `continue`d. The
+ * three oldest unfixable items therefore consumed the ENTIRE per-run budget on every run,
+ * forever, and no agent was ever dispatched again. Measured in `_board-drainer/drainer.log`:
+ * last real dispatch 2026-08-23T09:36:57Z, then 0 dispatches and 138 re-escalations on
+ * 2026-08-24 alone, across ~90 runs. 31 fixable items were never even looked at.
+ *
+ * ── WHY THE CAP WAS BEING SPENT ON NOTHING ──────────────────────────────────────────────
+ * MAX_PER_RUN is a BLAST-RADIUS cap: it bounds how many autonomous code changes one run may
+ * make. A stuck-escalation changes no code — it is one idempotent DB write. Charging it against
+ * the blast-radius budget was the category error. So: the cap now applies to AGENT DISPATCHES
+ * only, and escalations are handled outside it.
+ *
+ * ── AND IT ONLY ESCALATES ONCE ──────────────────────────────────────────────────────────
+ * The old code re-escalated every stuck item on every run, overwriting `root_cause` with a stub
+ * each time — 138 overwrites in one day, which is the separately-filed incident
+ * `board-drainer-stuck-stub-erases-root-cause`. An item is now escalated the first time it goes
+ * stuck, recorded in `state.stuck`, and thereafter PARKED: no write, no dispatch, no cost.
+ *
+ * ── PARKED IS A SUPPRESSION, SO IT HAS A CLEARING PATH AND IT ANNOUNCES ITSELF ───────────
+ * Three ways out, all live in this same commit (the rule: a suppression flag ships with the
+ * thing that clears it, and a default nobody chose must announce itself):
+ *   1. the key leaves the board            -> pruned with the attempt counter (see main)
+ *   2. Roger presses "Hand to Claude"      -> priorityKeys clears stuck AND attempts, so the
+ *                                             item gets a fresh run of tries at the FRONT
+ *   3. BOARD_DRAINER_RESET_STUCK=all|<key> -> manual reset for an operator
+ * and every run logs the parked count and keys, so a parked item can never be a silent one.
+ *
+ * @returns {{toWork:Array, toEscalate:Array, parked:Array, belowBar:number, hoisted:string[]}}
+ */
+export function selectWorkQueue({ routed, state, maxPerRun = MAX_PER_RUN, maxAttempts = MAX_ATTEMPTS, priorityKeys = [] }) {
+  const attempts = state?.attempts || {}
+  const stuck = state?.stuck || {}
+  const priority = new Set(priorityKeys)
+
+  const eligible = routed.filter(({ inc }) => meetsThreshold(inc))
+  const belowBar = routed.length - eligible.length
+
+  const toEscalate = [], parked = [], workable = [], hoisted = []
+  for (const entry of eligible) {
+    const key = entry.inc.key
+    // A human override outranks the breaker. Roger asking for an item IS the new evidence that
+    // makes another attempt worth making; refusing him because a machine gave up three times is
+    // the failure mode, not the safeguard.
+    if (priority.has(key)) { hoisted.push(key); workable.unshift(entry); continue }
+    // `mode: 'note'` is a cheap idempotent write (vendor plan expired -> status=expected), not an
+    // agent run. It must not be charged to the blast-radius budget either, or a handful of noted
+    // items would starve the queue the same way the stuck ones did.
+    if (entry.cls.mode === 'note') { toEscalate.push({ ...entry, why: 'note' }); continue }
+    if ((attempts[key] || 0) >= maxAttempts) {
+      if (stuck[key]) parked.push(entry)
+      else toEscalate.push({ ...entry, why: 'stuck' })
+      continue
+    }
+    workable.push(entry)
+  }
+  return { toWork: workable.slice(0, maxPerRun), toEscalate, parked, belowBar, hoisted, eligible: workable.length }
+}
+
 // ── main ────────────────────────────────────────────────────────────────────────────────
 async function main() {
   // gates
@@ -388,10 +480,21 @@ async function main() {
   if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true })
   const state = loadState()
   state.attempts = state.attempts || {}
+  state.stuck = state.stuck || {}
   log(`Board Drainer start — mode=${LIVE ? 'LIVE' : 'DRY-RUN'}${FIXTURE ? ' [FIXTURE]' : ''}`)
 
+  // Clearing path 3 of 3 for the parked suppression: an operator reset. Runs before anything
+  // reads state.stuck, and says out loud what it cleared.
+  const reset = (process.env.BOARD_DRAINER_RESET_STUCK || '').trim()
+  if (reset) {
+    const keys = reset === 'all' ? Object.keys(state.stuck) : [reset]
+    for (const k of keys) { delete state.stuck[k]; delete state.attempts[k] }
+    saveState(state)
+    log(`  BOARD_DRAINER_RESET_STUCK=${reset} — cleared ${keys.length} parked item(s): ${keys.join(', ') || '(none)'}`)
+  }
+
   // 1. read the work-list
-  let secret = null, incidents = []
+  let secret = null, incidents = [], priorityKeys = []
   // Did EVERY work-list source load this run? The prune below must never run on a partial
   // picture (see the comment there).
   let allSourcesLoaded = true
@@ -412,6 +515,15 @@ async function main() {
     } catch (e) {
       allSourcesLoaded = false
       log(`  scout queue unavailable (${String(e).slice(0, 120)}); continuing with the board only`)
+    }
+    // The "Hand to Claude" lane. A read failure is announced, never treated as "nobody handed
+    // anything over" — those two look identical in FIFO order and only one of them is true.
+    try {
+      priorityKeys = await readPriorityKeys(secret)
+      if (priorityKeys.length) log(`  priority queue: ${priorityKeys.length} signal(s) handed to Claude on /signals — worked first`)
+    } catch (e) {
+      allSourcesLoaded = false
+      log(`  ⚠ priority queue unavailable (${String(e).slice(0, 120)}) — a "Hand to Claude" pressed since the last good run will NOT jump the queue this run`)
     }
   }
   // Prune stale attempt counters (added 2026-08-20). state.attempts was only ever cleared on
@@ -438,11 +550,26 @@ async function main() {
   if (!FIXTURE && allSourcesLoaded) {
     const live = new Set(incidents.map((i) => i.key))
     const stale = Object.keys(state.attempts).filter((k) => !live.has(k))
-    if (stale.length) {
+    // Clearing path 1 of 3: state.stuck rides the SAME prune as state.attempts and under the
+    // same fail-safe. If it did not, an item could leave the board, come back, and be parked on
+    // sight forever — which is the exact bug this prune was written for in the first place.
+    const staleStuck = Object.keys(state.stuck).filter((k) => !live.has(k))
+    if (stale.length || staleStuck.length) {
       for (const k of stale) delete state.attempts[k]
+      for (const k of staleStuck) delete state.stuck[k]
       saveState(state)
-      log(`  pruned ${stale.length} stale attempt counter(s) for incidents no longer open`)
+      log(`  pruned ${stale.length} stale attempt counter(s) and ${staleStuck.length} parked marker(s) for incidents no longer open`)
     }
+  }
+
+  // Clearing path 2 of 3: a human override. Pressing "Hand to Claude" on /signals is Roger
+  // saying "try again", so it resets BOTH the attempt counter and the parked marker — otherwise
+  // the button would hoist an item to the front of a queue it is still forbidden to enter.
+  const revived = priorityKeys.filter((k) => state.stuck[k] || state.attempts[k])
+  if (revived.length) {
+    for (const k of revived) { delete state.stuck[k]; delete state.attempts[k] }
+    saveState(state)
+    log(`  ${revived.length} item(s) revived by "Hand to Claude" — attempt counter and parked marker cleared: ${revived.join(', ')}`)
   }
 
   if (!FIXTURE && !allSourcesLoaded) log('  prune SKIPPED this run: a work-list source failed to load, so a stale counter cannot be told from an unfetched one')
@@ -455,32 +582,33 @@ async function main() {
   for (const { inc, cls } of routed) {
     log(`  • [${cls.owner}/${cls.mode.toUpperCase()}] ${inc.source}/${inc.key} (${cls.reason}) :: ${inc.title}`)
   }
-  const eligible = routed.filter(({ inc }) => meetsThreshold(inc))
-  const belowBar = routed.length - eligible.length
+  const { toWork, toEscalate, parked, belowBar, hoisted, eligible } = selectWorkQueue({ routed, state, priorityKeys })
   if (belowBar) log(`  severity threshold '${THRESHOLD}': ${belowBar} item(s) below the bar, classified and logged above but not dispatched.`)
-  const toWork = eligible.slice(0, MAX_PER_RUN)
-  if (eligible.length > MAX_PER_RUN) log(`  blast-radius cap: ${eligible.length} eligible, taking ${MAX_PER_RUN} this run.`)
+  if (hoisted.length) log(`  hoisted to the front by "Hand to Claude": ${hoisted.join(', ')}`)
+  if (eligible > MAX_PER_RUN) log(`  blast-radius cap: ${eligible} dispatchable, taking ${MAX_PER_RUN} this run.`)
+  if (toEscalate.length) log(`  ${toEscalate.length} item(s) to record without an agent (${toEscalate.filter((e) => e.why === 'stuck').length} newly stuck, ${toEscalate.filter((e) => e.why === 'note').length} expected-state) — these do NOT consume the blast-radius budget.`)
+  // A parked item is a SUPPRESSED item, so it is named out loud every single run. Silence here
+  // is what let 34 items rot behind 3 for 30 hours.
+  if (parked.length) {
+    log(`  PARKED at the attempt ceiling (${MAX_ATTEMPTS} failed tries), not dispatched and not re-escalated: ${parked.length}`)
+    for (const { inc } of parked) log(`    ⏸ ${inc.source}/${inc.key} :: ${inc.title}`)
+    log(`    To retry one: press "Hand to Claude" on /signals, or run with BOARD_DRAINER_RESET_STUCK=<key> (or =all).`)
+  }
 
   // In DRY-RUN or FIXTURE we stop here: classification only, nothing dispatched or written.
   if (!LIVE || FIXTURE) {
     const fixes = toWork.filter((r) => r.cls.mode === 'fix').length
-    const notes = toWork.filter((r) => r.cls.mode === 'note').length
-    log(`DRY-RUN: would FIX ${fixes}, VERIFY ${toWork.length - fixes - notes}, NOTE-as-expected ${notes}. No agent run, no write-back.`)
+    log(`DRY-RUN: would FIX ${fixes}, VERIFY ${toWork.length - fixes}, RECORD-without-agent ${toEscalate.length}, PARK ${parked.length}. No agent run, no write-back.`)
     saveState(state)
     return
   }
 
-  // 3. LIVE: dispatch + write back, with dedup-stuck escalation.
-  //
-  // Each item is isolated. Previously a single throw anywhere in here (e.g. a rejected
-  // upsert) propagated out of main(), skipping every REMAINING item, skipping saveState()
-  // so the attempt counter never advanced, and skipping the scout write-back so the same
-  // report re-dispatched forever. The blast-radius guard failed OPEN. One bad item must cost
-  // exactly one item.
-  for (const { inc, cls } of toWork) {
-    try {  
-      if (cls.mode === 'note') {
-        // Expected business state: no agent dispatch, no fix — note it on the board as `expected`.
+  // 3a. Record-only pass: notes and first-time stuck escalations. Neither runs an agent, so
+  // neither is charged against MAX_PER_RUN — that cap bounds autonomous CODE CHANGES, and the
+  // old code spending it on three permanently-stuck items is precisely what killed the loop.
+  for (const { inc, why } of toEscalate) {
+    try {
+      if (why === 'note') {
         log(`  ${inc.key}: expected business state — upserting status=expected (noted, no action).`)
         if (isScoutDerived(inc)) { log('    (scout-derived: recorded on the report, never on the incidents board)'); continue }
         await upsertIncident(secret, {
@@ -490,42 +618,50 @@ async function main() {
           p_evidence: { by: 'board-drainer', class: 'EXPECTED', note: 'vendor plan expired — noted, no action' },
         })
         delete state.attempts[inc.key]
+        delete state.stuck[inc.key]
         saveState(state)
         continue
       }
-      const attempts = (state.attempts[inc.key] || 0) + 1
-      if (attempts > MAX_ATTEMPTS) {
-        // STUCK. Two bugs used to live in this block (incident
-        // board-drainer-stuck-escalates-to-roger, filed 2026-08-20 by the monitor and verified
-        // by hand before this fix):
-        //
-        // 1. It hardcoded `Roger - ...` on EVERY stuck item, including pure code/spec/CI fixes
-        //    the drainer merely could not APPLY. That is precisely the graveyard Roger's
-        //    2026-08-12 rule forbids: a code fix must never end up sitting on him. Ownership
-        //    now SURVIVES: only an action that genuinely needs his hands (HUMAN_HANDS: OAuth,
-        //    payment, vendor, new secret, business decision) is re-owned to Roger. Everything
-        //    else stays Claude's, with "auto-fix stuck" recorded as the reason rather than as a
-        //    change of owner.
-        // 2. It CONCATENATED onto the previous who_must_act, so the prefix compounded on every
-        //    stuck pass and buried the real action behind repeated boilerplate. The underlying
-        //    action is now extracted and REPLACED, so it can never grow.
-        const { owner: stuckOwner, priorAction, value: stuckWho } = stuckWhoMustAct(inc.who_must_act)
-        const needsRogersHands = stuckOwner === 'Roger'
-        log(`  ${inc.key}: ${attempts - 1} prior failed attempts — escalating as auto-fix-stuck (owner ${stuckOwner}).`)
-        if (isScoutDerived(inc)) {
-          await markScoutReport(secret, inc.scoutReportId, { state: 'real', state_reason: `auto-fix stuck after ${attempts - 1} attempts: ${priorAction}`.slice(0, 500), worked_at: new Date().toISOString() })
-          state.attempts[inc.key] = attempts
-          saveState(state)
-          continue
-        }
+      // why === 'stuck': escalate ONCE, then park. The old code rewrote this row on every run
+      // (138 times on 2026-08-24), stamping a stub over the real diagnosis each time — incident
+      // `board-drainer-stuck-stub-erases-root-cause`. Writing it once is the fix for that too.
+      const attempts = state.attempts[inc.key] || MAX_ATTEMPTS
+      const { owner: stuckOwner, priorAction, value: stuckWho } = stuckWhoMustAct(inc.who_must_act)
+      const needsRogersHands = stuckOwner === 'Roger'
+      log(`  ${inc.key}: ${attempts} failed attempts — escalating ONCE as auto-fix-stuck (owner ${stuckOwner}), then parking.`)
+      if (isScoutDerived(inc)) {
+        await markScoutReport(secret, inc.scoutReportId, { state: 'real', state_reason: `auto-fix stuck after ${attempts} attempts: ${priorAction}`.slice(0, 500), worked_at: new Date().toISOString() })
+      } else {
         await upsertIncident(secret, {
           p_source: inc.source, p_key: inc.key, p_title: inc.title, p_severity: 'critical', p_status: 'blocked',
-          p_root_cause: `[board-drainer] auto-fix STUCK after ${attempts - 1} attempts — the action below still stands, it just could not be applied automatically.`,
+          p_root_cause: `[board-drainer] auto-fix STUCK after ${attempts} attempts — the action below still stands, it just could not be applied automatically. Retry with "Hand to Claude" on /signals.`,
           p_who_must_act: stuckWho,
-          p_evidence: { by: 'board-drainer', stuck: true, attempts: attempts - 1, stuckOwner, needsRogersHands },
+          p_evidence: { by: 'board-drainer', stuck: true, attempts, stuckOwner, needsRogersHands },
         })
-        continue
       }
+      // Mark parked LAST, so a failed escalation is retried next run instead of being
+      // silently swallowed into the parked set.
+      state.stuck[inc.key] = { at: new Date().toISOString(), attempts }
+      state.attempts[inc.key] = attempts
+      saveState(state)
+    } catch (e) {
+      log(`  ${inc.key}: ERRORED while recording (${String(e).slice(0, 160)}) — will retry next run, not parked.`)
+    }
+  }
+
+  // 3b. LIVE: dispatch + write back. Only genuinely workable items reach here — the `note`
+  // and stuck-escalation branches that used to live inline now run in 3a, OUTSIDE the
+  // blast-radius cap, because neither of them runs an agent. Keeping them in here is what
+  // let three permanently-stuck items eat the entire per-run budget on every run.
+  //
+  // Each item is isolated. Previously a single throw anywhere in here (e.g. a rejected
+  // upsert) propagated out of main(), skipping every REMAINING item, skipping saveState()
+  // so the attempt counter never advanced, and skipping the scout write-back so the same
+  // report re-dispatched forever. The blast-radius guard failed OPEN. One bad item must cost
+  // exactly one item.
+  for (const { inc, cls } of toWork) {
+    try {
+      const attempts = (state.attempts[inc.key] || 0) + 1
       log(`  dispatching agent [${cls.mode}] for ${inc.source}/${inc.key} (attempt ${attempts})...`)
       const verdict = dispatchAgent(inc, cls.mode)
       if (!verdict) {

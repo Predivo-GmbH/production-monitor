@@ -5,7 +5,7 @@
  * Run: node test/board-drainer.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
-import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, isScoutDerived } from '../scripts/board-drainer.mjs'
+import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, isScoutDerived, selectWorkQueue } from '../scripts/board-drainer.mjs'
 
 let n = 0
 const t = (name, fn) => { fn(); n++; console.log(`  ok - ${name}`) }
@@ -206,3 +206,92 @@ t('CONSTRAINT GUARD: no scout source is one the incidents CHECK accepts', () => 
     'scout items must stay OFF monitoring_incidents; reports are free, alarms are not')
   assert.equal(isScoutDerived(inc), true, 'and must therefore be caught by the guard')
 })
+
+// ── selectWorkQueue: the head-of-line deadlock ────────────────────────────────────────────
+//
+// THE REGRESSION THESE GUARD. On 2026-08-24 the drainer was found to have dispatched ZERO fix
+// agents since 2026-08-23T09:36:57Z while running every 20 minutes — ~90 runs, 138 no-op
+// re-escalations on the final day alone. Cause: the board is read oldest-first, the eligible
+// list was sliced to MAX_PER_RUN=3, and the three OLDEST items were all frozen at the attempt
+// ceiling. They consumed the entire per-run budget on every run, forever, and the 31 fixable
+// items behind them were never looked at. The tests below fail on that code and pass on this.
+
+const wq = (key, over = {}) => ({ inc: { key, source: 'silent-failure', severity: 'warning', title: key, ...over }, cls: { mode: 'fix', owner: 'claude' } })
+const atCeiling = { 'stuck-1': 3, 'stuck-2': 3, 'stuck-3': 3 }
+
+t('DEADLOCK: three ceiling-stuck items at the head do NOT consume the dispatch budget', () => {
+  const routed = [wq('stuck-1'), wq('stuck-2'), wq('stuck-3'), wq('fixable-a'), wq('fixable-b'), wq('fixable-c'), wq('fixable-d')]
+  const state = { attempts: { ...atCeiling }, stuck: { 'stuck-1': {}, 'stuck-2': {}, 'stuck-3': {} } }
+  const { toWork, parked } = selectWorkQueue({ routed, state })
+  assert.equal(parked.length, 3, 'the three ceiling items are parked')
+  assert.equal(toWork.length, 3, 'and the run still dispatches a full budget')
+  assert.deepEqual(toWork.map((r) => r.inc.key), ['fixable-a', 'fixable-b', 'fixable-c'])
+})
+
+t('DEADLOCK: a board of NOTHING BUT stuck items dispatches nothing and parks everything', () => {
+  const routed = [wq('stuck-1'), wq('stuck-2'), wq('stuck-3')]
+  const state = { attempts: { ...atCeiling }, stuck: { 'stuck-1': {}, 'stuck-2': {}, 'stuck-3': {} } }
+  const { toWork, parked, toEscalate } = selectWorkQueue({ routed, state })
+  assert.equal(toWork.length, 0); assert.equal(parked.length, 3); assert.equal(toEscalate.length, 0)
+})
+
+t('a NEWLY stuck item is escalated exactly once, outside the dispatch budget', () => {
+  // attempts at the ceiling but no parked marker yet = first time it goes stuck.
+  const routed = [wq('newly-stuck'), wq('fixable-a'), wq('fixable-b'), wq('fixable-c')]
+  const state = { attempts: { 'newly-stuck': 3 }, stuck: {} }
+  const { toWork, toEscalate, parked } = selectWorkQueue({ routed, state })
+  assert.deepEqual(toEscalate.map((r) => r.inc.key), ['newly-stuck'])
+  assert.equal(toEscalate[0].why, 'stuck')
+  assert.equal(parked.length, 0)
+  assert.equal(toWork.length, 3, 'the escalation did not cost a dispatch slot')
+})
+
+t('an ALREADY-escalated stuck item is silent: parked, never re-written', () => {
+  // This is the `board-drainer-stuck-stub-erases-root-cause` incident: the old code re-upserted
+  // a stub over the real diagnosis on every run, 138 times in one day.
+  const routed = [wq('stuck-1')]
+  const state = { attempts: { 'stuck-1': 3 }, stuck: { 'stuck-1': { at: 'x', attempts: 3 } } }
+  const { toEscalate, parked } = selectWorkQueue({ routed, state })
+  assert.equal(toEscalate.length, 0, 'no second write')
+  assert.equal(parked.length, 1)
+})
+
+t('a `note` item is recorded outside the budget too, never charged as a dispatch', () => {
+  const routed = [
+    { inc: { key: 'vendor', source: 'production-monitor', severity: 'warning', title: 'plan expired' }, cls: { mode: 'note', owner: 'none' } },
+    wq('fixable-a'), wq('fixable-b'), wq('fixable-c'),
+  ]
+  const { toWork, toEscalate } = selectWorkQueue({ routed, state: { attempts: {}, stuck: {} } })
+  assert.deepEqual(toEscalate.map((r) => r.why), ['note'])
+  assert.equal(toWork.length, 3)
+})
+
+t('HAND TO CLAUDE hoists an item to the front, past oldest-first', () => {
+  const routed = [wq('old-a'), wq('old-b'), wq('old-c'), wq('roger-picked')]
+  const { toWork, hoisted } = selectWorkQueue({ routed, state: { attempts: {}, stuck: {} }, priorityKeys: ['roger-picked'] })
+  assert.deepEqual(hoisted, ['roger-picked'])
+  assert.equal(toWork[0].inc.key, 'roger-picked', 'the human override outranks queue position')
+})
+
+t('HAND TO CLAUDE overrides the attempt ceiling — the button is the escape hatch', () => {
+  const routed = [wq('stuck-1'), wq('stuck-2'), wq('stuck-3')]
+  const state = { attempts: { ...atCeiling }, stuck: { 'stuck-1': {}, 'stuck-2': {}, 'stuck-3': {} } }
+  const { toWork, parked } = selectWorkQueue({ routed, state, priorityKeys: ['stuck-2'] })
+  assert.equal(toWork[0].inc.key, 'stuck-2', 'Roger asking IS the new evidence')
+  assert.equal(parked.length, 2)
+})
+
+t('the severity threshold still filters, and below-bar items are counted not lost', () => {
+  const routed = [wq('quiet', { severity: 'info' }), wq('loud')]
+  const { toWork, belowBar } = selectWorkQueue({ routed, state: { attempts: {}, stuck: {} } })
+  assert.equal(belowBar, 1)
+  assert.deepEqual(toWork.map((r) => r.inc.key), ['loud'])
+})
+
+t('an item one attempt BELOW the ceiling is still dispatched', () => {
+  const routed = [wq('almost')]
+  const { toWork, toEscalate } = selectWorkQueue({ routed, state: { attempts: { almost: 2 }, stuck: {} } })
+  assert.equal(toWork.length, 1); assert.equal(toEscalate.length, 0)
+})
+
+console.log(`\n${n} assertions passed.`)
