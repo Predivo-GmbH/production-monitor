@@ -233,6 +233,25 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.DASHBOARD_PAT }}
 
+      # LAYER 2 for the fleet's auto-fixer. The board drainer ran on schedule for 30 hours on
+      # 2026-08-24 and fixed NOTHING - three permanently-stuck items ate the whole per-run
+      # budget while 34 incidents waited behind them. Every alarm we had asked "did it run?",
+      # and it did, so nothing ever went red; Roger found it by reading the board himself.
+      #
+      # This asks the two questions liveness cannot: did a run happen at all, and is work that
+      # COULD be dispatched actually being dispatched. It runs HERE rather than on the drainer's
+      # own machine on purpose - an alarm hosted by the thing it watches dies with it.
+      #
+      # It files the alarm as a SIGNAL (signal-intake), so the self-heal window, dedup and page
+      # policy all apply. `board-drainer` has deliberately NOT been given a page policy: the
+      # first signal it files will appear on /signals under "nobody ever decided whether these
+      # may alert you", with the two buttons that settle it. A new pager that pages before
+      # anyone chose it is the default-nobody-chose failure this whole system exists to remove.
+      - name: The fleet auto-fixer is still fixing things
+        run: node scripts/check-drainer-progress.mjs
+        env:
+          BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
+
       # Scoped to THIS step's outcome. Without the scope it would fire on any earlier monitor
       # failure, and the generic monitor alert below would separately mail "production monitor
       # failed" alongside an all-green results table - an alert that misdescribes itself trains

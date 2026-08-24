@@ -96,6 +96,69 @@ function readBoSecret() {
   return m[0]
 }
 
+// ── run heartbeat: what a stall alarm reads ──────────────────────────────────────────────
+/**
+ * WHY (2026-08-24): this drainer ran for 30 hours, on schedule, and fixed nothing — three stuck
+ * items ate the whole per-run budget while 34 others waited behind them. Nothing alerted,
+ * because every alarm we had asks "did it RUN?" and the answer was yes, every time.
+ *
+ * The existing coverage note says the box going dark is covered "by proxy" through the sibling
+ * local runners' healthchecks dead-man switches. True, and irrelevant here: the machine was
+ * fine. Liveness cannot see a loop that is alive and stuck.
+ *
+ * So every run publishes what it actually DID, and `check-drainer-progress.mjs` reads it and
+ * asserts two different things: that a run happened recently at all, and that work which COULD
+ * be dispatched is actually being dispatched. `last_dispatch_at` lives in the local state file
+ * so it survives runs that dispatch nothing — which is exactly the state being watched for.
+ */
+const runStats = {
+  started_at: new Date().toISOString(),
+  considered: 0,      // open/blocked/investigating incidents on the board
+  dispatchable: 0,    // passed the severity bar and not parked — work the drainer MAY take
+  dispatched: 0,      // agents actually launched this run
+  parked: 0,          // at the attempt ceiling: suppressed, deliberately
+  escalated: 0,       // recorded without an agent (notes + first-time stuck)
+  dry: !LIVE || !!FIXTURE,
+  last_dispatch_at: null,
+  error: null,
+}
+
+/**
+ * The heartbeat is a SIGNAL, not an incident: it is routine machine output, it must never look
+ * like a problem, and `state: 'resolved'` keeps it out of every active band on /signals while
+ * still bumping last_seen_at. The alarm that reads it is a separate signal with its own key.
+ */
+async function writeRunHeartbeat(secret) {
+  try {
+    const key = secret || readBoSecret()
+    const res = await fetch(`${BO_BASE}/functions/v1/signal-intake`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${key}`,
+        'Content-Type': 'application/json',
+        'User-Agent': NON_BROWSER_UA,
+      },
+      body: JSON.stringify({
+        source: 'board-drainer',
+        key: 'run',
+        kind: 'heartbeat',
+        severity: 'info',
+        state: 'resolved',
+        title: 'Board drainer run',
+        summary: runStats.error
+          ? `run ERRORED: ${String(runStats.error).slice(0, 200)}`
+          : `${runStats.considered} on the board, ${runStats.dispatchable} dispatchable, ${runStats.dispatched} dispatched, ${runStats.parked} parked${runStats.dry ? ' (dry run)' : ''}`,
+        detail: { ...runStats, finished_at: new Date().toISOString() },
+        link: 'https://cockpit.predivo.ch/signals',
+      }),
+    })
+    if (!res.ok) log(`  heartbeat NOT written (HTTP ${res.status}) — the stall alarm will read this run as a missed one.`)
+  } catch (e) {
+    // Never let the heartbeat take down the run it is reporting on.
+    log(`  heartbeat NOT written (${String(e).slice(0, 120)}) — the stall alarm will read this run as a missed one.`)
+  }
+}
+
 // ── board I/O (PostgREST; non-browser UA is mandatory) ───────────────────────────────────
 async function readBoard(secret) {
   const url = `${BO_BASE}/rest/v1/monitoring_incidents`
@@ -511,6 +574,12 @@ async function main() {
   state.attempts = state.attempts || {}
   state.stuck = state.stuck || {}
   state.timeouts = state.timeouts || {}
+  // Bootstrap the progress clock on the very first run that ever records one. Without this the
+  // stall alarm reads "never dispatched" — which is true and useless — and cries wolf for its
+  // first six hours of life, which is how an alarm gets switched off in week one. We can only
+  // honestly measure non-progress from the moment we started measuring it.
+  if (!state.lastDispatchAt) { state.lastDispatchAt = new Date().toISOString(); saveState(state) }
+  runStats.last_dispatch_at = state.lastDispatchAt || null
   log(`Board Drainer start — mode=${LIVE ? 'LIVE' : 'DRY-RUN'}${FIXTURE ? ' [FIXTURE]' : ''}`)
 
   // Clearing path 3 of 3 for the parked suppression: an operator reset. Runs before anything
@@ -605,6 +674,7 @@ async function main() {
   if (!FIXTURE && !allSourcesLoaded) log('  prune SKIPPED this run: a work-list source failed to load, so a stale counter cannot be told from an unfetched one')
 
   log(`board: ${incidents.length} open/blocked/investigating incident(s)`)
+  runStats.considered = incidents.length
   if (incidents.length === 0) { log('nothing to drain — board is clean.'); return }
 
   // 2. classify all (every open incident is re-verified), then work up to the per-run cap
@@ -613,6 +683,11 @@ async function main() {
     log(`  • [${cls.owner}/${cls.mode.toUpperCase()}] ${inc.source}/${inc.key} (${cls.reason}) :: ${inc.title}`)
   }
   const { toWork, toEscalate, parked, belowBar, hoisted, eligible } = selectWorkQueue({ routed, state, priorityKeys })
+  // Published in the heartbeat: `dispatchable > 0` with nothing dispatched, run after run, is
+  // the exact 30-hour failure, and it is invisible to any alarm that only asks "did it run?".
+  runStats.dispatchable = eligible
+  runStats.parked = parked.length
+  runStats.escalated = toEscalate.length
   if (belowBar) log(`  severity threshold '${THRESHOLD}': ${belowBar} item(s) below the bar, classified and logged above but not dispatched.`)
   if (hoisted.length) log(`  hoisted to the front by "Hand to Claude": ${hoisted.join(', ')}`)
   if (eligible > MAX_PER_RUN) log(`  blast-radius cap: ${eligible} dispatchable, taking ${MAX_PER_RUN} this run.`)
@@ -693,6 +768,13 @@ async function main() {
     try {
       const attempts = (state.attempts[inc.key] || 0) + 1
       log(`  dispatching agent [${cls.mode}] for ${inc.source}/${inc.key} (attempt ${attempts})...`)
+      // Counted at DISPATCH, not at success: the alarm asks whether the loop is moving, and a
+      // dispatch that fails is still a loop that moved. Persisted, because the run that
+      // dispatches nothing is the one whose "when did we last move" has to survive.
+      runStats.dispatched += 1
+      runStats.last_dispatch_at = new Date().toISOString()
+      state.lastDispatchAt = runStats.last_dispatch_at
+      saveState(state)
       const verdict = dispatchAgent(inc, cls.mode)
       // A TIMEOUT is infrastructure, not a failed diagnosis. Note that AGENT_TIMED_OUT is a
       // Symbol and therefore TRUTHY, so this must be tested BEFORE the `!verdict` branch below
@@ -772,7 +854,18 @@ function alertFailure(msg) {
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
   main().then(
-    () => { const hc = process.env.BOARD_DRAINER_HC; if (hc) fetch(hc).catch(() => {}) },
-    (e) => { console.error(e); alertFailure(e?.stack || e?.message || String(e)); process.exitCode = 1 },
+    async () => {
+      await writeRunHeartbeat(null)
+      const hc = process.env.BOARD_DRAINER_HC; if (hc) fetch(hc).catch(() => {})
+    },
+    async (e) => {
+      console.error(e)
+      // A run that died still publishes what it managed to do. An alarm that only ever hears
+      // from healthy runs is blind to precisely the runs worth hearing about.
+      runStats.error = e?.message || String(e)
+      await writeRunHeartbeat(null)
+      alertFailure(e?.stack || e?.message || String(e))
+      process.exitCode = 1
+    },
   )
 }
