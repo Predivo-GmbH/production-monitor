@@ -52,3 +52,18 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           ALERT_EMAIL: rogmueller1976@gmail.com
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      # Dead-man's switch. If this workflow itself stops running - disabled after 60 days of repo
+      # inactivity, deleted, renamed, or the Actions spend cap stopping every workflow in the
+      # account - healthchecks.io notices the missing ping and emails from ITS infrastructure,
+      # which is independent of ours. Silence is the failure mode a red run can never report.
+      # The URL is a secret, not inline: this repository is PUBLIC, and a published ping URL lets
+      # anyone keep the check green while the job is actually dead.
+      - name: Heartbeat
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            curl -fsS -m 10 --retry 3 "${{ secrets.HC_PING_CI_WATCHDOG }}" || true
+          else
+            curl -fsS -m 10 --retry 3 "${{ secrets.HC_PING_CI_WATCHDOG }}/fail" || true
+          fi

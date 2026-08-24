@@ -27,3 +27,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.DASHBOARD_PAT }}
           CI_BUDGET_WINDOW_DAYS: 7
+
+      - name: Heartbeat
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            curl -fsS -m 10 --retry 3 "${{ secrets.HC_PING_CI_BUDGET }}" || true
+          else
+            curl -fsS -m 10 --retry 3 "${{ secrets.HC_PING_CI_BUDGET }}/fail" || true
+          fi
