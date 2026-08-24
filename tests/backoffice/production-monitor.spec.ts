@@ -861,6 +861,91 @@ test.describe('BackOffice — Production Monitor', () => {
     })
   })
 
+  // ── API dashboard: BUDGET freshness — the denominator nobody was watching ──
+  //
+  // The test above watches `balance_override_updated_at`: the SPEND. GitHub
+  // Actions has a second, independently-updated number — `balance_initial`, the
+  // monthly BUDGET — and it is the denominator of every "$X spent of $Y budget"
+  // and "N% of budget" figure on the dashboard.
+  //
+  // On 2026-07-02 the updater that maintained it (a Playwright scrape in
+  // `Predivo-GmbH/api-dashboard`) stopped, because that repo was archived the
+  // same day: an archived repo still accepts `workflow_dispatch` and still
+  // records a `queued` run, but never assigns a runner. The spend kept updating
+  // perfectly, so the freshness test above stayed GREEN for 53 days while the
+  // page divided a live number by a frozen $100 and emailed "105% of budget"
+  // about a budget that had been raised to $150.
+  //
+  // The lesson this test encodes: a derived figure is only as fresh as its
+  // STALEST input, so watch every input, not the one that happens to be easy.
+  // 168h matches BUDGET_CONFIRM_STALE_MS in sync-usage and BUDGET_STALE_MS in
+  // the Cockpit hook — one threshold, one meaning. This copy lives here because
+  // it is machine-independent: if sync-usage itself stops running, its own
+  // "budget unverified" alert dies with it, and this one still fires.
+  test.describe('API dashboard — budget freshness', () => {
+    const BUDGET_STALE_HOURS = 168 // 7 days; GitHubBudgetSync re-reads it daily
+    const BUDGETED_APIS = ['GitHub Actions']
+
+    test(`budget figures confirmed within ${BUDGET_STALE_HOURS}h`, async () => {
+      const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY)
+
+      const { data: entries, error: entErr } = await admin
+        .from('api_entries')
+        .select('id, name')
+        .in('name', BUDGETED_APIS)
+      expect(entErr, `api_entries query failed: ${entErr?.message}`).toBeNull()
+      expect(
+        (entries ?? []).map((e) => e.name).sort(),
+        `Expected budget-tracked entries ${BUDGETED_APIS.join(', ')} in api_entries`,
+      ).toEqual([...BUDGETED_APIS].sort())
+
+      const nameById = new Map((entries ?? []).map((e) => [e.id as string, e.name as string]))
+      const { data: subs, error: subErr } = await admin
+        .from('api_subscriptions')
+        .select('api_entry_id, balance_initial, balance_initial_updated_at, balance_override')
+        .in('api_entry_id', [...nameById.keys()])
+      expect(subErr, `api_subscriptions query failed: ${subErr?.message}`).toBeNull()
+
+      const now = Date.now()
+      const stale: string[] = []
+      for (const [id, name] of nameById) {
+        const sub = (subs ?? []).find((s) => s.api_entry_id === id)
+        if (!sub || sub.balance_initial === null || !sub.balance_initial_updated_at) {
+          stale.push(`${name}: budget never confirmed (no balance_initial_updated_at)`)
+          continue
+        }
+        const ageH = (now - new Date(sub.balance_initial_updated_at).getTime()) / 3_600_000
+        if (ageH > BUDGET_STALE_HOURS) {
+          stale.push(`${name}: budget ${ageH.toFixed(1)}h unconfirmed (showing $${sub.balance_initial})`)
+          continue
+        }
+        // Independent cross-check that needs no clock: GitHub's Actions budget is
+        // set to "stop usage" at the limit, so spend genuinely cannot pass it.
+        // Spend above budget therefore means the stored budget is wrong, however
+        // recently we think we confirmed it.
+        if (sub.balance_override !== null && Number(sub.balance_override) > Number(sub.balance_initial)) {
+          stale.push(
+            `${name}: recorded spend $${sub.balance_override} exceeds recorded budget ` +
+            `$${sub.balance_initial} — impossible while stop-usage is on, so the budget is wrong`,
+          )
+        }
+      }
+
+      expect(
+        stale,
+        `Budget figure looks STALE or WRONG:\n${stale.join('\n')}\n\n` +
+          `GitHub Actions: read daily by the local Windows task "GitHubBudgetSync"\n` +
+          `  (BackOffice/scripts/sync-github-budget.mjs, CDP to the dedicated Chrome :9222).\n` +
+          `  Stale usually = Chrome down, or its github.com session logged out.\n` +
+          `  Fix: ensure Chrome is up + logged in as Predivo-GmbH, then:\n` +
+          `    schtasks /Run /TN GitHubBudgetSync\n` +
+          `  Or set the budget by hand on https://cockpit.predivo.ch/api-dashboard.\n` +
+          `Why this matters: the spend half refreshes on its own, so a stale budget does\n` +
+          `not look broken — it looks like a percentage.`,
+      ).toEqual([])
+    })
+  })
+
   // ── SEO panel freshness — catches a DEAD pull-engine weekly run ─────────────
   //
   // The /seo-engine panel is refreshed every Monday 05:00 UTC by the pull-engine
