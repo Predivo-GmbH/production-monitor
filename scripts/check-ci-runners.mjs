@@ -26,6 +26,8 @@
  * watchdog whose pass branch is satisfied by "I saw nothing" is worse than no watchdog, because
  * it manufactures confidence.
  */
+import { writeFileSync } from 'node:fs'
+
 const OWNER = process.env.CI_RUNNER_OWNER || 'Predivo-GmbH'
 const TOKEN = process.env.GH_TOKEN || process.env.GITHUB_TOKEN
 const LABEL = process.env.CI_RUNNER_LABEL || 'predivo-wsl'
@@ -139,6 +141,15 @@ if (apiErrors) {
 console.log(`repos with runners : ${migrated}`)
 console.log(`variable flips     : ${flipped.length ? flipped.join(', ') : 'none'}`)
 console.log(`apply mode         : ${APPLY ? 'on (variables are changed)' : 'off (report only)'}`)
+
+// House pattern: the guard writes findings, a matching send-*.mjs emails them on failure.
+// A red run in the GitHub UI is not an alert, because nobody is watching the GitHub UI.
+writeFileSync('ci-runner-findings.json', JSON.stringify({
+  generated_at: new Date().toISOString(),
+  repos_with_runners: migrated,
+  flips: flipped,
+  findings: alerts,
+}, null, 2))
 
 if (!alerts.length) {
   console.log('\nCI runner watchdog: PASS')

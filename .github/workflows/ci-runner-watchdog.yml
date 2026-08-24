@@ -32,7 +32,23 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
+      # nodemailer for the alert step; the checker itself is dependency-free
+      - run: npm ci
+
       - name: Check runners and move RUNNER_LABEL if needed
         run: node scripts/check-ci-runners.mjs
         env:
           GH_TOKEN: ${{ secrets.DASHBOARD_PAT }}
+
+      # A red run in the GitHub UI is NOT an alert - nobody is watching the GitHub UI. Without
+      # this the fleet could sit on paid runners for days and the first sign would be the bill.
+      - name: Email when the fleet falls back to paid runners
+        if: failure()
+        run: node scripts/send-ci-runner-alert.mjs
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: '465'
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          ALERT_EMAIL: rogmueller1976@gmail.com
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

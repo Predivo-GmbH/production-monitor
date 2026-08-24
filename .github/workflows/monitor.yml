@@ -210,6 +210,46 @@ jobs:
           AGENT_TRIAGE_ENABLED: ${{ vars.AGENT_TRIAGE_ENABLED }}
           GH_TOKEN: ${{ secrets.DASHBOARD_PAT }}
 
+      # LAYER 2 of the CI runner alarm: who watches the watchdog.
+      #
+      # ci-runner-watchdog.yml (every 10 min) moves the fleet back to paid runners when the
+      # office PC stops taking build jobs. That covers the PC dying. It does NOT cover ITSELF
+      # dying - a scheduled workflow can go silent (disabled after 60 days of repo inactivity,
+      # deleted, renamed, or the Actions spend cap tripping and stopping every workflow in the
+      # account). Silence produces no red run and therefore no alert, which is exactly the
+      # failure shape a heartbeat exists to catch.
+      #
+      # It lives HERE because this workflow is hourly and already carries the fleet's
+      # healthchecks.io dead-man's switch, so the CI alarm inherits real heartbeat coverage
+      # without needing a 21st healthchecks check - and the account is at 20 of 20 (verified
+      # 2026-08-24: POST /api/v3/checks/ returns HTTP 403 at the plan ceiling).
+      #
+      # Threshold is loose on purpose (90 min for a 10-min job = 9 missed ticks allowed).
+      # GitHub drops scheduled ticks routinely, including this very workflow's, and an alarm
+      # that cries wolf gets ignored - which is worse than no alarm.
+      - name: CI runner watchdog is still alive
+        id: ci_watchdog_alive
+        run: node scripts/check-ci-watchdog-alive.mjs
+        env:
+          GH_TOKEN: ${{ secrets.DASHBOARD_PAT }}
+
+      # Scoped to THIS step's outcome. Without the scope it would fire on any earlier monitor
+      # failure, and the generic monitor alert below would separately mail "production monitor
+      # failed" alongside an all-green results table - an alert that misdescribes itself trains
+      # you to ignore it.
+      - name: Email when the CI runner watchdog has gone silent
+        if: ${{ always() && steps.ci_watchdog_alive.outcome == 'failure' }}
+        run: |
+          node -e "require('fs').writeFileSync('ci-runner-findings.json', JSON.stringify({generated_at:new Date().toISOString(),flips:[],findings:['The CI runner watchdog has stopped running. While it is silent nobody is checking whether the office PC is taking build jobs, so if that machine goes down deploys would queue with no alert. Check the ci-runner-watchdog workflow in production-monitor.']},null,2))"
+          node scripts/send-ci-runner-alert.mjs
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: '465'
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          ALERT_EMAIL: rogmueller1976@gmail.com
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
       - name: Send alert on failure
         if: failure()
         run: node scripts/send-alert.mjs
