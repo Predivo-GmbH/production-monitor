@@ -56,6 +56,10 @@ jobs:
           IMAP_PASS: ${{ secrets.IMAP_PASS }}
 
       - name: Run production monitor
+        # Backstop for the config's globalTimeout, in case the Playwright runner itself wedges.
+        # A STEP timeout fails the job (conclusion=failure -> alert fires); the job-level
+        # timeout-minutes above yields conclusion=cancelled, which silences every alert path.
+        timeout-minutes: 18
         run: npx playwright test --project=chromium
         env:
           # BackOffice

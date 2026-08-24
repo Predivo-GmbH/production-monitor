@@ -3,6 +3,13 @@ import { defineConfig } from '@playwright/test'
 export default defineConfig({
   testDir: './tests',
   timeout: 60_000,
+  // Suite-level cap: a hung suite must end as a FAILED run, never a job-level timeout.
+  // GitHub reports an exceeded job `timeout-minutes` as conclusion=cancelled, which skips
+  // every `if: failure()` step in monitor.yml — auto-fix, auto-heal, triage AND the alert
+  // email — so a 25-min blackout run went out completely silent (2026-08-24, runner lost
+  // network egress: all 96 tests burned their full timeout). 15 min is ~3x the normal
+  // ~4m50s suite, and Playwright still writes results.json so send-alert.mjs can report.
+  globalTimeout: 15 * 60_000,
   expect: { timeout: 10_000 },
   fullyParallel: false,
   retries: 1,
