@@ -53,19 +53,28 @@ function isEnrolled({ repo, dir }) {
   } catch { return false } // 404 -> not enrolled
 }
 
-// Latest COMPLETED staging-gates run conclusion via gh api (needs a token). Returns 'success' |
-// 'failure' | 'none' (enrolled but never ran) | 'unknown' (no token to check).
+// Latest CONCLUSIVE staging-gates run conclusion via gh api (needs a token). Returns 'success' |
+// 'failure' | 'none' (enrolled but never ran, or no verdict in the recent window) | 'unknown'
+// (no token to check).
 // status=completed: this guard runs Mon 06:40 UTC, right while the gates' own Mon 06:30 cron is
 // mid-flight (conclusion null) — judging an in-progress run as 'none' false-positive FAILs
 // (BackOffice + ReplyFlow, 2026-08-17). An in-flight run is not a verdict; judge the last FINISHED one.
+// Same reasoning for 'cancelled': staging-gates.yml runs `concurrency: cancel-in-progress: true`, so a
+// Deploy/schedule/dispatch burst supersedes older runs mid-crawl, leaving a superseded 'cancelled' as the
+// newest completed run even when the gates are GREEN (2026-08-24: BackOffice + ReplyFlow both had a recent
+// 'success' but the newest completed run was a superseded 'cancelled' → false FAIL). A concurrency-cancelled
+// run is not a verdict either; scan back and judge the newest run that reached success/failure. If NONE of
+// the recent window reached a verdict, that's a genuinely stuck harness → 'none' (fails), so a truly broken
+// gate still alerts.
 function latestRunConclusion({ repo }) {
   if (!hasToken) return 'unknown'
   try {
     const out = execSync(
-      `gh api "repos/${repo}/actions/workflows/${WORKFLOW}/runs?per_page=1&status=completed" --jq ".workflow_runs[0].conclusion // \\"none\\""`,
+      `gh api "repos/${repo}/actions/workflows/${WORKFLOW}/runs?per_page=10&status=completed" --jq "[.workflow_runs[].conclusion]"`,
       { stdio: 'pipe' },
     ).toString().trim()
-    return out || 'none'
+    const conclusions = JSON.parse(out || '[]')
+    return conclusions.find((c) => c && c !== 'cancelled' && c !== 'skipped') || 'none'
   } catch { return 'none' }
 }
 
