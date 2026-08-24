@@ -55,12 +55,95 @@ function isPlatformNotFound(body: string): boolean {
 }
 
 /**
+ * Cap how many probes are in flight at once, ACROSS every caller in the run.
+ *
+ * WHY: each spec probes its project with `Promise.all(deployed.map(...))`, so a
+ * 41-function project fires 41 simultaneous POSTs at cold isolates. Supabase's
+ * edge runtime sheds that boot storm with 503s on an arbitrary subset — Valrano
+ * reddened the monitor on 2026-08-24 with 15 functions "down" on the first
+ * attempt and a DIFFERENT 5 on the retry, while all 20 answered 401 (healthy)
+ * when probed one at a time seconds later. A real outage fails the same
+ * functions every time; a boot storm fails a different lottery each time.
+ *
+ * The gate is module-level (not per-call) because Playwright runs 3 workers in
+ * one process — two projects probing at once would otherwise double the burst.
+ */
+const MAX_CONCURRENT_PROBES = 8
+let activeProbes = 0
+const probeQueue: Array<() => void> = []
+
+async function withProbeSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (activeProbes >= MAX_CONCURRENT_PROBES) {
+    await new Promise<void>((resolve) => probeQueue.push(resolve))
+  }
+  activeProbes++
+  try {
+    return await fn()
+  } finally {
+    activeProbes--
+    probeQueue.shift()?.()
+  }
+}
+
+/** Total attempts before a 5xx is believed, and the backoff before each retry. */
+const PROBE_ATTEMPTS = 3
+const PROBE_BACKOFF_MS = [800, 2000]
+/** Per-request cap so one hung function cannot burn the whole 60s test timeout. */
+const PROBE_TIMEOUT_MS = 8_000
+/**
+ * Stop RETRYING (never stop reporting) once the probe phase has run this long.
+ * The spec's Playwright timeout is 60s; if the whole fleet hangs, three attempt
+ * rounds would blow past it and the run would die as a bare timeout with no list
+ * of what was down. Past the budget we report the last answer we actually got.
+ */
+const PROBE_BUDGET_MS = 40_000
+
+/**
+ * Deadline for the CURRENT burst, shared by every function in it — a per-call
+ * budget would not bound the total, since 41 calls through 8 slots is ~5 waves
+ * of it. Re-anchored whenever a burst starts from idle (no probe in flight and
+ * none queued), so each spec's probe test gets its own full budget rather than
+ * inheriting an exhausted clock from the project probed minutes earlier.
+ */
+let burstDeadline = 0
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+type ProbeAttempt = { status: number; body: string }
+
+/** One POST. status 0 means the request never completed (timeout / network). */
+async function probeOnce(supabaseUrl: string, slug: string): Promise<ProbeAttempt> {
+  return withProbeSlot(async () => {
+    try {
+      const res = await fetch(`${supabaseUrl}/functions/v1/${slug}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+        signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+      })
+      // Only 404 and 5xx need the body; reading it for every 401 is wasted time.
+      const body =
+        res.status === 404 || res.status >= 500 ? await res.text().catch(() => '') : ''
+      return { status: res.status, body }
+    } catch (err) {
+      return { status: 0, body: err instanceof Error ? err.message : String(err) }
+    }
+  })
+}
+
+/**
  * POST to a function and report whether it is healthy. 401/403/400/422 without
- * auth/body are fine (the function booted and rejected us). Any 5xx means the
- * function is DOWN — a crashed function, a dead edge secret, or a BOOT_ERROR all
- * surface as 5xx, and "reachable = not 404" let every one of those pass for weeks
- * (ReplyFlow post-reply 503 x2 days, ChannelMover SB_SECRET_KEY x5 days — see
+ * auth/body are fine (the function booted and rejected us). A 5xx that SURVIVES
+ * every retry means the function is DOWN — a crashed function, a dead edge
+ * secret, or a BOOT_ERROR all surface as 5xx, and "reachable = not 404" let
+ * every one of those pass for weeks (ReplyFlow post-reply 503 x2 days,
+ * ChannelMover SB_SECRET_KEY x5 days — see
  * Audits/BREAKAGE_ROOT_CAUSE_INVESTIGATION_2026-07-14.md section 8).
+ *
+ * A SINGLE 5xx proves nothing, which is why we retry: a genuinely broken
+ * function fails all PROBE_ATTEMPTS, while a cold-start 503 answers on the next
+ * one. That distinction is the whole alarm — it must stay sharp in both
+ * directions, so we neither ignore 5xx nor trust the first one.
  *
  * A bare 404 is AMBIGUOUS and must not be failed on its own: functions that route
  * on a query param or path segment answer our empty probe with their OWN 404
@@ -72,16 +155,41 @@ function isPlatformNotFound(body: string): boolean {
 export async function isFunctionReachable(
   supabaseUrl: string,
   slug: string,
-): Promise<{ slug: string; status: number; reachable: boolean }> {
-  const res = await fetch(`${supabaseUrl}/functions/v1/${slug}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: '{}',
-  })
-  const status = res.status
-  if (status >= 500) return { slug, status, reachable: false }
-  if (status !== 404) return { slug, status, reachable: true }
+): Promise<{ slug: string; status: number; reachable: boolean; detail?: string }> {
+  let last: ProbeAttempt = { status: 0, body: 'no attempt made' }
+  let made = 0
 
-  const body = await res.text().catch(() => '')
-  return { slug, status, reachable: !isPlatformNotFound(body) }
+  if (activeProbes === 0 && probeQueue.length === 0) {
+    burstDeadline = Date.now() + PROBE_BUDGET_MS
+  }
+
+  for (let attempt = 0; attempt < PROBE_ATTEMPTS; attempt++) {
+    // Out of budget: keep the answer we have rather than risk a bare test timeout.
+    if (attempt > 0 && Date.now() > burstDeadline) break
+    if (attempt > 0) await sleep(PROBE_BACKOFF_MS[attempt - 1] ?? 2000)
+    last = await probeOnce(supabaseUrl, slug)
+    made++
+
+    // Anything that is not a 5xx and not a failed request is a definitive answer.
+    if (last.status !== 0 && last.status < 500) {
+      if (last.status !== 404) return { slug, status: last.status, reachable: true }
+      if (!isPlatformNotFound(last.body)) return { slug, status: 404, reachable: true }
+      return {
+        slug,
+        status: 404,
+        reachable: false,
+        detail: 'no deployment for this slug (platform NOT_FOUND)',
+      }
+    }
+  }
+
+  // Every attempt was a 5xx or a dead request — believe it, and say WHY. The body
+  // is what tells a BOOT_ERROR apart from a resource limit; the 2026-08-24 alarm
+  // reported bare "503" and cost a full diagnosis round to establish which it was.
+  return {
+    slug,
+    status: last.status,
+    reachable: false,
+    detail: `${made}x ${last.status || 'request failed'}, last body: ${last.body.slice(0, 200) || '(empty)'}`,
+  }
 }
