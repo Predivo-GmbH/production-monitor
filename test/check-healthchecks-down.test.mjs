@@ -82,4 +82,13 @@ t('the environment wins over the file, and a comma-separated list is two account
   assert.deepEqual(keys.map((k) => k.key), ['aaa', 'bbb'])
 })
 
+// This script only ever LISTS checks. A write key would also hand it every check's pause_url,
+// which is the one thing nobody reading a board should be able to do.
+t('the read-only key is taken when an account has one, and the write key only when it does not', () => {
+  const keys = readHcKeys({}, fileURLToPath(new URL('./fixtures/hc-config.fixture.json', import.meta.url)))
+  const byLabel = Object.fromEntries(keys.map((k) => [k.label, k.key]))
+  assert.equal(byLabel.primary, 'fixture-primary-readonly')
+  assert.equal(byLabel.ci, 'fixture-ci')
+})
+
 console.log(`\n${n} tests passed.`)

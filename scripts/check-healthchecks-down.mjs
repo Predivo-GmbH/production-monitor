@@ -24,8 +24,9 @@
  * mistake, not an outage, and it would fire forever until somebody fixed it.
  *
  * Contract:  node scripts/check-healthchecks-down.mjs [--dry]
- *   env: HEALTHCHECKS_API_KEYS  comma-separated read keys (CI). Falls back to every key in
- *                               ~/.claude/scripts/hc-config.json when running locally.
+ *   env: HEALTHCHECKS_API_KEYS  comma-separated READ-ONLY keys, `hcr_...` (CI). Falls back to
+ *                               every account in ~/.claude/scripts/hc-config.json when running
+ *                               locally, preferring each account's `api_key_readonly`.
  *        BOARD_SUPABASE_SECRET or BACKOFFICE_SERVICE_ROLE_KEY  to file the signal.
  * Exit 0 = judged (healthy or alarm filed). Exit 1 = could not tell, which is never "fine".
  */
@@ -50,7 +51,15 @@ function readBoSecret() {
   return m[0]
 }
 
-/** Every healthchecks account we own, as [{label, key}]. Never silently one of them. */
+/**
+ * Every healthchecks account we own, as [{label, key}]. Never silently one of them.
+ *
+ * READ-ONLY BY PREFERENCE (2026-08-25). This script only ever lists checks, so it takes each
+ * account's `api_key_readonly` (`hcr_...`) when the config has one. The write key (`hcw_...`)
+ * additionally returns every check's `pause_url`, so a holder of it can silence the fleet's
+ * monitoring — and monitoring that goes quiet reads exactly like monitoring that is happy.
+ * The write key stays as the fallback so an account without a read-only key still works.
+ */
 export function readHcKeys(env = process.env, configPath = HC_CONFIG) {
   const fromEnv = (env.HEALTHCHECKS_API_KEYS || env.HEALTHCHECKS_API_KEY || '')
     .split(',').map((k) => k.trim()).filter(Boolean)
@@ -58,7 +67,7 @@ export function readHcKeys(env = process.env, configPath = HC_CONFIG) {
 
   const cfg = JSON.parse(readFileSync(configPath, 'utf-8'))
   const accounts = Object.entries(cfg.accounts || {})
-    .map(([label, a]) => ({ label, key: a.api_key }))
+    .map(([label, a]) => ({ label, key: a.api_key_readonly || a.api_key }))
     .filter((a) => a.key)
   if (accounts.length) return accounts
   if (cfg.api_key) return [{ label: 'default', key: cfg.api_key }]

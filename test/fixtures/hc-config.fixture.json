@@ -1,7 +1,7 @@
 {
   "api_key": "fixture-default",
   "accounts": {
-    "primary": { "api_key": "fixture-primary", "project": "p1", "email": "example@example.com" },
+    "primary": { "api_key": "fixture-primary", "api_key_readonly": "fixture-primary-readonly", "project": "p1", "email": "example@example.com" },
     "ci":      { "api_key": "fixture-ci",      "project": "p2", "email": "example+ci@example.com" }
   }
 }
