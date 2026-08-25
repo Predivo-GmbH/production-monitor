@@ -24,7 +24,7 @@ import { execFileSync } from 'node:child_process'
 import { readFileSync, writeFileSync, mkdtempSync, cpSync, mkdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const REPO = path.join(HERE, '..')
@@ -42,9 +42,9 @@ let passed = 0
 let failed = 0
 
 /** Run the real checker and return { code, out }. */
-function runChecker(env = {}) {
+function runChecker(env = {}, nodeArgs = []) {
   try {
-    const out = execFileSync('node', [CHECKER], {
+    const out = execFileSync('node', [...nodeArgs, CHECKER], {
       cwd: scratch,
       encoding: 'utf-8',
       env: { ...process.env, ...env },
@@ -177,6 +177,44 @@ console.log('Source and baseline injections (no live system is modified):')
 {
   const r = runChecker({ POSTMARK_ACCOUNT_TOKEN: 'injection-not-a-real-postmark-token' })
   expectCaught('an unreadable Postmark account token makes every postmark product unaudited, not OK', r, 'its send history could not be read')
+}
+
+// 5c. A SINGLE SERVER'S OUTBOUND HISTORY IS UNREADABLE. 91e053b fixed the ACCOUNT-level unreadable
+//     case (5b) but left the PER-SERVER case as a warn(): when the account list reads fine but ONE
+//     product's Postmark server answers the outbound-history fetch with a non-2xx (a rotated or
+//     revoked server token -> 401, or a 429 partway through the sequential loop), the guard could
+//     not prove THAT product sent, yet exited 0 and dropped its row - the exact silent-BackOffice
+//     shape one level below where 5b caught it. Injected with a fetch shim (run via `node --import`
+//     in the checker's own subprocess) that lets the live account list and every other server
+//     through untouched and fails ONLY the ChannelMover server's outbound fetch, so exactly one
+//     product must go red as unaudited while the rest of the fleet stays green. No live system is
+//     modified - the shim only rewrites one HTTP response in memory.
+{
+  const shim = path.join(scratch, 'postmark-oneserver-fault.mjs')
+  writeFileSync(shim, [
+    "// Test-only fetch shim. Fails ONLY the target Postmark server's outbound-history fetch.",
+    "const TARGET = process.env.POSTMARK_FAULT_SERVER",
+    "const realFetch = globalThis.fetch",
+    "const targetTokens = new Set()",
+    "globalThis.fetch = async (url, opts = {}) => {",
+    "  const u = typeof url === 'string' ? url : url.url",
+    "  if (u.includes('/servers')) {",
+    "    // Pass the live server list through, but capture the target server's API token.",
+    "    const res = await realFetch(url, opts)",
+    "    const text = await res.text()",
+    "    try { for (const s of (JSON.parse(text).Servers || [])) if (s.Name === TARGET) for (const t of (s.ApiTokens || [])) targetTokens.add(t) } catch {}",
+    "    return new Response(text, { status: res.status, headers: { 'content-type': 'application/json' } })",
+    "  }",
+    "  if (u.includes('/messages/outbound')) {",
+    "    const h = opts.headers || {}",
+    "    const tok = h['X-Postmark-Server-Token'] || h['x-postmark-server-token']",
+    "    if (tok && targetTokens.has(tok)) return new Response('{\"Message\":\"injected 401\"}', { status: 401, headers: { 'content-type': 'application/json' } })",
+    "  }",
+    "  return realFetch(url, opts)",
+    "}",
+  ].join('\n'))
+  const r = runChecker({ POSTMARK_FAULT_SERVER: 'ChannelMover' }, ['--import', pathToFileURL(shim).href])
+  expectCaught('one product\'s Postmark server outbound history answers non-2xx (per-server unreadable)', r, 'its send history could not be read')
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

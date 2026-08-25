@@ -421,7 +421,14 @@ for (const p of BASELINE.products) {
         if (!s) {
           fail(p.product, e.env, 'its Postmark server is gone', `no Postmark server named "${e.postmarkServer}" exists on the account any more, so this product has no sending unit.`)
         } else if (s.error) {
-          warn(p.product, e.env, 'Postmark history unreadable', s.error)
+          // Per-server twin of the account-level branch above. A single server whose outbound
+          // history answers non-2xx (rotated/revoked server token -> 401, or a 429 mid-loop)
+          // means we CANNOT prove THIS product sent, so it is UNAUDITED - a hard fail, not a
+          // warn. Left as warn() by 91e053b, which fixed only the account-level case; that made
+          // the guard exit 0 and drop the row, the exact silent shape one level down (2026-08-25).
+          fail(p.product, e.env, 'unaudited',
+            `its send history could not be read (${s.error}), so whether Postmark server "${e.postmarkServer}" has actually sent is unverified. Treated as unaudited, not OK.`)
+          rows.push({ product: p.product, env: e.env, ns: 'sent', host: '?', port: '?', mode: 'postmark', status: 'UNAUDITED' })
         } else if (!s.last) {
           fail(p.product, e.env, 'it has never sent anything', `Postmark server "${e.postmarkServer}" has no outbound message in its retention window, yet this environment is declared to be sending.`)
         } else {
