@@ -10,8 +10,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+# pull-requests: read is REQUIRED. gitleaks-action lists the PR's commits through the
+# API, and without it every pull_request run dies with
+# "RequestError [HttpError]: Resource not accessible by integration, status: 403"
+# BEFORE scanning anything - a red check that never looked at a single file.
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   gitleaks:
