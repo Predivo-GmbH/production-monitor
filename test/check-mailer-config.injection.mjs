@@ -203,6 +203,10 @@ console.log('Source and baseline injections (no live system is modified):')
     "    const res = await realFetch(url, opts)",
     "    const text = await res.text()",
     "    try { for (const s of (JSON.parse(text).Servers || [])) if (s.Name === TARGET) for (const t of (s.ApiTokens || [])) targetTokens.add(t) } catch {}",
+    "    // Tell the parent test whether the LIVE account list actually yielded the target server's",
+    "    // token. If it did not (token absent/rotated/rate-limited, or the server is gone), the",
+    "    // per-server branch can never be reached and 5c must report a SKIPPED test, not a pass.",
+    "    if (targetTokens.size) console.error('__5C_SHIM_CAPTURED_TARGET__')",
     "    return new Response(text, { status: res.status, headers: { 'content-type': 'application/json' } })",
     "  }",
     "  if (u.includes('/messages/outbound')) {",
@@ -214,7 +218,32 @@ console.log('Source and baseline injections (no live system is modified):')
     "}",
   ].join('\n'))
   const r = runChecker({ POSTMARK_FAULT_SERVER: 'ChannelMover' }, ['--import', pathToFileURL(shim).href])
-  expectCaught('one product\'s Postmark server outbound history answers non-2xx (per-server unreadable)', r, 'its send history could not be read')
+  // 5c must DISCRIMINATE the per-server branch, not just see the phrase. The account-level branch
+  // (5b) and the per-server branch emit the byte-identical 'its send history could not be read',
+  // so asserting only that phrase (as this case used to via expectCaught) passes even when the
+  // shim never captured the target token and the ACCOUNT-level branch fired for ALL FOUR postmark
+  // products - the per-server branch this case exists to prove is then never reached and the
+  // regression ships green. The tell that ISOLATES the per-server branch: exactly ONE product goes
+  // unaudited for unreadable send history (ChannelMover), whereas the account-level branch takes
+  // replyflow/signalscore/BackOffice down with it (four occurrences of the phrase, not one).
+  const name5c = 'one product\'s Postmark server outbound history answers non-2xx (per-server unreadable)'
+  try {
+    assert.ok(r.out.includes('__5C_SHIM_CAPTURED_TARGET__'),
+      'the shim never captured ChannelMover\'s server token (POSTMARK_ACCOUNT_TOKEN absent/rotated/rate-limited, or the account list did not return the ChannelMover server), so the per-server branch was never exercised - reporting a SKIPPED test as a fail rather than a silent pass')
+    assert.notEqual(r.code, 0, 'the checker exited 0 - it did NOT catch the per-server unreadable defect')
+    const unreadable = (r.out.match(/its send history could not be read/g) || []).length
+    assert.equal(unreadable, 1,
+      `expected exactly ONE product unaudited for unreadable send history (the per-server branch); got ${unreadable}. More than one means the ACCOUNT-level branch fired (the 5b scenario) and the per-server branch was never reached - the byte-identical-phrase trap this case exists to catch.`)
+    assert.match(r.out, /ChannelMover\/production: unaudited/,
+      'the single unaudited product is not ChannelMover/production, so the per-server fault did not isolate to the target server')
+    console.log(`  ok   - ${name5c}`)
+    passed++
+  } catch (err) {
+    console.log(`  FAIL - ${name5c}: ${err.message}`)
+    const lines = r.out.split('\n').filter((l) => /\*\*\*|FAIL/.test(l)).slice(0, 6)
+    for (const l of lines) console.log(`         | ${l.trim()}`)
+    failed++
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
