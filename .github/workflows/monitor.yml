@@ -259,6 +259,21 @@ jobs:
         env:
           BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
 
+      # A dead automation must ALERT, not merely be visible. healthchecks.io knows within
+      # minutes that a scheduled job stopped checking in, but until 2026-08-25 that fact only
+      # ever appeared on a screen: the jobs grid renders the check grey and nobody is told, so
+      # a dead automation stayed dead until somebody happened to look. This files a DOWN check
+      # as a signal, which puts it in the cockpit's "needs you" band and lets it page.
+      #
+      # BOTH accounts are read (the original is at its 20-check plan ceiling, so CI heartbeats
+      # live in a second one). A monitor that read only one would report "nothing is down"
+      # while the other burned, and an unreadable key fails the step rather than reporting zero.
+      - name: A scheduled job that went dark must say so
+        run: node scripts/check-healthchecks-down.mjs
+        env:
+          HEALTHCHECKS_API_KEYS: ${{ secrets.HEALTHCHECKS_API_KEYS }}
+          BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
+
       # Two guards, doing two different jobs, both required:
       #   1. This step is scoped to `ci_watchdog_alive.outcome == 'failure'` so it fires ONLY for a
       #      silent watchdog, never on some unrelated earlier monitor failure.
