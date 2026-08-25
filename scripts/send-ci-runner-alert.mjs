@@ -92,6 +92,24 @@ if (report.watchdog_silent) {
 
 // Case 2: the watchdog itself is blind. Loud, distinct, non-zero.
 if (brokenReason) {
+  // The "renew the token" advice is only right when the failure is actually auth-shaped. A dropped
+  // socket, a timeout, a crash, or a batch of failed API calls is NOT an expired PAT, and telling
+  // Roger to renew the token every time trains him to distrust the one case where it IS the token.
+  // So gate that paragraph behind the reason actually looking like an auth failure (401/403, missing
+  // or broken/descoped token, permission/scope); otherwise point at the run logs for the real cause.
+  const authShaped = /\b(401|403)\b|token|scope|unauthor|forbidden|permission|administration/i.test(brokenReason)
+  const likelyCauseHtml = authShaped
+    ? `<p style="margin-top:16px;font-size:13px;color:#374151">
+        <strong>Most likely cause:</strong> the DASHBOARD_PAT expired or lost its <code>administration</code>
+        scope - the most likely auth failure of this watchdog. Renew/rescope the token and the check
+        goes green within 10 minutes.
+      </p>`
+    : `<p style="margin-top:16px;font-size:13px;color:#374151">
+        <strong>What to check:</strong> this is not an auth failure - the reason above is a crash, a
+        timeout, a dropped connection, or failed API calls, not an expired token. Open the run logs to
+        see what actually failed. (If the reason later mentions 401/403 or the token/scope, then renew
+        the DASHBOARD_PAT.)
+      </p>`
   const brokenHtml = `
   <div style="font-family:system-ui,sans-serif;max-width:760px;margin:0 auto">
     <div style="background:#dc2626;color:white;padding:16px 24px;border-radius:8px 8px 0 0">
@@ -107,11 +125,7 @@ if (brokenReason) {
       <table style="width:100%;border-collapse:collapse"><tbody>
         <tr><td style="padding:8px;border:1px solid #e5e7eb;font-size:13px">${esc(brokenReason)}</td></tr>
       </tbody></table>
-      <p style="margin-top:16px;font-size:13px;color:#374151">
-        <strong>Most likely cause:</strong> the DASHBOARD_PAT expired or lost its <code>administration</code>
-        scope - the single most likely failure of this watchdog. Renew/rescope the token and the check
-        goes green within 10 minutes.
-      </p>
+      ${likelyCauseHtml}
       ${GITHUB_RUN_URL ? `<p style="margin-top:8px"><a href="${GITHUB_RUN_URL}" style="color:#2563eb">View full run logs</a></p>` : ''}
       <p style="margin-top:8px;font-size:12px;color:#6b7280">Sent by production-monitor at ${new Date().toISOString()}</p>
     </div>
