@@ -335,6 +335,15 @@ function checkTransport(p, e, ns, info, mode, secrets) {
 // 5. Run
 // ─────────────────────────────────────────────────────────────────────────────
 
+// FIRE DRILL. An alarm nobody has ever heard is not an alarm. This injects one obviously
+// labelled finding so the whole path downstream - the red run, the alert email, and the
+// healthchecks.io ping that is the layer surviving our own mail being broken - can be exercised
+// on demand, today and in six months. It changes nothing it looks at.
+if (process.env.MAILER_FIRE_DRILL === '1') {
+  fail('(fire drill)', 'none', 'this is a TEST, nothing is broken',
+    'Somebody ran the mailer guard in fire-drill mode to check that this alert still reaches a human. No product is affected. If you did not expect this mail, the guard is fine and someone is testing it.')
+}
+
 const pm = await postmarkHistory()
 if (pm.error) warn('(fleet)', '-', 'Postmark history unavailable', `${pm.error} - no product could be checked for whether it actually sent.`)
 
