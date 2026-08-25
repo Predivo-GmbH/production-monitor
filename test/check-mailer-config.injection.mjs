@@ -168,6 +168,17 @@ console.log('Source and baseline injections (no live system is modified):')
   expectCaught('the product\'s Postmark server has disappeared', r, 'its Postmark server is gone')
 }
 
+// 5b. POSTMARK HISTORY UNREADABLE. A blank or rotated account token means the checker can read
+//     NO product's Postmark send history. Before 2026-08-25 that was a single fleet-level WARN
+//     and the whole 'did it send' block was gated on `&& pm.servers`, so the run stayed green and
+//     the four postmark products went unchecked - the exact silent-BackOffice shape this guard
+//     exists to catch. Now every postmark environment must go red as unaudited. Injected with a
+//     bogus token, so no live system is touched.
+{
+  const r = runChecker({ POSTMARK_ACCOUNT_TOKEN: 'injection-not-a-real-postmark-token' })
+  expectCaught('an unreadable Postmark account token makes every postmark product unaudited, not OK', r, 'its send history could not be read')
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Injections against the LIVE arivioo staging project - captured, broken, restored, verified
 // ─────────────────────────────────────────────────────────────────────────────

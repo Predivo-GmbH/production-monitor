@@ -404,26 +404,46 @@ for (const p of BASELINE.products) {
     }
 
     // --- 4. did it actually send? ------------------------------------------
-    if (e.traffic === 'postmark' && pm.servers) {
-      const s = pm.servers.get(e.postmarkServer)
-      if (!s) {
-        fail(p.product, e.env, 'its Postmark server is gone', `no Postmark server named "${e.postmarkServer}" exists on the account any more, so this product has no sending unit.`)
-      } else if (s.error) {
-        warn(p.product, e.env, 'Postmark history unreadable', s.error)
-      } else if (!s.last) {
-        fail(p.product, e.env, 'it has never sent anything', `Postmark server "${e.postmarkServer}" has no outbound message in its retention window, yet this environment is declared to be sending.`)
+    if (e.traffic === 'postmark') {
+      // When postmarkHistory() could not read the account (POSTMARK_ACCOUNT_TOKEN unset/rotated,
+      // or api.postmarkapp.com answered non-2xx), pm.servers is undefined. We then CANNOT prove
+      // this mailer actually sent, so the environment is UNAUDITED - a hard fail, exactly as a
+      // missing SUPABASE_TOKEN is above. Treating it as a fleet-level WARN was the 2026-08-25
+      // board finding: the whole 'did it send' block was gated on `&& pm.servers` with no else,
+      // so the four postmark products (BackOffice/ChannelMover/replyflow/signalscore production)
+      // went unchecked while the guard still printed 'All declared mailers OK' and exited 0.
+      if (!pm.servers) {
+        fail(p.product, e.env, 'unaudited',
+          `its send history could not be read (${pm.error}), so whether Postmark server "${e.postmarkServer}" has actually sent is unverified. Treated as unaudited, not OK.`)
+        rows.push({ product: p.product, env: e.env, ns: 'sent', host: '?', port: '?', mode: 'postmark', status: 'UNAUDITED' })
       } else {
-        const hours = (Date.now() - s.last.getTime()) / 3600e3
-        if (hours > e.maxSilenceHours) {
-          fail(p.product, e.env, 'it has sent nothing recently',
-            `last message through Postmark server "${e.postmarkServer}" was ${Math.round(hours)}h ago (${s.last.toISOString()}), past the ${e.maxSilenceHours}h this product is allowed to be silent.`)
+        const s = pm.servers.get(e.postmarkServer)
+        if (!s) {
+          fail(p.product, e.env, 'its Postmark server is gone', `no Postmark server named "${e.postmarkServer}" exists on the account any more, so this product has no sending unit.`)
+        } else if (s.error) {
+          warn(p.product, e.env, 'Postmark history unreadable', s.error)
+        } else if (!s.last) {
+          fail(p.product, e.env, 'it has never sent anything', `Postmark server "${e.postmarkServer}" has no outbound message in its retention window, yet this environment is declared to be sending.`)
+        } else {
+          const hours = (Date.now() - s.last.getTime()) / 3600e3
+          if (hours > e.maxSilenceHours) {
+            fail(p.product, e.env, 'it has sent nothing recently',
+              `last message through Postmark server "${e.postmarkServer}" was ${Math.round(hours)}h ago (${s.last.toISOString()}), past the ${e.maxSilenceHours}h this product is allowed to be silent.`)
+          }
+          rows.push({ product: p.product, env: e.env, ns: 'sent', host: `${s.total} msg`, port: `${Math.round(hours)}h ago`, mode: 'postmark', status: hours > e.maxSilenceHours ? 'FAIL' : 'OK' })
         }
-        rows.push({ product: p.product, env: e.env, ns: 'sent', host: `${s.total} msg`, port: `${Math.round(hours)}h ago`, mode: 'postmark', status: hours > e.maxSilenceHours ? 'FAIL' : 'OK' })
       }
     } else if (e.traffic === 'edge') {
       const a = await edgeMailActivity(e.ref, token, scan ? scan.mailFunctions : null)
-      if (a.error) warn(p.product, e.env, 'edge-function history unreadable', a.error)
-      else if (!a.count) {
+      // Same rule as the postmark path: an unreadable edge-log history means we cannot prove this
+      // mailer sent, so it is UNAUDITED (a fail), not a warn. No product declares traffic:'edge'
+      // today, so this changes nothing now - it is here so the send-proof cannot go quiet the day
+      // one does.
+      if (a.error) {
+        fail(p.product, e.env, 'unaudited',
+          `its send history could not be read (${a.error}), so whether its mail functions actually ran is unverified. Treated as unaudited, not OK.`)
+        rows.push({ product: p.product, env: e.env, ns: 'sent', host: '?', port: '?', mode: 'edge', status: 'UNAUDITED' })
+      } else if (!a.count) {
         fail(p.product, e.env, 'it has sent nothing recently',
           `no SUCCESSFUL invocation of ${(scan.mailFunctions || []).join(', ')} in the last ${a.windowHours}h, yet this environment is declared to be sending.`)
       } else {
