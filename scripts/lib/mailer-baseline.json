@@ -1,0 +1,281 @@
+{
+  "_comment": [
+    "Declared baseline for check-mailer-config.mjs. Everything the checker treats as NORMAL lives",
+    "here, so a drift from normal is a diff against this file and never a code change.",
+    "",
+    "Every value below was read from the LIVE system on 2026-08-25 (Supabase Management API secret",
+    "digests, Postmark outbound history, GoTrue admin user counts) or from the repo working copies.",
+    "",
+    "readers  = the files under supabase/functions that are ALLOWED to read each SMTP_* namespace.",
+    "           A namespace is the prefix before SMTP_ ('' = the bare SMTP_HOST/PORT/USER/PASS).",
+    "           The 2026-08-20 BackOffice outage was a SECOND file quietly reading the bare",
+    "           namespace as its fallback, so any file appearing here that is not listed FAILS.",
+    "config   = 'required' when this environment is supposed to be able to send, 'dormant' when it",
+    "           deliberately has no mailer at all.",
+    "traffic  = how we prove it actually sent. 'postmark' reads that product's Postmark server",
+    "           outbound history; 'edge' reads Supabase edge-function invocation logs; 'none' means",
+    "           the product has no audience yet, so silence is reported but is not a failure - a",
+    "           permanent red on a zero-user product is how an alarm loses its credibility.",
+    "maxSilenceHours applies only to traffic:'postmark'. The edge path counts only 2xx invocations of the functions that IMPORT the mailer - that list is derived from the source, never written down here, because a hand-kept list of function names goes stale and then reads as \"nothing sends\"."
+  ],
+  "hostCandidates": [
+    "tertia.sui-inter.net",
+    "tertia2.sui-inter.net",
+    "mail.predivo.ch",
+    "mail.valrano.com",
+    "mail.arivioo.com",
+    "smtp.postmarkapp.com",
+    "smtp.gmail.com",
+    "smtp-relay.brevo.com",
+    "email-smtp.eu-central-1.amazonaws.com",
+    "localhost"
+  ],
+  "portCandidates": [
+    "25",
+    "465",
+    "587",
+    "2525",
+    "1025",
+    "2465"
+  ],
+  "implicitTlsOnlyPort": 465,
+  "noImplicitTlsListener": [
+    "smtp.postmarkapp.com"
+  ],
+  "products": [
+    {
+      "product": "arivioo",
+      "repo": "Predivo-GmbH/Cursor_Arivioo",
+      "dir": "arivioo",
+      "account": "ARIVIOO",
+      "readers": {
+        "": [
+          "supabase/functions/_shared/email.ts"
+        ]
+      },
+      "envs": [
+        {
+          "env": "production",
+          "ref": "iooexkbuxmeryeuzpxau",
+          "config": "required",
+          "traffic": "none",
+          "trafficNote": "0 registered users (GoTrue admin x-total-count=0, re-read 2026-08-25). Nothing legitimately sends yet, so silence here is expected, not a fault. The 2026-08-24 outage was a CONFIG failure and the secrets check above catches that class hard."
+        },
+        {
+          "env": "staging",
+          "ref": "xyqdyqpdjugevjmjbcdp",
+          "config": "required",
+          "traffic": "none",
+          "trafficNote": "staging - sends only when a test drives it"
+        }
+      ]
+    },
+    {
+      "product": "BackOffice",
+      "repo": "Predivo-GmbH/backoffice",
+      "dir": "BackOffice",
+      "account": "BACKOFFICE",
+      "readers": {
+        "": [
+          "supabase/functions/_shared/email.ts"
+        ],
+        "METANET_": [
+          "supabase/functions/_shared/email.ts"
+        ],
+        "SUPPORT_": [
+          "supabase/functions/_shared/support-email.ts"
+        ]
+      },
+      "readersNote": "The ONLY product with two mailers on purpose. support-email.ts owns the SUPPORT_ namespace outright; it read the bare SMTP_HOST/SMTP_PORT as a fallback until b11c5d2, which is the 2026-08-20 outage. If it ever appears under \"\" again, that is the same bug returning.",
+      "envs": [
+        {
+          "env": "production",
+          "ref": "xoecpzfsskalvjrtcbbl",
+          "config": "required",
+          "traffic": "postmark",
+          "postmarkServer": "BackOffice",
+          "maxSilenceHours": 72
+        },
+        {
+          "env": "staging",
+          "ref": "vvgqkwiqauafcflshsec",
+          "config": "required",
+          "traffic": "none",
+          "trafficNote": "staging - sends only when a test drives it"
+        }
+      ]
+    },
+    {
+      "product": "ChannelMover",
+      "repo": "Predivo-GmbH/ChannelMover",
+      "dir": "ChannelMover",
+      "account": "CHANNELMOVER",
+      "readers": {
+        "": [
+          "supabase/functions/_shared/email.ts"
+        ],
+        "METANET_": [
+          "supabase/functions/_shared/email.ts"
+        ]
+      },
+      "envs": [
+        {
+          "env": "production",
+          "ref": "qswluvqunswggfmesdcs",
+          "config": "required",
+          "traffic": "postmark",
+          "postmarkServer": "ChannelMover",
+          "maxSilenceHours": 168
+        },
+        {
+          "env": "staging",
+          "ref": "wlbykamxcgwduixcwadn",
+          "config": "required",
+          "traffic": "none",
+          "trafficNote": "staging - sends only when a test drives it"
+        }
+      ]
+    },
+    {
+      "product": "Distribution-OS",
+      "repo": "Predivo-GmbH/distribution-os",
+      "dir": "Distribution-OS",
+      "account": "DISTRIBUTIONOS",
+      "readers": {
+        "": [
+          "supabase/functions/_shared/emailClient.ts"
+        ]
+      },
+      "envs": [
+        {
+          "env": "production",
+          "ref": "jxjpbmkgmuunpayqgbsx",
+          "config": "required",
+          "traffic": "none",
+          "trafficNote": "no proven customer mail yet; the 2026-08-24 sweep found no send in its history"
+        },
+        {
+          "env": "staging",
+          "ref": "jckctrtkstejolddqzlk",
+          "config": "dormant",
+          "configNote": "deliberately unconfigured - carries only the seven auto-provisioned Supabase variables and nothing sends from it (2026-08-24 sweep). If mailer secrets ever appear here, this line is what must change.",
+          "traffic": "none"
+        }
+      ]
+    },
+    {
+      "product": "replyflow",
+      "repo": "Predivo-GmbH/ReplyFlow",
+      "dir": "replyflow",
+      "account": "REPLYFLOW",
+      "readers": {
+        "": [
+          "supabase/functions/_shared/email.ts"
+        ],
+        "METANET_": [
+          "supabase/functions/_shared/email.ts"
+        ]
+      },
+      "envs": [
+        {
+          "env": "production",
+          "ref": "dqmhsdzldkxngwjrxois",
+          "config": "required",
+          "traffic": "postmark",
+          "postmarkServer": "ReplyFlow",
+          "maxSilenceHours": 72
+        },
+        {
+          "env": "staging",
+          "ref": "cuvqzwvyovxvvvuddtjd",
+          "config": "required",
+          "traffic": "none",
+          "trafficNote": "staging - sends only when a test drives it"
+        }
+      ]
+    },
+    {
+      "product": "ScoutCopilot",
+      "repo": "Predivo-GmbH/ScoutCopilot",
+      "dir": "ScoutCopilot",
+      "account": "SCOUTCOPILOT",
+      "readers": {
+        "": [
+          "supabase/functions/_shared/email.ts"
+        ],
+        "METANET_": [
+          "supabase/functions/_shared/email.ts"
+        ]
+      },
+      "envs": [
+        {
+          "env": "production",
+          "ref": "rlcsuqwqzoqjykdiqjye",
+          "config": "required",
+          "traffic": "none",
+          "trafficNote": "2 messages in Postmark's whole 45-day retention window (read 2026-08-25). Any silence budget short enough to be useful would be red most weeks, so silence is reported and not enforced until the product has real traffic.",
+          "postmarkServer": "ScoutCopilot"
+        }
+      ]
+    },
+    {
+      "product": "signalscore",
+      "repo": "Predivo-GmbH/signalscore",
+      "dir": "signalscore",
+      "account": "MUELLER",
+      "readers": {
+        "": [
+          "supabase/functions/_shared/emailClient.ts"
+        ],
+        "METANET_": [
+          "supabase/functions/_shared/emailClient.ts"
+        ]
+      },
+      "envs": [
+        {
+          "env": "production",
+          "ref": "ogdpgufptemcgyszmjek",
+          "config": "required",
+          "traffic": "postmark",
+          "postmarkServer": "SignalScore",
+          "maxSilenceHours": 168
+        },
+        {
+          "env": "staging",
+          "ref": "blfnyxwcriyxvsaubiqb",
+          "config": "required",
+          "traffic": "none",
+          "trafficNote": "staging - sends only when a test drives it"
+        }
+      ]
+    },
+    {
+      "product": "Valrano",
+      "repo": "Predivo-GmbH/Valrano",
+      "dir": "Valrano",
+      "account": "VALRANO",
+      "readers": {
+        "": [
+          "supabase/functions/_shared/email.ts"
+        ]
+      },
+      "readersNote": "send-document-notification/index.ts was a SECOND reader of this namespace until 5fc5fb9 (2026-08-24), and it hand-rolled SMTP over Deno.connectTls while discarding every server reply. If a second file appears here again, read that closeout before assuming it is benign.",
+      "envs": [
+        {
+          "env": "production",
+          "ref": "mkdeftmubrkseyrrbzvp",
+          "config": "required",
+          "traffic": "none",
+          "trafficNote": "no proven customer mail before the 2026-08-24 repair probes"
+        },
+        {
+          "env": "staging",
+          "ref": "vfwpcgdkrwqhdivfzmrg",
+          "config": "required",
+          "traffic": "none",
+          "trafficNote": "staging - sends only when a test drives it"
+        }
+      ]
+    }
+  ]
+}

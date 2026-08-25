@@ -1,0 +1,86 @@
+name: Product Mailer Guard
+
+# Catches an unconfigured or mis-configured product mailer before a customer does.
+#
+# Two silent mailer failures were found four days apart in August 2026: BackOffice support mail
+# died on the 20th and nobody knew for four days, and arivioo PRODUCTION turned out to have no
+# mailer secrets at all on a live public site. Neither was visible to any guard we had - the
+# only auth-email guard reads GoTrue's SMTP config, and every product actually sends from
+# EDGE-FUNCTION secrets, which nothing had ever read.
+#
+# HOURLY, not weekly like its sibling Auth Email Config Guard. The thing being measured is how
+# long a broken mailer stays broken, and the answer last time was four days. This repository is
+# PUBLIC, and GitHub does not bill Actions minutes on public repositories, so the frequency
+# costs nothing. For the same reason this repository must NEVER be given a self-hosted runner.
+
+on:
+  schedule:
+    - cron: '47 * * * *' # hourly at :47 - off-peak, and clear of the :37 production monitor
+  workflow_dispatch: {}
+
+concurrency:
+  group: mailer-config-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      # nodemailer, for the alert step only; the checker itself is dependency-free
+      - run: npm ci
+
+      - name: Read every product's live mailer config
+        # The product repos are not checked out beside this one, so the checker blobless-sparse-
+        # clones each supabase/functions tree with GH_TOKEN. It needs the source, not just the
+        # secrets: half the 2026-08-20 defect was in the CODE (implicit TLS) and half in the
+        # CONFIG (a STARTTLS port), and neither half is wrong on its own.
+        run: node scripts/check-mailer-config.mjs
+        env:
+          GH_TOKEN: ${{ secrets.DASHBOARD_PAT }}
+          MAILER_SRC_ROOT: ${{ runner.temp }}/no-local-checkouts
+          POSTMARK_ACCOUNT_TOKEN: ${{ secrets.POSTMARK_ACCOUNT_TOKEN }}
+          SUPABASE_TOKEN_ARIVIOO: ${{ secrets.SUPABASE_TOKEN_ARIVIOO }}
+          SUPABASE_TOKEN_BACKOFFICE: ${{ secrets.SUPABASE_TOKEN_BACKOFFICE }}
+          SUPABASE_TOKEN_CHANNELMOVER: ${{ secrets.SUPABASE_TOKEN_CHANNELMOVER }}
+          SUPABASE_TOKEN_DISTRIBUTIONOS: ${{ secrets.SUPABASE_TOKEN_DISTRIBUTIONOS }}
+          SUPABASE_TOKEN_MUELLER: ${{ secrets.SUPABASE_TOKEN_MUELLER }}
+          SUPABASE_TOKEN_REPLYFLOW: ${{ secrets.SUPABASE_TOKEN_REPLYFLOW }}
+          SUPABASE_TOKEN_SCOUTCOPILOT: ${{ secrets.SUPABASE_TOKEN_SCOUTCOPILOT }}
+          SUPABASE_TOKEN_VALRANO: ${{ secrets.SUPABASE_TOKEN_VALRANO }}
+
+      # A red run in the GitHub UI is NOT an alert - nobody is watching the GitHub UI. A row in a
+      # database is not an alert either; that is precisely what let the August outage run for
+      # four days.
+      - name: Email when a product cannot send
+        if: failure()
+        run: node scripts/send-mailer-alert.mjs
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: '465'
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          ALERT_EMAIL: rogmueller1976@gmail.com
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      # THE ALERT MUST NOT TRAVEL OVER THE THING BEING CHECKED. The step above leaves on our own
+      # Metanet mailbox, and three of the eight products this guard watches send through that
+      # same Metanet server - so if that is what broke, the mail above dies with it. This step is
+      # the layer that survives: healthchecks.io sees the ping (or the missing ping) and mails
+      # from ITS infrastructure, which shares nothing with ours. It also covers the failure a red
+      # run can never report - this workflow silently not running at all, because GitHub disabled
+      # it after 60 days of repo inactivity, or somebody renamed it, or a spend cap stopped every
+      # workflow in the account. The URL is a secret, not inline: this repository is PUBLIC, and
+      # a published ping URL lets anyone hold the check green while the job is actually dead.
+      - name: Heartbeat
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            curl -fsS -m 10 --retry 3 "${{ secrets.HC_PING_MAILER_GUARD }}" || true
+          else
+            curl -fsS -m 10 --retry 3 "${{ secrets.HC_PING_MAILER_GUARD }}/fail" || true
+          fi
