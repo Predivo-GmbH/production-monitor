@@ -43,6 +43,53 @@ if (!existsSync('ci-runner-findings.json')) {
   }
 }
 
+// Case 3 (LAYER 2): the watchdog WORKFLOW itself has gone silent - monitor.yml files this with
+// watchdog_silent:true when check-ci-watchdog-alive.mjs reports the every-10-min watchdog has not
+// run. This is the OPPOSITE of the benign "moved to paid runners" copy: nothing has been moved and
+// there is NO automatic fallback. While the watchdog is silent nobody flips RUNNER_LABEL, so if the
+// office PC then goes down every job queues with no alert. Distinct red copy, but exit 0 on purpose:
+// the email IS the alert, and the monitor job must stay green so the generic monitor alert does not
+// separately mail "production monitor failed" for the same event (that double-mail trains you to
+// ignore both). The monitor step is `continue-on-error`, so this failure never turns the run red.
+if (report.watchdog_silent) {
+  const detail = (report.findings && report.findings[0]) ||
+    'The CI runner watchdog has stopped running.'
+  const silentHtml = `
+  <div style="font-family:system-ui,sans-serif;max-width:760px;margin:0 auto">
+    <div style="background:#dc2626;color:white;padding:16px 24px;border-radius:8px 8px 0 0">
+      <h2 style="margin:0;font-size:18px">The CI runner watchdog has gone SILENT - the fleet has NO automatic fallback</h2>
+      <p style="margin:4px 0 0;font-size:14px;opacity:0.95">
+        This is NOT the "office PC is off, moved to paid runners" notice. NOTHING has been moved and
+        nothing is protected: while the watchdog is silent nobody is flipping the fleet to paid runners,
+        so if the office PC goes down now, every build and deploy queues with no fallback and no alert.
+      </p>
+    </div>
+    <div style="padding:24px;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 8px 8px">
+      <p style="margin:0 0 12px;font-size:13px"><strong>What the heartbeat reported:</strong></p>
+      <table style="width:100%;border-collapse:collapse"><tbody>
+        <tr><td style="padding:8px;border:1px solid #e5e7eb;font-size:13px">${esc(detail)}</td></tr>
+      </tbody></table>
+      <p style="margin-top:16px;font-size:13px;color:#374151">
+        <strong>What usually causes this:</strong> a scheduled workflow stops running silently - GitHub
+        disables it after 60 days of repo inactivity, someone deleted or renamed it, or the Actions spend
+        cap tripped and stopped every workflow in the account. Open the <code>ci-runner-watchdog</code>
+        workflow in production-monitor and re-enable / restore it; the check clears within an hour.
+      </p>
+      ${GITHUB_RUN_URL ? `<p style="margin-top:8px"><a href="${GITHUB_RUN_URL}" style="color:#2563eb">View full run logs</a></p>` : ''}
+      <p style="margin-top:8px;font-size:12px;color:#6b7280">Sent by production-monitor at ${new Date().toISOString()}</p>
+    </div>
+  </div>
+  `
+  await transporter.sendMail({
+    from: `Production Monitor <${SMTP_USER}>`,
+    to: ALERT_EMAIL,
+    subject: `[CI RUNNERS] the runner watchdog has gone SILENT - the fleet has NO automatic fallback`,
+    html: silentHtml,
+  })
+  console.log(`CI runner WATCHDOG-SILENT alert sent to ${ALERT_EMAIL}: ${detail}`)
+  process.exit(0)
+}
+
 // Case 2: the watchdog itself is blind. Loud, distinct, non-zero.
 if (brokenReason) {
   const brokenHtml = `

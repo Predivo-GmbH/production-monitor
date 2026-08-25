@@ -229,6 +229,13 @@ jobs:
       # that cries wolf gets ignored - which is worse than no alarm.
       - name: CI runner watchdog is still alive
         id: ci_watchdog_alive
+        # continue-on-error so a silent-watchdog result does NOT put the job in failure(): its own
+        # dedicated email below is the alert. Without this, the generic "Send alert on failure" step
+        # would ALSO fire (send-alert.mjs surfaces "Run failed - no per-test detail" over an all-green
+        # table), double-mailing one event with one message misdescribing itself. The step's `outcome`
+        # is still 'failure', so the scoped email below still fires; the job's healthchecks heartbeat
+        # (Layer 3) still pings, so a silent Layer-1 watchdog does not cascade into a false Layer-3 alarm.
+        continue-on-error: true
         run: node scripts/check-ci-watchdog-alive.mjs
         env:
           GH_TOKEN: ${{ secrets.DASHBOARD_PAT }}
@@ -252,14 +259,19 @@ jobs:
         env:
           BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
 
-      # Scoped to THIS step's outcome. Without the scope it would fire on any earlier monitor
-      # failure, and the generic monitor alert below would separately mail "production monitor
-      # failed" alongside an all-green results table - an alert that misdescribes itself trains
-      # you to ignore it.
+      # Two guards, doing two different jobs, both required:
+      #   1. This step is scoped to `ci_watchdog_alive.outcome == 'failure'` so it fires ONLY for a
+      #      silent watchdog, never on some unrelated earlier monitor failure.
+      #   2. The `continue-on-error` on ci_watchdog_alive (above) keeps that failure OUT of the job's
+      #      failure() state, so the generic "Send alert on failure" step does NOT also mail for the
+      #      same event. Scoping this step alone does not stop that - only continue-on-error does.
+      # The findings file is written with watchdog_silent:true so send-ci-runner-alert.mjs uses its
+      # distinct "watchdog silent - no automatic fallback" copy, not the benign "moved to paid runners"
+      # template, and exits 0 (the email is the alert; the run stays green).
       - name: Email when the CI runner watchdog has gone silent
         if: ${{ always() && steps.ci_watchdog_alive.outcome == 'failure' }}
         run: |
-          node -e "require('fs').writeFileSync('ci-runner-findings.json', JSON.stringify({generated_at:new Date().toISOString(),flips:[],findings:['The CI runner watchdog has stopped running. While it is silent nobody is checking whether the office PC is taking build jobs, so if that machine goes down deploys would queue with no alert. Check the ci-runner-watchdog workflow in production-monitor.']},null,2))"
+          node -e "require('fs').writeFileSync('ci-runner-findings.json', JSON.stringify({generated_at:new Date().toISOString(),watchdog_silent:true,flips:[],findings:['The CI runner watchdog has stopped running. While it is silent nobody is checking whether the office PC is taking build jobs, so if that machine goes down deploys would queue with no alert. Check the ci-runner-watchdog workflow in production-monitor.']},null,2))"
           node scripts/send-ci-runner-alert.mjs
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
