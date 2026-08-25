@@ -7,3 +7,4 @@ blob-report/
 auto-fix-results.json
 heartbeat-findings.json
 ci-runner-findings.json
+mailer-findings.json
