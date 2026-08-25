@@ -34,9 +34,27 @@ const LABEL = process.env.CI_RUNNER_LABEL || 'predivo-wsl'
 const APPLY = process.env.CI_RUNNER_APPLY !== '0' // set 0 to report without changing anything
 const QUEUE_ALERT_MIN = Number(process.env.CI_RUNNER_QUEUE_ALERT_MIN || 20)
 
-if (!TOKEN) {
-  console.error('::error::no GH_TOKEN / GITHUB_TOKEN - cannot check runners, and will not pretend the fleet is healthy')
+// When the watchdog itself cannot complete (no token, blind token, no runners, API errors) it must
+// still leave a report behind, marked broken, so send-ci-runner-alert.mjs (if: failure()) has
+// something to email. A red run in the GitHub UI is not an alert - nobody is watching it. Without
+// this, the most likely failure of this watchdog (an expired/descoped DASHBOARD_PAT) is silent.
+function bail(reason) {
+  try {
+    writeFileSync('ci-runner-findings.json', JSON.stringify({
+      generated_at: new Date().toISOString(),
+      watchdog_broken: true,
+      broken_reason: reason,
+      repos_with_runners: null,
+      flips: [],
+      findings: [`WATCHDOG COULD NOT COMPLETE: ${reason}`],
+    }, null, 2))
+  } catch { /* if we cannot even write the report, the alert's missing-file path still fires */ }
+  console.error(`::error::${reason}`)
   process.exit(1)
+}
+
+if (!TOKEN) {
+  bail('no GH_TOKEN / GITHUB_TOKEN - cannot check runners, and will not pretend the fleet is healthy')
 }
 
 const H = {
@@ -80,8 +98,7 @@ for (let page = 1; page <= 5; page++) {
   if (j.length < 100) break
 }
 if (!repos.length) {
-  console.error('::error::listed no private repositories. Broken token or broken harness - not a healthy fleet.')
-  process.exit(1)
+  bail('listed no private repositories. Broken token or broken harness - not a healthy fleet.')
 }
 
 const flipped = []
@@ -130,12 +147,10 @@ for (const repo of repos) {
 }
 
 if (!migrated) {
-  console.error('::error::no repository has a self-hosted runner registered. Either the migration was undone, or this token cannot see runners. Not treating that as healthy.')
-  process.exit(1)
+  bail('no repository has a self-hosted runner registered. Either the migration was undone, or this token cannot see runners. Not treating that as healthy.')
 }
 if (apiErrors) {
-  console.error(`::error::${apiErrors} API call(s) failed - this run cannot certify the fleet`)
-  process.exit(1)
+  bail(`${apiErrors} API call(s) failed - this run cannot certify the fleet`)
 }
 
 console.log(`repos with runners : ${migrated}`)
