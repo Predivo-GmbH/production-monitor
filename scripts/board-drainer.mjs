@@ -121,6 +121,7 @@ const runStats = {
   dry: !LIVE || !!FIXTURE,
   last_dispatch_at: null,
   error: null,
+  skipped: null,      // set to the switch name when a gate makes the run return without looking
 }
 
 /**
@@ -564,9 +565,18 @@ export function selectWorkQueue({ routed, state, maxPerRun = MAX_PER_RUN, maxAtt
 // ── main ────────────────────────────────────────────────────────────────────────────────
 async function main() {
   // gates
-  if (process.env.BOARD_DRAINER_DISABLED === '1') { log('KILL SWITCH set (BOARD_DRAINER_DISABLED=1) — exiting.'); return }
+  // A skipped run still publishes a heartbeat (from the .then() handler below), so it MUST say it
+  // was skipped — otherwise considered=0/dispatchable=0 reads as a clean board and the stall alarm
+  // reports the fixer as "working" while a switch is left on. check-drainer-progress.mjs reads
+  // runStats.skipped and treats it as not-ok.
+  if (process.env.BOARD_DRAINER_DISABLED === '1') {
+    log('KILL SWITCH set (BOARD_DRAINER_DISABLED=1) — exiting.')
+    runStats.skipped = 'kill switch (BOARD_DRAINER_DISABLED=1)'
+    return
+  }
   if (process.env.BOARD_DRAINER_ENABLED !== '1') {
     log('⏭️  SKIP: BOARD_DRAINER_ENABLED != 1 (wired-but-off until Roger enables it).')
+    runStats.skipped = 'wired-but-off (BOARD_DRAINER_ENABLED != 1)'
     return
   }
   if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true })

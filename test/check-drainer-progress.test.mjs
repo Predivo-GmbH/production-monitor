@@ -91,4 +91,26 @@ t('just inside the stall threshold is still ok; just outside is stalled (boundar
   assert.equal(outside.verdict, 'stalled')
 })
 
+// ── STOPPED: a run that crashed reports what it managed to do, and that is not a clean board ──
+t('a run whose heartbeat carries an error -> stopped, not ok (a crashed read is never green)', () => {
+  const j = judgeDrainer({
+    heartbeat: { last_seen_at: ago(5), detail: { error: 'board read HTTP 500: PostgREST', dispatchable: 0, dispatched: 0 } },
+    now: NOW,
+  })
+  assert.equal(j.verdict, 'stopped')
+  assert.equal(j.severity, 'critical')
+  assert.match(j.summary, /PostgREST/)
+})
+
+// ── DISABLED: the kill switch / wired-but-off gate, left on, must not read as a clean board ──
+t('a switched-off run (runStats.skipped set) -> disabled, not ok — a switch left on is not clean', () => {
+  const j = judgeDrainer({
+    heartbeat: { last_seen_at: ago(5), detail: { skipped: 'kill switch (BOARD_DRAINER_DISABLED=1)', dispatchable: 0, dispatched: 0 } },
+    now: NOW,
+  })
+  assert.equal(j.verdict, 'disabled')
+  assert.notEqual(j.verdict, 'ok')
+  assert.match(j.summary, /switched off/)
+})
+
 console.log(`\n${n} tests passed.`)

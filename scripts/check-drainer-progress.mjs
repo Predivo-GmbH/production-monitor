@@ -8,13 +8,16 @@
  * we owned asked "did it run?" — and it did, every time, so nothing ever went red. Roger found
  * it by reading the board himself.
  *
- * Liveness cannot see a loop that is alive and stuck. So this asserts two separate things:
+ * Liveness cannot see a loop that is alive and stuck. So this asserts four separate things:
  *
- *   1. STOPPED  — no run heartbeat at all, or the newest one is older than DRAINER_STALE_MIN.
- *                 (The drainer publishes a heartbeat signal on EVERY run, including one that
- *                 errored; see writeRunHeartbeat in board-drainer.mjs.)
+ *   1. STOPPED  — no run heartbeat at all, or the newest one is older than DRAINER_STALE_MIN,
+ *                 OR the newest run ERRORED (runStats.error set). The drainer publishes a
+ *                 heartbeat on EVERY run, including one that crashed; see writeRunHeartbeat in
+ *                 board-drainer.mjs. A crashed read is a stopped fixer, never a clean board.
  *   2. STALLED  — runs are happening, work IS dispatchable, and yet nothing has been dispatched
  *                 for DRAINER_STALL_HOURS. That is the 30-hour failure, stated as an invariant.
+ *   3. DISABLED — the run was skipped by the kill switch or the wired-but-off gate (runStats.skipped
+ *                 set). A switch left on looks byte-identical to a clean board; it is not-ok.
  *
  * A parked item is NOT dispatchable and never counts: parking is a deliberate suppression the
  * drainer announces every run. The alarm fires on work the drainer is allowed to take and is
@@ -87,6 +90,35 @@ export function judgeDrainer({ heartbeat, now = Date.now(), staleMin = STALE_MIN
   }
 
   const detail = heartbeat.detail || {}
+
+  // A run that THREW still publishes a heartbeat, with runStats.error set on the failure path
+  // (board-drainer.mjs) precisely so a dead run is visible. If the board read starts throwing
+  // every run (rotated service-role secret, PostgREST 500), incidents pile up unworked — that is
+  // a stopped fixer, not a clean board, and must go red. Reading only liveness here was the bug
+  // this alarm was itself built to never make (see the header: never 'ok' for an uninterpretable input).
+  if (detail.error) {
+    return {
+      verdict: 'stopped',
+      severity: 'critical',
+      title: 'The fleet auto-fixer crashed on its last run',
+      summary: `The last board-drainer run errored and fixed nothing: ${String(detail.error).slice(0, 200)}. Incidents are no longer being worked automatically until this is resolved.`,
+    }
+  }
+
+  // The kill switch (BOARD_DRAINER_DISABLED=1) and the wired-but-off gate (BOARD_DRAINER_ENABLED!=1)
+  // both make main() return early, yet a heartbeat is still written with considered=0/dispatchable=0
+  // — byte-identical to a genuinely clean board. A switch LEFT ON is exactly the "incidents pile up
+  // and the alarm reads green" failure this script exists to catch, so a run that never looked is
+  // not-ok, not clean. board-drainer.mjs stamps runStats.skipped on those early returns.
+  if (detail.skipped) {
+    return {
+      verdict: 'disabled',
+      severity: 'warning',
+      title: 'The fleet auto-fixer is switched off',
+      summary: `The board-drainer did not look at the board this run because it is switched off (${String(detail.skipped)}). Nothing is being fixed automatically; if this switch was left on, incidents are piling up unseen.`,
+    }
+  }
+
   const dispatchable = Number(detail.dispatchable || 0)
   const sinceDispatch = minsSince(detail.last_dispatch_at, now)
   if (dispatchable > 0 && (sinceDispatch === null || sinceDispatch > stallHours * 60)) {
