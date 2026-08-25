@@ -29,6 +29,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'fs'
 import { execFileSync, spawnSync } from 'child_process'
 import { join, dirname } from 'path'
+import { homedir } from 'os'
 import { pathToFileURL } from 'url'
 
 // ── config ─────────────────────────────────────────────────────────────────────
@@ -41,7 +42,7 @@ const ALLOWLIST = {
 
 const DAILY_CAP = 2
 const STATE_FILE = process.env.PROD_DEPLOYS_STATE || 'C:/Business/_board-drainer/prod-deploys.json'
-const SEND_EMAIL = 'C:/Users/roger_rwjnmnz/.claude/scripts/send_report_email.py'
+const SEND_EMAIL = join(homedir(), '.claude', 'scripts', 'send_report_email.py')
 const PROBE_TRIES = 3
 const PROBE_GAP_MS = 15_000
 

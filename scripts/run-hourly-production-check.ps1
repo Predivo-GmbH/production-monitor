@@ -1,13 +1,15 @@
 # Scheduled Task wrapper: Production Issue Auto-Fix (hourly)
 # Runs headless Claude Code against the hourly production-check prompt.
 # Versioned canonical copy (2026-08-18) — the live file deployed by the scheduled task is
-# C:\Users\roger_rwjnmnz\.claude\scripts\run-hourly-production-check.ps1; keep the two in sync.
+# ~\.claude\scripts\run-hourly-production-check.ps1; keep the two in sync.
+# Paths are parameterised on the current user (2026-08-25): the same file runs on the work PC
+# (roger_rwjnmnz) and the automation laptop (roger_spfi4lz).
 $ErrorActionPreference = 'Continue'
-$scripts = 'C:\Users\roger_rwjnmnz\.claude\scripts'
+$scripts = Join-Path $env:USERPROFILE '.claude\scripts'
 $lock    = Join-Path $scripts 'hourly-production-check.lock'
 $log     = Join-Path $scripts 'logs\hourly-production-check.log'
 $prompt  = Join-Path $scripts 'hourly-production-check-prompt.md'
-$claude  = 'C:\Users\roger_rwjnmnz\.local\bin\claude.exe'
+$claude  = Join-Path $env:USERPROFILE '.local\bin\claude.exe'
 
 # Platform preflight (2026-08-19): shared claude-auth check. If the claude platform is down
 # (OAuth expired etc.), skip this run WITHOUT pinging this job's own check /fail - one platform
@@ -38,7 +40,7 @@ try {
 
     # Attempt 1
     Add-Content $log "[$(Get-Date -Format s)] START"
-    $out  = ($text | & $claude -p --dangerously-skip-permissions --add-dir 'C:\Business' --add-dir 'C:\Users\roger_rwjnmnz\.claude' 2>&1 | Out-String)
+    $out  = ($text | & $claude -p --dangerously-skip-permissions --add-dir 'C:\Business' --add-dir "$env:USERPROFILE\.claude" 2>&1 | Out-String)
     $code = $LASTEXITCODE
     Add-Content $log $out
     Add-Content $log "[$(Get-Date -Format s)] END (exit $code)"
@@ -49,7 +51,7 @@ try {
         Add-Content $log "[$(Get-Date -Format s)] UPSTREAM-API-ERROR on attempt 1 - backing off 30s and retrying once"
         Start-Sleep -Seconds 30
         Add-Content $log "[$(Get-Date -Format s)] START (retry)"
-        $out  = ($text | & $claude -p --dangerously-skip-permissions --add-dir 'C:\Business' --add-dir 'C:\Users\roger_rwjnmnz\.claude' 2>&1 | Out-String)
+        $out  = ($text | & $claude -p --dangerously-skip-permissions --add-dir 'C:\Business' --add-dir "$env:USERPROFILE\.claude" 2>&1 | Out-String)
         $code = $LASTEXITCODE
         Add-Content $log $out
         Add-Content $log "[$(Get-Date -Format s)] END (retry, exit $code)"

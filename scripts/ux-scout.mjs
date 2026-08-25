@@ -31,13 +31,14 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { join } from 'node:path'
+import { homedir } from 'node:os'
 import { pathToFileURL } from 'node:url'
 
 // ── config ───────────────────────────────────────────────────────────────────────
 const PROJECTS_ROOT = process.env.UX_SCOUT_PROJECTS_ROOT || 'C:\\Business\\Internal Projects'
 const STATE_DIR = process.env.UX_SCOUT_HOME || 'C:\\Business\\_ux-scout'
 const LOG = join(STATE_DIR, 'ux-scout.log')
-const SEND_EMAIL = 'C:\\Users\\roger_rwjnmnz\\.claude\\scripts\\send_report_email.py'
+const SEND_EMAIL = join(homedir(), '.claude', 'scripts', 'send_report_email.py')
 const BO_CREDS = join(PROJECTS_ROOT, 'BackOffice', 'docs', 'Credentials.txt')
 const BO_REF = 'xoecpzfsskalvjrtcbbl' // BackOffice PROD (docs/Credentials.txt:18, "Production URL" line 12)
 const BO_BASE = `https://${BO_REF}.supabase.co`

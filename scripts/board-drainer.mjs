@@ -33,6 +33,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, rmSync } from 'fs'
 import { execFileSync } from 'child_process'
 import { join } from 'path'
+import { homedir } from 'os'
 import { pathToFileURL } from 'url'
 
 // ── config ──────────────────────────────────────────────────────────────────────────────
@@ -43,7 +44,7 @@ const STATE_DIR = process.env.BOARD_DRAINER_HOME || 'C:\\Business\\_board-draine
 const STATE = join(STATE_DIR, 'state.json')
 const LOG = join(STATE_DIR, 'drainer.log')
 const VERDICT_PATH = join(STATE_DIR, 'drainer-verdict.json')
-const SEND_EMAIL = 'C:\\Users\\roger_rwjnmnz\\.claude\\scripts\\send_report_email.py'
+const SEND_EMAIL = join(homedir(), '.claude', 'scripts', 'send_report_email.py')
 
 // Blast-radius cap, still a hard ceiling, but no longer the ONLY control.
 const MAX_PER_RUN = Number(process.env.BOARD_DRAINER_MAX_PER_RUN || 3)
