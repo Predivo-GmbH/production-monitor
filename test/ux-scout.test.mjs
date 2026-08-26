@@ -209,6 +209,35 @@ t('backoffice is WATCHED, not excluded as an internal tool', () => {
   assert.ok(SOURCES_FOR_TEST.some((x) => x.product === 'backoffice'))
 })
 
+t('arivioo resolves its prod ref from an audited source, not a deploy.yml it does not have', () => {
+  // arivioo ships over FTP and has no .github/workflows/deploy.yml, so resolveProdRef() hit
+  // ENOENT every run and its prod error_log went unread (incident 2026-08-26). It must carry
+  // an explicit, audited ref instead — and it must be PROD, never the staging ref that also
+  // lives in its credentials file.
+  const a = SOURCES_FOR_TEST.find((x) => x.product === 'arivioo')
+  assert.ok(a.ref && a.ref.value, 'arivioo must carry an explicit audited ref')
+  assert.equal(a.ref.value, 'iooexkbuxmeryeuzpxau', 'must be the PROD ref')
+  assert.notEqual(a.ref.value, 'xyqdyqpdjugevjmjbcdp', 'must not be the arivioo STAGING ref')
+  assert.match(a.ref.because, /Credentials\.txt/)
+})
+
+t('the "nothing is skipped" reassurance never renders while a source is UNREADABLE', () => {
+  // The report may not read as full coverage while a product could not be read at all;
+  // that contradiction (blind spot rendered as reassurance) is what the incident was.
+  const d = buildDigest([
+    { product: 'replyflow', table: 'error_log', ref: 'x', authenticated: [], anonymous: [], skipped: [] },
+    { product: 'arivioo', table: 'error_log', ref: 'y', error: 'ENOENT deploy.yml', authenticated: [], anonymous: [], skipped: [] },
+  ], 7)
+  assert.doesNotMatch(d, /Nothing is skipped/)
+  assert.match(d, /blind spot/i)
+  assert.match(d, /arivioo/)
+})
+
+t('with every source read, the full-coverage line is allowed again', () => {
+  const d = buildDigest([{ product: 'replyflow', table: 'error_log', ref: 'x', authenticated: [], anonymous: [], skipped: [] }], 7)
+  assert.match(d, /Nothing is skipped/)
+})
+
 t('every product with a failure table is watched, none silently dropped', () => {
   const want = ['replyflow', 'channelmover', 'signalscore', 'arivioo', 'valrano', 'backoffice',
                 'scoutcopilot', 'distribution-os', 'launchready']

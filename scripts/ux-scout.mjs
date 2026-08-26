@@ -102,10 +102,19 @@ export const SOURCES_FOR_TEST = [
     // arivioo: writes error_log but had 0 rows at 2026-08-20. Included anyway. A source
     // that is empty today must still be WATCHED, otherwise the day it starts producing is
     // the day nobody notices.
+    //
+    // arivioo has NO .github/workflows/deploy.yml at all — it ships to Metanet over FTP, not
+    // GitHub CI — so resolveProdRef() had nothing to read and every run failed ENOENT, leaving
+    // arivioo's prod error_log silently unread while the digest still claimed nothing was
+    // skipped (incident ux-scout:arivioo-source-unreadable, 2026-08-26). The ref therefore
+    // comes from the next-best source of truth, named here so it is auditable rather than
+    // magic. This is the PROD ref, deliberately NOT the staging ref xyqdyqpdjugevjmjbcdp that
+    // also lives in that credentials file.
     product: 'arivioo',
     repo: 'arivioo',
     table: 'error_log',
     contextFixed: true, // commit 9be8b4b
+    ref: { value: 'iooexkbuxmeryeuzpxau', because: 'docs/Credentials.txt:18 "Project ID: iooexkbuxmeryeuzpxau" + :19 "Project URL"; repo deploys via FTP so it has no .github/workflows/deploy.yml for resolveProdRef()' },
     sql: (days) => ERROR_LOG_SQL(days),
   },
   {
@@ -519,9 +528,17 @@ export function buildDigest(findings, windowDays, measured = []) {
     }
     L.push('')
   }
+  const unreadable = findings.filter((f) => f.error)
   if (NOT_COVERED.length) {
     L.push('NOT watched (stated every week on purpose, so "fleet-wide" never overstates coverage):')
     for (const [p, why] of NOT_COVERED) L.push(`  ${p}: ${why}`)
+  } else if (unreadable.length) {
+    // A source we could not read this run is a BLIND SPOT, not coverage. The reassuring
+    // "nothing is skipped" line may render ONLY when every source was actually read;
+    // otherwise a failure inside an unreadable product would be invisible AND the report
+    // would still read as full coverage — the exact contradiction that opened incident
+    // ux-scout:arivioo-source-unreadable (2026-08-26).
+    L.push(`Coverage has a blind spot this run: ${unreadable.length} product(s) could not be read (${unreadable.map((f) => f.product).join(', ')}). A failure inside them would go unseen — do NOT read this as full coverage.`)
   } else {
     L.push('Every product that ships edge functions has a failure table and is watched. Nothing is skipped.')
   }
