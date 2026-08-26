@@ -113,6 +113,12 @@ const ACCOUNTS = {
         'perform_year_end_closing', // client-called as authenticated (useYearEndClosing supabase.rpc, p_user_id=user.id); single owner's own books. anon+PUBLIC revoked separately.
         'reconcile_match',          // client-called as authenticated (useReconciliation supabase.rpc); anon+PUBLIC already revoked; verifies tx ownership internally. Single owner.
         'support_accuracy',         // read-only analytics, client-called as authenticated (useSupport supabase.rpc); single-user dashboard. anon+PUBLIC revoked separately.
+        // Fleet-signals + push RPCs (BackOffice DB, but the UI on top of them is the Cockpit).
+        // All three are called from the browser as authenticated, so service_role-only would
+        // break the Cockpit; single-user still holds - `authenticated` is Roger.
+        'set_signal_state',         // client-called as authenticated (Cockpit useFleetSignals supabase.rpc); acks/snoozes a fleet signal. anon+PUBLIC revoked in 130.
+        'set_page_policy',          // client-called as authenticated (Cockpit useFleetSignals supabase.rpc); per-source paging prefs. anon+PUBLIC revoked in 130.
+        'register_push_device',     // client-called as authenticated (Cockpit lib/push.ts supabase.rpc); upserts THIS browser's push endpoint. anon+PUBLIC revoked in 132.
       ],
     } },
     { ref: 'vvgqkwiqauafcflshsec', name: 'BackOffice Staging', exempt: STAGING },
