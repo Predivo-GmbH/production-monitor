@@ -206,7 +206,7 @@ console.log('Source and baseline injections (no live system is modified):')
     "    // Tell the parent test whether the LIVE account list actually yielded the target server's",
     "    // token. If it did not (token absent/rotated/rate-limited, or the server is gone), the",
     "    // per-server branch can never be reached and 5c must report a SKIPPED test, not a pass.",
-    "    if (targetTokens.size) console.error('__5C_SHIM_CAPTURED_TARGET__')",
+    "    if (targetTokens.size) console.log('__5C_SHIM_CAPTURED_TARGET__')",
     "    return new Response(text, { status: res.status, headers: { 'content-type': 'application/json' } })",
     "  }",
     "  if (u.includes('/messages/outbound')) {",
@@ -228,9 +228,13 @@ console.log('Source and baseline injections (no live system is modified):')
   // replyflow/signalscore/BackOffice down with it (four occurrences of the phrase, not one).
   const name5c = 'one product\'s Postmark server outbound history answers non-2xx (per-server unreadable)'
   try {
+    // Exit code FIRST: a real checker regression exits 0, and the shim marker travels on the
+    // checker's stdout, which runChecker returns on both the success (line 53) and failure paths.
+    // Ordered the other way, an exit-0 regression fails the marker assertion and gets misreported
+    // as a rotated-token SKIP instead of 'the checker did NOT catch the per-server defect'.
+    assert.notEqual(r.code, 0, 'the checker exited 0 - it did NOT catch the per-server unreadable defect')
     assert.ok(r.out.includes('__5C_SHIM_CAPTURED_TARGET__'),
       'the shim never captured ChannelMover\'s server token (POSTMARK_ACCOUNT_TOKEN absent/rotated/rate-limited, or the account list did not return the ChannelMover server), so the per-server branch was never exercised - reporting a SKIPPED test as a fail rather than a silent pass')
-    assert.notEqual(r.code, 0, 'the checker exited 0 - it did NOT catch the per-server unreadable defect')
     const unreadable = (r.out.match(/its send history could not be read/g) || []).length
     assert.equal(unreadable, 1,
       `expected exactly ONE product unaudited for unreadable send history (the per-server branch); got ${unreadable}. More than one means the ACCOUNT-level branch fired (the 5b scenario) and the per-server branch was never reached - the byte-identical-phrase trap this case exists to catch.`)
