@@ -11,6 +11,7 @@
 // half that survives: healthchecks.io notices the missing ping and mails from ITS infrastructure,
 // which shares nothing with ours. Two layers, on purpose.
 import { createMailTransport } from './lib/smtp.mjs'
+import { classifyMailerAlert } from './lib/mailer-alert-copy.mjs'
 import { readFileSync, existsSync } from 'node:fs'
 
 const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, ALERT_EMAIL, GITHUB_RUN_URL } = process.env
@@ -76,7 +77,6 @@ if (!failures.length) {
   process.exit(0)
 }
 
-const products = [...new Set(failures.map((f) => f.product))]
 const rows = failures
   .map((f) => `<tr>
       <td style="padding:8px;border:1px solid #e5e7eb;font-size:13px;white-space:nowrap"><strong>${esc(f.product)}</strong><br><span style="color:#6b7280">${esc(f.env)}</span></td>
@@ -84,14 +84,19 @@ const rows = failures
     </tr>`)
   .join('')
 
+// A finding whose `what` is 'unaudited' means the send history could not be READ, not that a send
+// was proven to have failed. classifyMailerAlert reserves "cannot send email" for the proven case
+// and renders an unaudited-only run as unaudited (2026-08-26 board finding).
+const { colour, subject, title, lede } = classifyMailerAlert(failures)
+
 await transporter.sendMail({
   from: `Production Monitor <${SMTP_USER}>`,
   to: ALERT_EMAIL,
-  subject: `[MAILERS] ${products.join(', ')} cannot send email`,
-  html: shell('#dc2626', `${products.length} product${products.length > 1 ? 's' : ''} cannot send email`,
-    'Customers hitting signup, a password reset or a support reply on these products get nothing. This is the failure that ran for four days in August 2026 before anyone noticed.',
+  subject,
+  html: shell(colour, title, lede,
     `<table style="width:100%;border-collapse:collapse"><tbody>${rows}</tbody></table>
-     <p style="margin-top:16px;font-size:13px;color:#374151">Every line above was read from the live project this hour, not from the repo. What normally causes it: a mailer secret changed on one environment and not the other, a move to a new mail provider that left the port behind, or a second piece of code quietly reading the first mailer's settings.</p>`),
+     <p style="margin-top:16px;font-size:13px;color:#374151">Every line above was read from the live project this hour, not from the repo. What normally causes it: a mailer secret changed on one environment and not the other, a move to a new mail provider that left the port behind, a second piece of code quietly reading the first mailer's settings, or a send history that could not be read (a rotated token or an upstream HTTP 500).</p>`),
 })
 
+const products = [...new Set(failures.map((f) => f.product))]
 console.log(`Mailer alert sent to ${ALERT_EMAIL} (${failures.length} finding(s) across ${products.length} product(s)).`)
