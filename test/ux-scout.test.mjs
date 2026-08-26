@@ -233,6 +233,23 @@ t('the "nothing is skipped" reassurance never renders while a source is UNREADAB
   assert.match(d, /arivioo/)
 })
 
+t('the blind-spot warning still renders when NOT_COVERED is non-empty', () => {
+  // Regression guard for the else-if chain (commit 7c5434a) that made the blind-spot line
+  // mutually exclusive with the not-watched list: while NOT_COVERED held any product, an
+  // unreadable source printed NO blind-spot disclosure and the digest read as full coverage.
+  // The three earlier blind-spot tests all run against the currently-EMPTY NOT_COVERED, so
+  // they cannot see this case; inject a non-empty list here to prove both lines coexist.
+  const d = buildDigest([
+    { product: 'replyflow', table: 'error_log', ref: 'x', authenticated: [], anonymous: [], skipped: [] },
+    { product: 'arivioo', table: 'error_log', ref: 'y', error: 'ENOENT deploy.yml', authenticated: [], anonymous: [], skipped: [] },
+  ], 7, [], [['scoutcopilot', 'no error-log helper in the repo']])
+  assert.match(d, /NOT watched/)
+  assert.match(d, /scoutcopilot/)
+  assert.match(d, /blind spot/i)
+  assert.match(d, /arivioo/)
+  assert.doesNotMatch(d, /Nothing is skipped/)
+})
+
 t('with every source read, the full-coverage line is allowed again', () => {
   const d = buildDigest([{ product: 'replyflow', table: 'error_log', ref: 'x', authenticated: [], anonymous: [], skipped: [] }], 7)
   assert.match(d, /Nothing is skipped/)

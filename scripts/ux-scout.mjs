@@ -481,7 +481,7 @@ export function escapeLiteral(s) {
 }
 
 // ── digest ───────────────────────────────────────────────────────────────────────
-export function buildDigest(findings, windowDays, measured = []) {
+export function buildDigest(findings, windowDays, measured = [], notCovered = NOT_COVERED) {
   const L = []
   const realCount = findings.reduce((n, f) => n + f.authenticated.length, 0)
   L.push(`UX Scout, last ${windowDays} days.`)
@@ -529,17 +529,20 @@ export function buildDigest(findings, windowDays, measured = []) {
     L.push('')
   }
   const unreadable = findings.filter((f) => f.error)
-  if (NOT_COVERED.length) {
+  // These three facts are INDEPENDENT and must never be chained mutually-exclusive. NOT_COVERED
+  // is 'products we chose not to watch'; unreadable is 'products we tried to read this run and
+  // could not' — a BLIND SPOT. An earlier else-if chain hung the blind-spot line off NOT_COVERED,
+  // so whenever NOT_COVERED was non-empty the digest went silent about an unreadable source and
+  // still read as full coverage — a quiet re-run of incident ux-scout:arivioo-source-unreadable
+  // (2026-08-26). Emit each on its own condition; only reassure when BOTH are empty.
+  if (notCovered.length) {
     L.push('NOT watched (stated every week on purpose, so "fleet-wide" never overstates coverage):')
-    for (const [p, why] of NOT_COVERED) L.push(`  ${p}: ${why}`)
-  } else if (unreadable.length) {
-    // A source we could not read this run is a BLIND SPOT, not coverage. The reassuring
-    // "nothing is skipped" line may render ONLY when every source was actually read;
-    // otherwise a failure inside an unreadable product would be invisible AND the report
-    // would still read as full coverage — the exact contradiction that opened incident
-    // ux-scout:arivioo-source-unreadable (2026-08-26).
+    for (const [p, why] of notCovered) L.push(`  ${p}: ${why}`)
+  }
+  if (unreadable.length) {
     L.push(`Coverage has a blind spot this run: ${unreadable.length} product(s) could not be read (${unreadable.map((f) => f.product).join(', ')}). A failure inside them would go unseen — do NOT read this as full coverage.`)
-  } else {
+  }
+  if (!notCovered.length && !unreadable.length) {
     L.push('Every product that ships edge functions has a failure table and is watched. Nothing is skipped.')
   }
   L.push('')
