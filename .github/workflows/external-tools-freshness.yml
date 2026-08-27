@@ -1,0 +1,41 @@
+name: External Tools freshness
+
+# Watches the WATCHER. The daily external-tools scan runs as a scheduled task on the CI laptop
+# (it needs the fleet repos on disk, and this repository is PUBLIC so it must never be given a
+# self-hosted runner — a fork pull request would run arbitrary code on it). That means the scan
+# itself is invisible to GitHub, so something has to notice when it stops.
+#
+# This is that something, and it is deliberately GitHub-hosted: it must still run when the
+# laptop is off, which is precisely the case it exists to detect. Public repo, so the minutes
+# are free.
+#
+# It is the guard the page it protects never had. Cockpit's old Infrastructure page was a
+# hardcoded file behind a LAST_VERIFIED constant; it froze and kept rendering confidently,
+# because nothing watched the thing that was supposed to refresh it.
+#
+# Plan: Cockpit/docs/PLAN-EXTERNAL-TOOLS-PAGE-2026-08-27.md
+
+on:
+  schedule:
+    - cron: '23 9 * * *'   # daily, five hours after the 04:17 scan — late enough that a healthy
+                           # scan has certainly landed, early enough to be seen the same morning.
+                           # Off the top of the hour: GitHub drops :00 ticks routinely.
+  workflow_dispatch: {}
+
+concurrency:
+  group: external-tools-freshness
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+      - name: Has the external-tools scan stopped?
+        env:
+          BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
+        run: node scripts/check-external-tools-freshness.mjs
