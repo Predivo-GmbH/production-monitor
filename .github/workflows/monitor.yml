@@ -283,6 +283,27 @@ jobs:
       # The findings file is written with watchdog_silent:true so send-ci-runner-alert.mjs uses its
       # distinct "watchdog silent - no automatic fallback" copy, not the benign "moved to paid runners"
       # template, and exits 0 (the email is the alert; the run stays green).
+      # A LIVE PRODUCT BEING UNREACHABLE MUST REACH ROGER — and until now nothing ever filed
+      # one. `production-monitor` has been armed in signal_page_policy since 2026-08-24 (may_page,
+      # 900s self-heal window, note "Confirmed production down"), and the audit of 2026-08-27
+      # found the alarm wired to a sensor that does not exist: "Money, a stuck customer and a
+      # dying credential are armed to ring your phone and have never received a single report,
+      # because nothing files one." Separately the count of unreachable products lost its only
+      # tile in the /monitoring -> /signals merge, so for three days it was on no page either.
+      #
+      # ONLY PERSISTENT FAILURE ALARMS. A product that fails is re-probed three times inside the
+      # run, and the first confirmed sighting is filed `warning` / needs_human:false, which
+      # upsert_signal records as `not-eligible` and which rings NOTHING. Only the next hourly run
+      # finding the same product still unreachable escalates it to critical and arms the phone.
+      # A product down for fifty minutes is on the board and silent.
+      #
+      # It fails the step rather than reporting zero when `fleet_projects` comes back empty: a
+      # registry read that returned nothing is not a fleet with nothing wrong.
+      - name: A product a customer cannot use must say so
+        run: node scripts/check-products-down.mjs
+        env:
+          BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
+
       - name: Email when the CI runner watchdog has gone silent
         if: ${{ always() && steps.ci_watchdog_alive.outcome == 'failure' }}
         run: |
