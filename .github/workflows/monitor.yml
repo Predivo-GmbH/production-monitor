@@ -328,7 +328,7 @@ jobs:
       # no heartbeat fails silent.
       - name: Heartbeat (healthchecks.io dead-man's-switch)
         if: success()
-        run: curl -fsS -m 10 --retry 3 https://hc-ping.com/ed11efd1-42e5-48d9-9b26-97dd6c284721 || true
+        run: curl -fsS -m 10 --retry 3 "${{ secrets.HC_PING_MONITOR_HOURLY }}" || true
 
       # Factory Cockpit: upsert the `monitoring` machine_state row (factory_state tile).
       # Best-effort: the script always exits 0; staleness/alert is the failure signal.

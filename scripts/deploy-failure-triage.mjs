@@ -37,6 +37,7 @@ import { execSync, execFileSync } from 'child_process'
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, rmSync } from 'fs'
 import { join } from 'path'
 import { getFleet } from '../lib/fleet.mjs'
+import { pingUrl } from './lib/hc-ping.mjs'
 
 // Fleet: name/repo/deploy-branch from the DB-backed registry (fleet_products) via getFleet(). Filter
 // to deploy-monitored products (branch != null). Falls back to the identical hardcoded superset on any
@@ -652,8 +653,8 @@ async function sendPromoEmail(items, { mode = 'alert' } = {}) {
 }
 
 // Heartbeat (2026-08-10 reliability plan): success ping / fail signal to healthchecks.io.
-const HC = 'https://hc-ping.com/530b0783-27f4-4fe7-8ea5-736a790bba8c'
+const HC = pingUrl('deploytriage-localrunner')
 Promise.resolve().then(main).then(
-  () => fetch(HC).catch(() => {}),
-  (e) => fetch(`${HC}/fail`).catch(() => {}).then(() => { console.error(e); process.exitCode = 1 }),
+  () => (HC ? fetch(HC).catch(() => {}) : undefined),
+  (e) => Promise.resolve(HC ? fetch(`${HC}/fail`).catch(() => {}) : null).then(() => { console.error(e); process.exitCode = 1 }),
 )

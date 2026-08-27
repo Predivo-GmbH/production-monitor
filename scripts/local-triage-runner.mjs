@@ -25,6 +25,7 @@
 import { execFileSync, execSync } from 'child_process'
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from 'fs'
 import { join } from 'path'
+import { pingUrl } from './lib/hc-ping.mjs'
 
 const REPO = process.env.LOCAL_TRIAGE_REPO || 'Arivioo/production-monitor'
 const BRANCH = 'master'
@@ -194,8 +195,8 @@ function main() {
 }
 
 // Heartbeat (2026-08-10 reliability plan): success ping / fail signal to healthchecks.io.
-const HC = 'https://hc-ping.com/22c411dc-3636-4032-80da-ca7deae506d0'
+const HC = pingUrl('agenttriage-localrunner')
 Promise.resolve().then(main).then(
-  () => fetch(HC).catch(() => {}),
-  (e) => fetch(`${HC}/fail`).catch(() => {}).then(() => { console.error(e); process.exitCode = 1 }),
+  () => (HC ? fetch(HC).catch(() => {}) : undefined),
+  (e) => Promise.resolve(HC ? fetch(`${HC}/fail`).catch(() => {}) : null).then(() => { console.error(e); process.exitCode = 1 }),
 )

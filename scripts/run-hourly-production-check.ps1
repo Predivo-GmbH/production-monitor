@@ -58,14 +58,26 @@ try {
         $isUpstream = ($code -ne 0) -and ($out -match $upstreamRe)
     }
 
+    # Ping URL comes from the machine-local hc-config.json, never from this repo: production-monitor
+    # is PUBLIC and a healthchecks ping URL needs no authentication, so a literal here let anyone
+    # hold this check green over a dead automation. UUID rotated 2026-08-27. If the config cannot
+    # be read we deliberately do NOT ping, which makes the check go DOWN and alert - never a
+    # hardcoded fallback, which would turn a broken config into a silent green.
+    $hcPing = $null
+    try {
+        $hcCfg = Get-Content (Join-Path $env:USERPROFILE '.claude\scripts\hc-config.json') -Raw | ConvertFrom-Json
+        $hcPing = $hcCfg.ping_urls.'production-autofix-hourly'
+    } catch { }
+    if (-not $hcPing) { Add-Content $log "[$(Get-Date -Format s)] HEARTBEAT CONFIG MISSING - not pinging; the check will go DOWN and alert" }
+
     # Heartbeat (2026-08-10 reliability plan): success ping / fail signal to healthchecks.io.
     # Persistent upstream API error => SOFT-SKIP: log it and DO NOT ping /fail (not a production failure).
     if ($code -eq 0) {
-        try { Invoke-RestMethod -Uri 'https://hc-ping.com/4d8de2d0-addb-483d-954c-045a052b3fb0' -TimeoutSec 10 | Out-Null } catch {}
+        if ($hcPing) { try { Invoke-RestMethod -Uri $hcPing -TimeoutSec 10 | Out-Null } catch {} }
     } elseif ($isUpstream) {
         Add-Content $log "[$(Get-Date -Format s)] SOFT-SKIP - persistent upstream Anthropic API error after 1 retry; NOT pinging /fail (not a production failure)"
     } else {
-        try { Invoke-RestMethod -Uri 'https://hc-ping.com/4d8de2d0-addb-483d-954c-045a052b3fb0/fail' -TimeoutSec 10 | Out-Null } catch {}
+        if ($hcPing) { try { Invoke-RestMethod -Uri "$hcPing/fail" -TimeoutSec 10 | Out-Null } catch {} }
     }
 } finally {
     Remove-Item $lock -Force -ErrorAction SilentlyContinue
