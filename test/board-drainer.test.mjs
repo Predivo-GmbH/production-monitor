@@ -5,7 +5,7 @@
  * Run: node test/board-drainer.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
-import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, parkedFields } from '../scripts/board-drainer.mjs'
+import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, parkedFields, gateFor, stripCode, actionOf, plainTitle, titleObjections, workItemSlugFor, handoffPrompt, routeToWorkBoard, prose } from '../scripts/board-drainer.mjs'
 
 let n = 0
 const t = (name, fn) => { fn(); n++; console.log(`  ok - ${name}`) }
@@ -110,13 +110,28 @@ t('a scout report carries its id so the loop can be closed back', () => {
   assert.equal(scoutReportToIncident(rep()).scoutReportId, rep().id)
 })
 
-t("REGRESSION GUARD: an OAuth scout report still hard-escalates, autonomy did NOT widen", () => {
-  // Phase 4 must not smuggle a new autonomy class in. This report is exactly the kind the
-  // scout surfaces, and OAuth is in HUMAN_HANDS, so it must still land in verify-only mode
-  // owned by Roger, identical to before Phase 4 existed.
+t("a UX report about users dead-ending in OAuth is a PRODUCT-CODE fix, not Roger's OAuth hands", () => {
+  // REWRITTEN 2026-08-27. This test used to assert verify-only "because OAuth is in HUMAN_HANDS",
+  // and that sentence WAS the defect: the report describes customers failing to complete an OAuth
+  // flow in `connect-platform`, which is a bug in our code and stops at staging like every other
+  // product fix. Nothing here asks Roger to press anything. The autonomy boundary did not widen —
+  // it is the same boundary, finally reading the request instead of counting the word "oauth".
   const c = classify(scoutReportToIncident(rep()))
+  assert.equal(c.mode, 'fix')
+  assert.equal(c.owner, 'claude')
+  assert.equal(c.handoff, false)
+})
+
+t("REGRESSION GUARD: a scout report that asks for ROGER'S OWN re-auth still escalates", () => {
+  // The genuine version of the case above: the action needed is Roger reconnecting his account,
+  // and no code change substitutes for it.
+  const c = classify(scoutReportToIncident(rep({
+    message_pattern: 'Roger must reconnect the Google account by hand before any sync can run',
+    narrative: 'the refresh grant was revoked at the provider',
+  })))
   assert.equal(c.mode, 'verify')
   assert.equal(c.owner, 'roger')
+  assert.equal(c.gate, 'human-hands')
 })
 
 t('a plain UX copy fix from the scout is Claude-owned and fixable', () => {
@@ -621,6 +636,401 @@ t('RETRY: the interval is configurable, and a 1-hour dial behaves like a 1-hour 
   assert.equal(selectWorkQueue({ ...b, now: NOW }).parkedRetry, null, 'closed at 24h')
   assert.ok(selectWorkQueue({ ...b, now: NOW, parkedRetryIntervalMs: HOUR }).parkedRetry, 'open at 1h')
 })
+
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// PLAN B, B3 part 3 (2026-08-27) — the classifier decides on WHAT THE ITEM IS
+//
+// Incident: production-monitor/board-drainer-human-hands-regex-matches-billing-nouns.
+// Every `who` string below is VERBATIM from the live production board on 2026-08-27, trimmed
+// only where a sentence was irrelevant to the decision. That matters: the old gate was written
+// against imagined text and passed its own tests while misrouting 12 of 18 real rows.
+//
+// MEASURED, production `fleet_signals`, 42 active signals, 2026-08-27:
+//   old gate: 18 routed away from the fixer — 6 genuine, 12 keyword accidents
+//   new gate:  7 routed away from the fixer — the same 6, plus one the OLD gate MISSED
+// ══════════════════════════════════════════════════════════════════════════════════════════
+
+const pending = []
+const ta = (name, fn) => { pending.push(fn().then(() => { n++; console.log(`  ok - ${name}`) })) }
+
+const live = (who, extra = {}) => ({ who_must_act: who, root_cause: '', title: '', key: 'k', source: 'silent-failure', ...extra })
+const fixable = (name, who, extra) => t(name, () => {
+  const c = classify(live(who, extra))
+  assert.equal(c.mode, 'fix', `expected FIX, got ${c.mode} (${c.reason})`)
+  assert.equal(c.owner, 'claude')
+  assert.equal(c.handoff, false, 'a code fix must never become a work-board task')
+})
+const escalates = (name, who, gateId, extra) => t(name, () => {
+  const c = classify(live(who, extra))
+  assert.equal(c.mode, 'verify', `expected escalation, got ${c.mode} (${c.reason})`)
+  assert.equal(c.owner, 'roger')
+  assert.equal(c.handoff, true, 'something needing a person must reach the work board')
+  if (gateId) assert.equal(c.gate, gateId, `expected the ${gateId} gate, got ${c.gate} (${c.reason})`)
+})
+
+// ── DIRECTION 1: the twelve keyword accidents, each one now a Claude fix ──────────────────
+
+fixable('LIVE fe87378: `--delete` is an rsync FLAG in a prescribed command, not a database op',
+  "Claude - in ChannelMover/.github/workflows/deploy.yml, after line 240 add a staging pre-upload pass for the hashed assets dir: 'mirror --reverse --verbose --no-perms ./dist/assets/ staging.channelmover.com/assets/' (same flags as the prod pass at :686-687, NO --delete). Commit, push, deploy staging, verify green.")
+
+fixable('LIVE 3fea238: deleting a LINE OF CODE at a path is an edit, not a row delete',
+  'Claude - delete the `if (pending.length === 1) return pending[0]` line at supabase/functions/github-invite-poller/index.ts:105 so ambiguous invites fall through to the safe \'unmatched\' branch (accept, email the operator, grant nothing).')
+
+fixable('LIVE pull-engine: deleting a JSON FILE is not deleting a row',
+  "Claude - fix the ROOT this time: widen NOT_INDEXED_RE at pull-engine/scripts/index-health.mjs:51 so 'URL is unknown to Google' is not counted as INDEXED, then delete data/circuit-breaker.json to resume channelmover.")
+
+fixable('LIVE 4e2a4fe: "DELETE the variable" is a workflow edit',
+  'Claude - in production-monitor scripts/check-ci-runners.mjs, treat `zero registered runners AND RUNNER_LABEL===LABEL` like the `online===0 && isSet` branch (alert + DELETE the variable), and only `continue` when no runner is registered.')
+
+fixable('LIVE 47afebf: deleting an `if:` guard from a workflow, plus "drop" inside a commit MESSAGE',
+  "Claude - class A one-line CI fix (workflow edit, NOT a prod deploy): delete `if: steps.playwright-cache.outputs.cache-hit != 'true'` at ReplyFlow .github/workflows/deploy.yml:886, then `git commit -m '[board-drainer] ci: drop stale Playwright cache-hit guard on prod-smoke'` and push.")
+
+fixable('LIVE cde2cb2: "delete deploy.yml:864" — a file:line reference is not an object',
+  "Claude - In C:/Business/Internal Projects/ChannelMover delete deploy.yml:864 (`if: steps.playwright-cache.outputs.cache-hit != 'true'`) from the prod-smoke 'Install Playwright chromium' step, commit, push, confirm deploy.yml green. CI/infra class, no gate needed - nothing here needs Roger's hands.")
+
+fixable('LIVE f666a20: "Delete deploy-staging.yml L211"',
+  "Claude - Delete deploy-staging.yml L211, carry across the 4-line 'No cache-hit guard' comment from test.yml:45-48, commit that one file, push, confirm deploy-staging.yml green.")
+
+fixable('LIVE 632a349: "DROP the ... sentence" is prose editing',
+  "Claude - apply the Class-A fix in production-monitor/scripts/lib/mailer-alert-copy.mjs: return colour '#dc2626' with guard-broken wording and DROP the 'Reserve action for a run that names a proven send failure' sentence; then commit, push, deploy to prod (low-blast-radius monitor class).")
+
+fixable('LIVE b1ff1a4: "delete the two comments"',
+  'Claude - in Predivo-GmbH/BackOffice pick one and ship it: either add a GitHub-hosted job that runs the specs on webkit, or delete the two comments that claim a Safari fallback exists - test.yml:85 and playwright.config.ts:10-13 - so nobody trusts coverage we do not have.')
+
+fixable('LIVE actions-fanout-cost: "Drop confirmed -> close", and a SPEND decision named as the branch NOT taken',
+  "Claude - this row's whole remaining action is a scheduled READING on/after 2026-08-26 compared against the pre-2026-08-24 baseline. Drop confirmed -> close. No drop -> re-diagnose the consumer and hand Roger ONE spend decision, never a reading task.")
+
+fixable('LIVE the meta-incident: payment / OAuth / invoice / pay inside the sentence DESCRIBING this very bug',
+  "Claude - (1) SPLIT THE LANE on the REASON, not the capability class: a row blocked by a real human gate (prod-deploy-guard allowlist, payment, OAuth, a decision) goes to Roger and says which gate. (4) Narrow HUMAN_HANDS (:397) to require a human VERB adjacent to its object so 'stripe dashboard'/'invoice'/'pay' inside a code description stops matching.",
+  { key: 'board-drainer-human-hands-regex-matches-billing-nouns', source: 'production-monitor' })
+
+fixable('LIVE 162c12b: support-article FILENAMES (refunds, payments-and-vat, pricing-and-plans) are a path, not a billing action',
+  "Roger - re-dispatch to a WRITE-authorized board-drainer run (this is Class-A infra dev work, NOT a Roger gate: no decision/secret/payment/OAuth). In ChannelMover .github/workflows/deploy.yml push.paths-ignore, delete `- '**/*.md'` and replace `- 'docs/**'` with `- 'docs/*.md'`, so that docs/support-kb/en/{refunds,payments-and-vat,pricing-and-plans}.md reach the sync again.")
+
+t('the accident is gone at the SOURCE: those nouns are simply not in the action any more', () => {
+  // The mechanism, asserted directly rather than only through its consequence.
+  assert.equal(stripCode('mirror ./dist/assets/ staging.channelmover.com/assets/ NO --delete'), 'mirror NO')
+  assert.equal(stripCode('delete deploy.yml:864 from the step'), 'delete from the step')
+  assert.equal(stripCode('set the staging edge secret AFFILIATE_ALERT_EMAIL to a non-personal address'),
+    'set the staging edge secret to a non-personal address')
+  assert.match(stripCode('read docs/support-kb/en/{refunds,payments-and-vat,pricing-and-plans}.md'), /^read\b/)
+  assert.doesNotMatch(stripCode('read docs/support-kb/en/{refunds,payments-and-vat,pricing-and-plans}.md'), /refund|payment|pricing/i)
+})
+
+t('ONLY the prescribed action is read — a title full of billing nouns cannot escalate anything', () => {
+  const c = classify({
+    who_must_act: 'Claude - fix the stale assertion in the spec',
+    title: 'Invoice page: the refund button charges the customer card twice',
+    root_cause: 'The vendor dashboard shows a payment. Reconnect the Google account to see it.',
+  })
+  assert.equal(c.mode, 'fix', 'describing a billing bug is not a request to move money')
+  assert.equal(c.gate, null)
+})
+
+// ── DIRECTION 2: the genuine escalations, all still escalating ────────────────────────────
+
+escalates('LIVE sentry/142350725: Roger runs the release himself; the action names no automatable path',
+  'Roger - a routine ReplyFlow release when it suits you, NOT an emergency. Run EXACTLY: `gh workflow run deploy.yml -f confirm=deploy` in the replyflow repo. The confirm flag is load-bearing.',
+  'owner-roger')
+
+escalates('LIVE 62520d7: "one decision, no code" is exactly what a human gate looks like',
+  'Roger - one decision, no code: may a PRODUCT function (sync-growth-plan) be deployed to BackOffice PROD for this fix? Say yes and Claude does the rest in one pass. Say no and the fix stays on staging.',
+  'business-decision')
+
+escalates('LIVE b11c5d2: the same, after a re-ownership stamp',
+  'Roger - RE-OWNED 2026-08-25T02:55Z. One decision, no code: may the PRODUCT function support-send-due be deployed to BackOffice PROD? prod-deploy-guard.mjs allows only monitoring-board + health-monitor there, by design, so no automated path exists.',
+  'business-decision')
+
+escalates('LIVE claude-weekly-limit: raising a plan costs money, and no code substitutes for it',
+  'Roger - one decision: either raise the Claude plan so the weekly budget lasts the whole week, or say the word and the four knowledge loops get cut back.',
+  'business-decision')
+
+escalates('LIVE recurring-costs: the figures are on his bank statement and nowhere we can read',
+  'Roger - open the recurring_costs registry in BackOffice and enter the amount + renewal date for the 4 UNVERIFIED rows.',
+  'owner-roger')
+
+escalates('LIVE 7b2867bf: SETTING an edge secret is still a secrets action, however plain the rest is',
+  'Claude - in ReplyFlow monitor-sync-health, extend the readiness filter at index.ts:138 to ALSO drop refresh_token=null connections from the syncable set, AND set the staging edge secret AFFILIATE_ALERT_EMAIL to a non-personal address, then deploy monitor-sync-health to staging.',
+  'secrets')
+
+escalates('LIVE gh-cli-keyring: storing a new token as a repo secret — a hole the OLD noun list did not even cover',
+  'Claude - a SEPARATE TOKEN for fleet automation is a browser+CLI credential flow, mine to create, scope narrowly, store as a repo/org secret and add to the credential inventory.',
+  'secrets')
+
+// The five hard classes, in their canonical form. These are the posture, and it does not move.
+escalates('POSTURE: deleting rows from a table', 'Claude - delete the orphaned rows from the platform_connections table', 'destructive-db')
+escalates('POSTURE: a migration applied to production', 'Claude - apply the pending migration to production once it is reviewed', 'destructive-db')
+escalates('POSTURE: rotating a key', 'Claude - rotate the Supabase service key, the legacy one is disabled', 'secrets')
+escalates('POSTURE: issuing a refund', 'Claude - issue a refund via the Stripe dashboard for the duplicate charge', 'payments')
+escalates('POSTURE: emailing affected customers', 'Claude - email the affected customers to tell them the export was incomplete', 'customer-comms')
+escalates('POSTURE: reconnecting a Google account', 'Roger - reconnect the Google account, the grant was revoked', 'human-hands')
+
+t('a gate names the exact span that tripped it — "it escalated" is not evidence', () => {
+  const g = gateFor(live('Claude - rotate the Supabase service key'))
+  assert.equal(g.id, 'secrets')
+  assert.match(g.evidence, /rotate the Supabase service key/i)
+})
+
+t('a DISCLAIMED gate does not fire, but a real one later in the same text still does', () => {
+  // Both halves matter. The first sentence is verbatim from ChannelMover cde2cb2.
+  assert.equal(gateFor(live('Claude - CI/infra class, no gate needed - nothing here needs Roger\'s hands.')), null)
+  const g = gateFor(live("Claude - CI/infra class, nothing here needs Roger's hands. Then rotate the service key."))
+  assert.equal(g?.id, 'secrets', 'a disclaimer must not shadow a genuine gate further down')
+})
+
+t('a "Roger -" prefix that DISOWNS itself goes back to Claude — but a gate always outranks that', () => {
+  const back = classify(live("Roger - re-dispatch to a WRITE-authorized run; NOT a Roger gate: no decision/secret/payment/OAuth. Delete the stale workflow step."))
+  assert.equal(back.owner, 'claude')
+  const still = classify(live("Roger - re-dispatch to a WRITE-authorized run, NOT a Roger gate. Then delete the orphaned rows from the sessions table."))
+  assert.equal(still.owner, 'roger', 'the disclaimer is not a master key')
+  assert.equal(still.gate, 'destructive-db')
+})
+
+t('a vendor plan expiring still wins over every gate — noted, never escalated', () => {
+  const c = classify({ who_must_act: 'Roger - renew the Smartlead plan', root_cause: 'HTTP 401 Plan expired', title: 'sync failed' })
+  assert.equal(c.mode, 'note')
+  assert.equal(c.handoff, false)
+})
+
+t('a stuck CI edit is NOT re-owned to Roger by the stuck path either', () => {
+  // stuckWhoMustAct shared the old noun list, so "delete deploy.yml:864" acquired a human owner
+  // the moment it hit the attempt ceiling — the second half of the same defect.
+  assert.equal(stuckWhoMustAct('Claude - delete deploy.yml:864 from the prod-smoke step').owner, 'Claude')
+  assert.equal(stuckWhoMustAct('Claude - rotate the Supabase service key').owner, 'Roger')
+})
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// B3 part 3 — a signal that needs a person becomes a WORK-BOARD ITEM and leaves the board
+// ══════════════════════════════════════════════════════════════════════════════════════════
+
+const rogerInc = (o = {}) => ({
+  source: 'production-monitor', key: 'backoffice-recurring-costs-unverified-rows',
+  title: 'Fill the 4 UNVERIFIED rows in the recurring_costs registry',
+  severity: 'warning', status: 'blocked', opened_at: '2026-08-19T10:00:00Z',
+  who_must_act: 'Roger - open the recurring_costs registry in BackOffice and enter the amount + renewal date for the 4 UNVERIFIED rows.',
+  root_cause: 'BackOffice prod recurring_costs still has 4 rows with no verified amount. Nobody but Roger holds these figures.',
+  ...o,
+})
+
+// ── the one line Roger reads ──────────────────────────────────────────────────────────────
+
+t('the title comes from what ROGER MUST DO, not from what the machine found', () => {
+  const { title, from } = plainTitle(rogerInc())
+  assert.equal(from, 'action')
+  assert.equal(title, 'Open the recurring costs registry in BackOffice and enter the amount + renewal date for the 4 unverified rows')
+})
+
+t('every jargon class the board actually produces is caught by titleObjections', () => {
+  const cases = {
+    '[commit-review] BackOffice 62520d7: emails counted as internal': /bracket tag|commit id/,
+    'delete deploy.yml:864 from the prod-smoke step': /filename|line number/,
+    'fix supabase/functions/github-invite-poller/index.ts': /file path/,
+    'set AFFILIATE_ALERT_EMAIL to a non-personal address': /identifier/,
+    "remove `if: steps.playwright-cache.outputs.cache-hit != 'true'`": /backticks/,
+    'run the deploy with --confirm=deploy': /flag/,
+    'the fix is at 62520d7abc1234': /commit id/,
+    'Do the thing. Then do the other thing.': /more than one sentence/,
+  }
+  for (const [bad, why] of Object.entries(cases)) {
+    const objections = titleObjections(bad).join('; ')
+    assert.match(objections, why, `"${bad}" should have been objected to (${why}); got: ${objections || 'nothing'}`)
+  }
+  assert.deepEqual(titleObjections('Open the recurring costs registry in BackOffice and enter the amounts'), [])
+})
+
+t('a bookkeeping stamp is never the title — b11c5d2 used to become "RE-owned 2026-08-25T02:55Z"', () => {
+  const { title } = plainTitle(rogerInc({
+    who_must_act: 'Roger - RE-OWNED 2026-08-25T02:55Z. One decision, no code: may the PRODUCT function support-send-due be deployed to BackOffice PROD?',
+  }))
+  assert.doesNotMatch(title, /^RE-?owned/i)
+  assert.match(title, /one decision/i)
+  // And a LONG stamp, which is the harder half: a short one is already skipped for being too
+  // short to be a sentence, so only this case actually exercises the bookkeeping rule.
+  const { title: long } = plainTitle(rogerInc({
+    who_must_act: 'Roger - RE-VERIFIED at HEAD and re-owned by the closer on 2026-08-25 at 02:55Z. One decision, no code: may the function be deployed to production?',
+  }))
+  assert.doesNotMatch(long, /^RE-?verified/i)
+  assert.match(long, /one decision/i)
+})
+
+t('a title that cannot be cleaned is still used, but it SAYS SO — it never passes silently', () => {
+  const { title, objections } = plainTitle({
+    who_must_act: 'Roger - confirm that count(*) = 0 for the affected view before anyone touches it',
+    title: 'Roger - confirm that count(*) = 0 for the affected view before anyone touches it',
+  })
+  assert.ok(title.length, 'an item with an imperfect title still beats a problem rotting on the alarm board')
+  assert.ok(objections.length, 'and the caller is told, so it can be recorded on the item')
+})
+
+t('the paste-ready prompt carries the ORIGINAL action and diagnosis verbatim, plus provenance', () => {
+  const inc = rogerInc()
+  const p = handoffPrompt(inc, classify(inc))
+  assert.ok(p.includes(inc.who_must_act), 'the action goes in uncleaned — the title is for Roger, this is for the session')
+  assert.ok(p.includes(inc.root_cause))
+  assert.ok(p.includes('production-monitor/backoffice-recurring-costs-unverified-rows'))
+  assert.match(p, /superseded, not resolved/)
+})
+
+t('the prompt names a working directory when the repo is knowable, and stays silent when it is not', () => {
+  assert.match(handoffPrompt({ key: 'ChannelMover:abc:x', title: '' }, null), /Working directory: C:\/Business\/Internal Projects\/ChannelMover/)
+  assert.doesNotMatch(handoffPrompt({ key: 'something-unmapped', title: 'no product named here' }, null), /Working directory/)
+})
+
+// ── idempotency ───────────────────────────────────────────────────────────────────────────
+
+const fakeBoard = () => {
+  const items = new Map()
+  const evidence = []
+  let creates = 0
+  return {
+    items, evidence, creates: () => creates, superseded: [],
+    deps: {
+      log() {},
+      async findItem(slug) { return items.get(slug) || null },
+      async createItem(row) { creates++; const it = { id: `id-${creates}`, ...row }; items.set(row.slug, it); return it },
+      async addEvidence(itemId, ev) { evidence.push({ itemId, ...ev }) },
+      async supersedeSignal() { return true },
+    },
+  }
+}
+
+ta('IDEMPOTENT: the same signal seen twice mints ONE item', async () => {
+  const b = fakeBoard()
+  const inc = rogerInc()
+  await routeToWorkBoard(inc, classify(inc), b.deps)
+  const second = await routeToWorkBoard(inc, classify(inc), b.deps)
+  assert.equal(b.creates(), 1, 'a second sighting must not mint a second item')
+  assert.equal(second.created, false)
+  assert.equal(b.items.size, 1)
+})
+
+t('IDEMPOTENT across a REWORDING: the slug is keyed on the signal, never on the title', () => {
+  // Rows on this board are re-owned and re-worded constantly — one has been rewritten four times
+  // in three days. A title-derived slug would mint a fresh item on every edit.
+  const a = workItemSlugFor(rogerInc())
+  const b = workItemSlugFor(rogerInc({ title: 'Something completely different now', who_must_act: 'Roger - and a different action too' }))
+  assert.equal(a, b)
+  assert.notEqual(a, workItemSlugFor(rogerInc({ key: 'a-different-signal' })))
+  assert.notEqual(a, workItemSlugFor(rogerInc({ source: 'cron' })), 'same key on another source is another problem')
+})
+
+ta('IDEMPOTENT: an item Roger already FINISHED is not re-minted', async () => {
+  const b = fakeBoard()
+  const inc = rogerInc()
+  b.items.set(workItemSlugFor(inc), { id: 'old', slug: workItemSlugFor(inc), status: 'done' })
+  const r = await routeToWorkBoard(inc, classify(inc), b.deps)
+  assert.equal(b.creates(), 0)
+  assert.equal(r.created, false)
+})
+
+ta('the prompt is attached to the item as evidence, once', async () => {
+  const b = fakeBoard()
+  const inc = rogerInc()
+  await routeToWorkBoard(inc, classify(inc), b.deps)
+  await routeToWorkBoard(inc, classify(inc), b.deps)
+  const prompts = b.evidence.filter((e) => /PASTE THIS/.test(e.title))
+  assert.equal(prompts.length, 1)
+  assert.ok(prompts[0].detail.includes(inc.who_must_act))
+})
+
+ta('the signal is superseded EVERY time, not only on the run that minted the item', async () => {
+  // A signal can be reopened by its producer after the hand-off. If supersede only ran on the
+  // creating run, the row would come back and stay back — visible noise for work already queued.
+  const b = fakeBoard()
+  let calls = 0
+  b.deps.supersedeSignal = async () => { calls++; return true }
+  const inc = rogerInc()
+  await routeToWorkBoard(inc, classify(inc), b.deps)
+  await routeToWorkBoard(inc, classify(inc), b.deps)
+  assert.equal(calls, 2)
+})
+
+ta('a hand-off that cannot be written NEVER supersedes the signal', async () => {
+  // The one failure mode worse than a noisy board: a signal quietly removed into a task that
+  // does not exist.
+  const b = fakeBoard()
+  b.deps.createItem = async () => { throw new Error('HTTP 500') }
+  let superseded = false
+  b.deps.supersedeSignal = async () => { superseded = true; return true }
+  const inc = rogerInc()
+  await assert.rejects(() => routeToWorkBoard(inc, classify(inc), b.deps), /HTTP 500/)
+  assert.equal(superseded, false, 'the alarm stays up until the task provably exists')
+})
+
+ta('a work item is born unowned and marked as coming from the monitor', async () => {
+  const b = fakeBoard()
+  const inc = rogerInc()
+  await routeToWorkBoard(inc, classify(inc), b.deps)
+  const item = [...b.items.values()][0]
+  assert.equal(item.status, 'next')
+  assert.equal(item.source, 'monitor')
+  assert.equal(item.kind, 'task')
+  assert.equal(item.owner_session, undefined, 'nobody is on it yet — `next` rows carry no owner')
+})
+
+// ── the queue: a hand-off costs no agent run and no blast-radius budget ───────────────────
+
+t('QUEUE: hand-offs are recorded without an agent and do NOT eat the per-run cap', () => {
+  const mk = (key, who) => ({ inc: { key, source: 's', severity: 'critical', who_must_act: who, title: '', root_cause: '' }, cls: classify({ key, who_must_act: who, title: '', root_cause: '' }) })
+  const routed = [
+    mk('needs-roger-1', 'Roger - one decision: raise the plan or cut the loops'),
+    mk('needs-roger-2', 'Claude - rotate the Supabase service key'),
+    mk('fix-a', 'Claude - delete deploy.yml:864 from the prod-smoke step'),
+    mk('fix-b', 'Claude - delete the two comments that claim a Safari fallback exists'),
+    mk('fix-c', 'Claude - DROP the stale sentence from the alert copy'),
+  ]
+  const { toWork, toEscalate } = selectWorkQueue({ routed, state: { attempts: {}, stuck: {} }, now: Date.now() })
+  assert.equal(toEscalate.filter((e) => e.why === 'handoff').length, 2)
+  assert.equal(toWork.length, 3, 'all three code fixes still get their dispatch slots')
+  assert.deepEqual(toWork.map((w) => w.inc.key), ['fix-a', 'fix-b', 'fix-c'])
+})
+
+t('QUEUE: a BELOW-THRESHOLD item that needs a person is still handed over', () => {
+  // Found by a dry run against the live board: `backoffice-recurring-costs-unverified-rows` is
+  // severity `info`, so the severity bar filtered it out BEFORE the hand-off branch and it stayed
+  // on the alarm surface — too quiet to be worked, too human to be fixed. The bar is a
+  // blast-radius dial for agent dispatches; a hand-off dispatches nothing.
+  const who = 'Roger - open the recurring costs registry and enter the amounts from the invoices'
+  const routed = [{ inc: { key: 'quiet', source: 's', severity: 'info', who_must_act: who }, cls: classify({ key: 'quiet', who_must_act: who }) }]
+  const { toEscalate, belowBar } = selectWorkQueue({ routed, state: { attempts: {}, stuck: {} }, now: Date.now() })
+  assert.equal(toEscalate.filter((e) => e.why === 'handoff').length, 1)
+  assert.equal(belowBar, 0, 'and it is not ALSO counted as skipped-below-the-bar')
+})
+
+t('QUEUE: "Hand to Claude" outranks the hand-off — Roger asking for it wins', () => {
+  const who = 'Roger - one decision: raise the plan or cut the loops'
+  const routed = [{ inc: { key: 'k', source: 's', severity: 'critical', who_must_act: who }, cls: classify({ key: 'k', who_must_act: who }) }]
+  const { toWork, toEscalate, hoisted } = selectWorkQueue({ routed, state: { attempts: {}, stuck: {} }, now: Date.now(), priorityKeys: ['k'] })
+  assert.equal(toEscalate.filter((e) => e.why === 'handoff').length, 0, 'it must not be filed away behind his back')
+  assert.deepEqual(hoisted, ['k'])
+  assert.equal(toWork.length, 1)
+})
+
+t('a long title is cut at a CLAUSE, and the objections describe the title actually used', () => {
+  // Also found by the dry run: `commit-review/Cockpit:2d2415c` produced a 138-character candidate
+  // that was recorded as "too long" and then silently shortened, so the complaint referred to a
+  // string nobody would ever see.
+  const inc = {
+    who_must_act: '',
+    title: 'Cockpit 2d2415c: work_open with the same title flips an awaiting_signoff row back to in_progress, silently removing it from Roger\'s sign-off queue',
+  }
+  const { title, objections } = plainTitle(inc)
+  assert.ok(title.length <= 120, `title is ${title.length} chars`)
+  assert.doesNotMatch(title, /\S$/u.test(title) ? /Roge$/ : /$^/, 'never cut mid-word')
+  assert.deepEqual(objections, titleObjections(title), 'the objections are about THIS string, not a discarded one')
+  assert.deepEqual(objections, [])
+})
+
+t('QUEUE: BOARD_DRAINER_HANDOFF=0 puts the old behaviour back, unchanged', () => {
+  const who = 'Roger - one decision: raise the plan or cut the loops'
+  const routed = [{ inc: { key: 'k', source: 's', severity: 'critical', who_must_act: who }, cls: classify({ key: 'k', who_must_act: who }) }]
+  const off = selectWorkQueue({ routed, state: { attempts: {}, stuck: {} }, now: Date.now(), handoff: false })
+  assert.equal(off.toEscalate.filter((e) => e.why === 'handoff').length, 0)
+  assert.equal(off.toWork.length, 1, 'with the switch off it is dispatched read-only, exactly as before')
+})
+
+await Promise.all(pending)
 
 console.log(`
 ${n} assertions passed.`)

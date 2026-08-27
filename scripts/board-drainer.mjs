@@ -34,6 +34,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, rmSync } from 'fs'
 import { execFileSync } from 'child_process'
+import { createHash } from 'crypto'
 import { join } from 'path'
 import { homedir } from 'os'
 import { pathToFileURL } from 'url'
@@ -138,6 +139,7 @@ const runStats = {
   dispatched: 0,      // agents actually launched this run
   parked: 0,          // at the attempt ceiling: suppressed, deliberately (excludes the one revived below)
   parked_retry: null, // the one parked key handed back to the agent this run, or null (Plan B B3.2)
+  handoff: 0,         // items routed OFF the alarm surface onto the work board (Plan B B3.3)
   escalated: 0,       // recorded without an agent (notes + first-time stuck)
   dry: !LIVE || !!FIXTURE,
   last_dispatch_at: null,
@@ -452,7 +454,13 @@ export function scoutReportToIncident(r) {
       r.state_reason ? `Roger marked this real: ${r.state_reason}` : '',
       `Evidence: ${JSON.stringify(r.sample_evidence || {})}`,
     ].filter(Boolean).join(' '),
-    who_must_act: 'Claude - fix the user-facing failure, staging deploy only',
+    // The report's OWN WORDS ride in who_must_act, and they have to. Since 2026-08-27 a gate reads
+    // the prescribed action and nothing else (see stripCode/gateFor above), and a scout report has
+    // no prescribed action of its own — every one of them would otherwise arrive carrying the same
+    // generic sentence and no gate could ever fire on any of them. A report that says "orphan rows
+    // should be deleted from the connections table" is asking for destructive database work, and
+    // the only place it says so is here.
+    who_must_act: `Claude - fix the user-facing failure, staging deploy only: ${r.message_pattern || ''}${r.narrative ? ` (${r.narrative})` : ''}`.trim(),
     scoutReportId: r.id,
   }
 }
@@ -472,41 +480,648 @@ async function markScoutReport(secret, id, patch) {
   if (!res.ok) log(`  scout_reports patch failed for ${String(id).slice(0, 8)}: HTTP ${res.status}`)
 }
 
-// ── classifier: owner + hard-escalate gate (the nuanced fix decision is the agent's, under policy) ──
-// A HARD-ESCALATE class is never dispatched to the agent — it needs Roger's hands or a forbidden verb.
-const HUMAN_HANDS = /\b(oauth|re-?auth|reconnect|reconnect|google account|log ?in|sign ?in|vendor|support ticket|business decision|pricing|refund|new secret|new credential|new api key|rotate|payment|invoice|pay\b|charge|bank|stripe dashboard)\b/i
-const DESTRUCTIVE_DB = /\b(delete|drop|truncate|purge|destroy|remove (?:the )?(?:row|record|connection|table)|ddl|migration to (?:prod|production))\b/i
+// ── classifier: WHAT THE ITEM IS, not which nouns turn up in its text ────────────────────────
+/**
+ * REWRITTEN 2026-08-27 (Plan B, B3 part 3 — Cockpit/docs/PLAN-QUIET-BOARD-2026-08-27.md), against
+ * incident `production-monitor/board-drainer-human-hands-regex-matches-billing-nouns`.
+ *
+ * THE DEFECT. The old gate was two flat noun lists tested against
+ * `who_must_act || root_cause || title`, concatenated into one blob. A single occurrence of
+ * `delete`, `drop`, `invoice`, `pay`, `payment`, `rotate` or `vendor` ANYWHERE in that blob pushed
+ * the row out of the fixer's lane and into a lane named after Roger.
+ *
+ * MEASURED against the live production board 2026-08-27 — 42 active signals, 18 routed away from
+ * the fixer, of which SIX genuinely need Roger and TWELVE were keyword accidents. The twelve, each
+ * with the exact token that did it:
+ *
+ *   `--delete`, an rsync FLAG in a prescribed command      ChannelMover  fe87378
+ *   "delete the `if (...)` line at index.ts:105"           BackOffice    3fea238
+ *   "delete data/circuit-breaker.json"                     cron          pull-engine breaker
+ *   "DELETE the variable"                                  prod-monitor  4e2a4fe
+ *   "delete `if: ...`" in a workflow                       ReplyFlow     47afebf
+ *   "delete deploy.yml:864"                                ChannelMover  cde2cb2
+ *   "Delete deploy-staging.yml L211"                       Distribution  f666a20
+ *   "DROP the '...' sentence"                              prod-monitor  632a349
+ *   "delete the two comments"                              BackOffice    b1ff1a4
+ *   "Drop confirmed -> close"                              prod-monitor  actions-fanout-cost
+ *   `payment` / `OAuth` / `invoice` inside the sentence DESCRIBING THIS VERY BUG
+ *   `{refunds,payments-and-vat,pricing-and-plans}.md` — support-article FILENAMES  ChannelMover 162c12b
+ *
+ * Not one is a payment, a secret or a database operation. Every one is a one-line code or workflow
+ * edit the fixer is allowed to make, and each sat blocked for days waiting for a human who was
+ * never coming. That is where a 41-of-42-blocked board comes from.
+ *
+ * THE FIX, three rules:
+ *
+ *  1. ONLY THE PRESCRIBED ACTION DECIDES. A gate reads `who_must_act` and nothing else. `title`
+ *     and `root_cause` DESCRIBE the problem — a page title carrying the word "invoice", an error
+ *     message quoted verbatim that says "reconnect the account" — and describing is not
+ *     instructing. This one rule kills five of the twelve on its own.
+ *  2. CODE IS NOT PROSE. Backticked spans, file paths, `file.yml:123` refs, CLI flags, commit ids
+ *     and SCREAMING_SNAKE identifiers are removed before any gate reads the sentence. `--delete`
+ *     is not a verb and `deploy.yml:864` is not an object.
+ *  3. A GATE NEEDS A VERB AND ITS OBJECT, ADJACENT. "delete … row" is database work; "delete …
+ *     comments" is an edit. The old list could not tell them apart because it never looked at the
+ *     object at all.
+ *
+ * THE SAFETY POSTURE DOES NOT MOVE. Destructive database work, secrets, payments, customer
+ * communication and Roger's own hands all still escalate — recognised now by what is being ASKED
+ * FOR instead of by which nouns appeared. Two deliberate non-changes:
+ *
+ *  - PRODUCTION PROMOTION OF PRODUCT CODE is NOT a text gate here, and must not become one. It is
+ *    enforced where it can actually be enforced: SYSTEM_POLICY class B (product fixes stop at
+ *    staging) and prod-deploy-guard's hard-coded allowlist, which REFUSES any function not on it.
+ *    A text rule cannot separate "deploy to prod (low-blast-radius monitor class)" — permitted,
+ *    and on the board verbatim today — from a product promotion, which is not.
+ *  - EXPECTED_BUSINESS still reads the whole row. It is a statement about STATE ("HTTP 401 Plan
+ *    expired"), not about an action, and state legitimately lives in root_cause.
+ */
+
 // EXPECTED business state, not an incident: a vendor plan/subscription lapsed (e.g. Smartlead
 // "HTTP 401 Plan expired"). These get upserted as status=expected (visible but muted on the board,
-// not counted as open) instead of sitting in Open Incidents forever. Checked BEFORE HUMAN_HANDS —
+// not counted as open) instead of sitting in Open Incidents forever. Checked BEFORE every gate —
 // a lapsed plan is noted, not escalated.
 const EXPECTED_BUSINESS = /\b(plan expired|plan (?:lapsed|cancelled|canceled|cancellation)|subscription (?:expired|lapsed|inactive|cancelled|canceled)|payment required|upgrade required|billing suspended|account (?:suspended|paused))\b/i
 
-// Every open incident is RE-VERIFIED against the live source each run — this is the root fix for the
-// class that bit us (a self-healed false-red that sat blocked because the email-driven Closer never
-// re-visited it). Claude-owned, safely-fixable items get FIX mode (full tools). Everything else
-// (owner=Roger, or a destructive/human-hands class) gets VERIFY mode: read-only, can ONLY close-if-green
-// (auto-close a self-healed row, any owner) or leave it escalated. VERIFY never performs a fix.
+/** The PRESCRIBED ACTION, with the owner prefix and any of the drainer's own stuck preambles
+ *  stripped. This — and only this — is what a gate is allowed to read. */
+export function actionOf(inc) {
+  return String(inc?.who_must_act || '')
+    .replace(/^(?:Roger|Claude)\s*[-:]\s*board-drainer could not resolve after \d+ tries;\s*/gi, '')
+    .replace(/^(?:Roger|Claude)\s*[-:]\s*auto-fix stuck[^;]*;\s*/gi, '')
+    .replace(/^(?:Roger|Claude)\s*[-:]\s*/i, '')
+    .trim()
+}
+
+/**
+ * Remove every span that is CODE rather than prose, so a token inside a command, a path or an
+ * identifier can never cast a vote. Rule 2 above, made mechanical.
+ *
+ * Order matters: paths go BEFORE anything else, or
+ * `docs/support-kb/en/{refunds,payments-and-vat,pricing-and-plans}.md` survives as loose nouns.
+ *
+ * A snake_case token is DELETED here, never unpacked into words. Unpacking it was tried first and
+ * it re-created the exact defect one layer down: `client_email` became "client email" and tripped
+ * the customer-comms gate on `silent-failure/BackOffice:87dc7c8`, whose action is an RLS policy
+ * migration and touches no customer. An identifier is code; code is not prose. (plainTitle() uses
+ * its own softer pass, `prose()`, because a HUMAN reading a title does want "recurring costs".)
+ */
+export function stripCode(s) {
+  return String(s || '')
+    .replace(/`[^`]*`/g, ' ')                                             // `backticked code`
+    .replace(/\$\{[^}]*\}/g, ' ')                                         // ${template} holes
+    .replace(/(?:^|[\s(])--?[A-Za-z][\w-]*(?:=\S+)?/g, ' ')               // CLI flags: --delete, -f confirm=deploy
+    .replace(/\b[A-Za-z]:[\\/][^\s,;)'"]+/g, ' ')                         // C:/Business/Internal Projects/...
+    .replace(/\b[\w.@-]+(?:[\\/][\w.@{}*,-]+)+(?::\d+(?:-\d+)?)?/g, ' ')  // a/b/c.ts:105, docs/**, {a,b}.md
+    .replace(/\b[\w-]+\.(?:ts|tsx|js|mjs|cjs|json|ya?ml|sql|md|py|sh|html|css|toml)\b(?::\d+(?:-\d+)?)?/gi, ' ')  // deploy.yml:864
+    .replace(/\b\w+(?:_\w+)+\b/g, ' ')                                    // snake_case / SCREAMING_SNAKE identifiers
+    .replace(/\b[0-9a-f]{7,40}\b/g, ' ')                                  // commit ids
+    .replace(/\bL\d+\b/g, ' ')                                            // L211
+    .replace(/(?:^|\s)[.\\/]+(?=\s|$)/g, ' ')                             // the punctuation a stripped path leaves behind
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/** A NEGATED or DISCLAIMED mention is not an instruction.
+ *
+ *  Two rows on the board say, in as many words, that they are NOT a human gate — "CI/infra class,
+ *  no gate needed - nothing here needs Roger's hands" and "it is a SPEND decision for Roger, not
+ *  the fix" — and the first version of this rewrite escalated both ON THE STRENGTH OF THE SENTENCE
+ *  DENYING IT. So a hit whose preceding ~40 characters carry a negation, uninterrupted by a
+ *  sentence break, does not count. */
+const NEGATOR = /\b(?:no|not|nothing|never|neither|without|nor)\b[^.;!?]{0,40}$/i
+function negated(text, index) {
+  return NEGATOR.test(text.slice(Math.max(0, index - 60), index))
+}
+
+/** VERB adjacent to its OBJECT, in either order, with at most three words between them.
+ *  Whitespace between the two is REQUIRED — which is why `decision/secret/payment/OAuth`, a
+ *  slash-run of nouns in a sentence about gates, matches nothing. */
+function adjacent(verbs, objects) {
+  const v = `(?:${verbs.join('|')})`
+  const o = `(?:${objects.join('|')})`
+  const gap = `(?:\\s+[\\w'’-]+){0,3}\\s+`
+  return new RegExp(`\\b${v}\\b${gap}${o}\\b|\\b${o}\\b${gap}${v}\\b`, 'i')
+}
+
+/**
+ * The escalate classes, each one a thing a fix session may not do. Every entry is a VERB+OBJECT
+ * pair or an explicit phrase; no entry is a bare noun, and that is the whole point.
+ */
+const GATES = [
+  {
+    id: 'destructive-db',
+    label: 'destructive database work',
+    tests: [
+      adjacent(
+        ['delet(?:e|es|ing)', 'drop(?:s|ping)?', 'truncat(?:e|es|ing)', 'purg(?:e|es|ing)', 'destroy(?:s|ing)?', 'wip(?:e|es|ing)', 'eras(?:e|es|ing)', 'alter(?:s|ing)?', 'remov(?:e|es|ing)'],
+        ['rows?', 'records?', 'tables?', 'columns?', 'indexes', 'schemas?', 'databases?', 'buckets?', 'tenants?', 'user accounts?', 'customer data', 'production data'],
+      ),
+      /\b(?:run|apply|push|ship)\b[^.]{0,60}\bmigrations?\b[^.]{0,60}\b(?:prod|production)\b/i,
+      // Bare SQL. `delete from` needs the lookahead: once a path is stripped, "delete
+      // deploy.yml:864 from the prod-smoke step" collapses to "delete from the prod-smoke step",
+      // and a naked `delete from` would call a workflow edit a table wipe — the same accident one
+      // layer down.
+      /\b(?:ddl|drop table|truncate table)\b/i,
+      /\bdelete\s+from\b(?!\s+(?:the|a|an|this|that|its|our|their|it|there|here)\b)/i,
+    ],
+  },
+  {
+    id: 'secrets',
+    label: 'a secret, key or credential',
+    tests: [adjacent(
+      ['rotat(?:e|es|ing)', 'revok(?:e|es|ing)', 'regenerat(?:e|es|ing)', 're-?issu(?:e|es|ing)', 'sets?', 'setting', 'creat(?:e|es|ing)', 'updat(?:e|es|ing)', 'replac(?:e|es|ing)', 'stor(?:e|es|ing)', 'adds?', 'unsets?', 'chang(?:e|es|ing)'],
+      ['secrets?', 'credentials?', 'api keys?', 'access tokens?', 'service keys?', 'service role keys?', 'passwords?', 'private keys?', 'signing keys?', 'edge secrets?', 'env(?:ironment)? secrets?'],
+    )],
+  },
+  {
+    id: 'payments',
+    label: 'money movement or a billing action',
+    tests: [
+      adjacent(
+        ['pays?', 'paying', 'process(?:es|ing)?', 'refunds?', 'refunding', 'charg(?:e|es|ing)', 'purchas(?:e|es|ing)', 'buy(?:s|ing)?', 'subscrib(?:e|es|ing)', 'renew(?:s|ing)?', 'cancel(?:s|ling|ing)?', 'upgrad(?:e|es|ing)', 'downgrad(?:e|es|ing)', 'settl(?:e|es|ing)', 'transfers?'],
+        ['invoices?', 'payments?', 'subscriptions?', 'plans?', 'cards?', 'bank transfers?', 'billing', 'refunds?', 'the bill'],
+      ),
+      /\b(?:issue|process|send)\s+(?:a|an|the|that|this)?\s*refunds?\b/i,
+      adjacent(['opens?', 'log(?:s|ging)? into', 'uses?', 'issues?'], ['stripe dashboard', 'paypal dashboard', 'bank portal']),
+    ],
+  },
+  {
+    id: 'customer-comms',
+    label: 'a message to a customer or a third party',
+    tests: [adjacent(
+      ['e-?mails?', 'e-?mailing', 'mails?', 'messages?', 'messaging', 'contacts?', 'notif(?:y|ies|ying)', 'writ(?:e|es|ing) to', 'repl(?:y|ies|ying) to', 'calls?', 'phones?', 'apologis(?:e|es)', 'apologiz(?:e|es)'],
+      ['customers?', 'clients?', 'subscribers?', 'prospects?', 'leads?', 'third part(?:y|ies)', 'the users?', 'affected users?'],
+    )],
+  },
+  {
+    id: 'human-hands',
+    label: 'an account or vendor action only Roger can perform',
+    tests: [
+      adjacent(
+        ['re-?auth(?:enticate|orise|orize)?', 're-?connects?', 'connects?', 'authoris(?:e|es)', 'authoriz(?:e|es)', 'logs? ?in(?:to)?', 'signs? ?in(?:to)?', 'grants?', 'links?', 'consents?'],
+        ['oauth', 'google account', 'google workspace', 'the account', 'his account', 'your account', 'the vendor', 'vendor portal', 'the dashboard', 'the console'],
+      ),
+      /\b(?:open|raise|reply to|answer|chase)\s+(?:a|the)\s+support ticket\b/i,
+    ],
+  },
+  {
+    id: 'business-decision',
+    label: 'a decision only Roger can make',
+    tests: [
+      // Deliberately NOT `spend|budget|pricing decision`. Two live rows use those exact words to
+      // NAME A BRANCH THEY ARE NOT TAKING ("hand Roger ONE spend decision, never a reading task";
+      // "that … is a SPEND decision for Roger, not the fix"). A phrase that describes the class of
+      // a hypothetical is not a request for a decision.
+      /\bbusiness decisions?\b/i,
+      // NOT `Roger gate`: the row that says "NOT a Roger gate" is the one asking to be given BACK
+      // to the fixer, and matching it would invert the sentence it appears in.
+      /\broger'?s?\s+(?:call|decision|approval|sign-?off)\b/i,
+      /\bneeds?\s+(?:your|roger'?s?)\s+(?:approval|decision|sign-?off|hands|answer)\b/i,
+      /\bone decision\b/i,
+    ],
+  },
+]
+
+/**
+ * The gate a prescribed action trips, or null. Exported so a test can name the class AND the exact
+ * span that tripped it — "it escalated" is not evidence, "it escalated on `rotate … service key`"
+ * is.
+ */
+export function gateFor(inc) {
+  const action = stripCode(actionOf(inc))
+  if (!action) return null
+  for (const g of GATES) {
+    for (const re of g.tests) {
+      // Every occurrence, not just the first: a sentence that disclaims a gate ("nothing here
+      // needs Roger's hands") must not shadow a later one that genuinely asks for it.
+      const all = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g')
+      for (const m of action.matchAll(all)) {
+        if (negated(action, m.index)) continue
+        return { id: g.id, label: g.label, evidence: m[0].trim() }
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * A `Roger - ` prefix that the sentence itself DISOWNS.
+ *
+ * Three rows on the board today read "Roger - re-dispatch to a WRITE-authorized run … NOT a Roger
+ * gate: no decision/secret/payment/OAuth". They are addressed to Roger because the run that wrote
+ * them had no write tools — a fact about that RUN's permissions, never about who owns the work —
+ * and a human then re-owned two of them by hand, twice, only for the next run to flip them back.
+ * So an explicit Roger prefix still escalates, UNLESS the action says in as many words that the
+ * reason was capability, AND no gate fires on it independently. A gate always outranks this.
+ */
+const CAPABILITY_REASON = /\b(?:not a roger gate|no (?:decision|secret|payment|oauth)\b|re-?dispatch(?:ed)? to a write|write-authoriz|verify-?only|lack(?:ed|s|ing) write tools|had no write tools|class[- ]?a (?:infra|ci|monitor))/i
+
+/**
+ * Every open incident is RE-VERIFIED against the live source each run — the root fix for the class
+ * that bit us (a self-healed false-red sitting blocked because the email-driven Closer never
+ * re-visited it).
+ *
+ * Returns `{ owner, mode, reason, gate, handoff }`.
+ *   mode 'fix'     Claude-owned and safely fixable: full tools (in LIVE).
+ *   mode 'verify'  read-only: may close-if-green or escalate, never fix.
+ *   mode 'note'    expected business state: one idempotent write, no agent.
+ *   handoff        true when this needs a HUMAN SESSION, not an agent run — B3 part 3 turns those
+ *                  into work-board items instead of leaving them on the alarm surface.
+ */
 function classify(inc) {
   const text = `${inc.who_must_act || ''} || ${inc.root_cause || ''} || ${inc.title || ''}`
-  const who = (inc.who_must_act || '').trim().toLowerCase()
 
   // Expected business state wins over every other class — it is noted, never worked or escalated.
   if (EXPECTED_BUSINESS.test(text)) {
-    return { owner: 'none', mode: 'note', reason: 'expected business state (vendor plan/subscription lapsed) — noted, no action' }
+    return { owner: 'none', mode: 'note', gate: null, handoff: false, reason: 'expected business state (vendor plan/subscription lapsed) — noted, no action' }
   }
 
-  const ownerRoger = /^roger\b/i.test(who)
-  const humanHands = HUMAN_HANDS.test(text)
-  const destructive = DESTRUCTIVE_DB.test(text)
-  const hardEscalate = ownerRoger || humanHands || destructive
+  const ownerRoger = /^roger\b/i.test((inc.who_must_act || '').trim())
+  const gate = gateFor(inc)
 
-  const reason = ownerRoger ? 'owner=Roger (verify/close-if-green, else escalate)'
-    : humanHands ? 'human-hands class (verify-only)'
-    : destructive ? 'destructive-DB class (verify-only)'
-    : 'owner=Claude, fixable'
+  if (gate) {
+    return {
+      owner: 'roger', mode: 'verify', gate: gate.id, handoff: true,
+      reason: `${gate.label} — ${gate.id} gate on "${gate.evidence}"`,
+    }
+  }
+  if (ownerRoger) {
+    if (CAPABILITY_REASON.test(actionOf(inc))) {
+      return {
+        owner: 'claude', mode: 'fix', gate: null, handoff: false,
+        reason: 'addressed to Roger only because an earlier run had no write tools — re-queued to Claude, no human gate in the action',
+      }
+    }
+    return { owner: 'roger', mode: 'verify', gate: 'owner-roger', handoff: true, reason: 'owner=Roger, and the action names no automatable path' }
+  }
+  return { owner: 'claude', mode: 'fix', gate: null, handoff: false, reason: 'owner=Claude, fixable' }
+}
 
-  return { owner: hardEscalate ? 'roger' : 'claude', mode: hardEscalate ? 'verify' : 'fix', reason }
+
+// ── B3 part 3: a signal that needs a PERSON becomes a WORK-BOARD ITEM ────────────────────
+/**
+ * Plan B, B3 part 3 (Cockpit/docs/PLAN-QUIET-BOARD-2026-08-27.md, approved 2026-08-27):
+ * "a signal that needs a human session is not a signal, it is a task."
+ *
+ * The signals board exists to say something is wrong RIGHT NOW. An item waiting on Roger's
+ * decision, his bank statement or his OAuth hands is not wrong right now — it is queued. Leaving
+ * it on the alarm surface trains the reader to ignore the alarm surface, which is precisely how
+ * 42 rows came to sit there with only 9 of them younger than a day.
+ *
+ * So a gated item is MOVED, not muted:
+ *   1. a work-board item (`work_items`, sql/055) with a title in plain words and source 'monitor',
+ *   2. the ready-to-paste session prompt attached to it as evidence,
+ *   3. the signal set to `superseded` — resolved_at stamped, pending page cancelled, and out of
+ *      the `state=in.(open,acknowledged)` query every board surface reads.
+ *
+ * IT IS NOT A CLOSE. `superseded` says "this lives somewhere else now", and if the underlying
+ * check goes red again its producer writes state='open' and the row comes straight back — which is
+ * right, and is why this is not a mute. The work item is minted once and only once (see
+ * workItemSlugFor), so a row that flaps produces one task, not one per flap.
+ *
+ * WHAT DELIBERATELY DOES NOT HAPPEN: the incident row in `monitoring_incidents` is NOT rewritten.
+ * Writing it fires the mirror trigger (134_mirror_carries_status_and_owner.sql), which maps
+ * `blocked` back to `open` and would un-supersede the signal on the same tick. The only honest
+ * statuses that mirror to resolved are fixed / self-healed / expected, and this item is none of
+ * the three. A status meaning "handed to a human queue" is a schema change in BackOffice, which
+ * this session does not own — it is written up as the one change needed there.
+ */
+const HANDOFF_ENABLED = process.env.BOARD_DRAINER_HANDOFF !== '0'
+
+/** Repos we can name a working directory for. A prompt that guesses a path is worse than one that
+ *  says nothing, so an unknown product simply gets no working-directory line. */
+const REPO_DIRS = {
+  backoffice: 'BackOffice', replyflow: 'ReplyFlow', channelmover: 'ChannelMover',
+  signalscore: 'SignalScore', scoutcopilot: 'ScoutCopilot', predivo: 'predivo',
+  valrano: 'Valrano', boatbuddy: 'BoatBuddy', cockpit: 'Cockpit',
+  'distribution-os': 'Distribution-OS', 'production-monitor': 'production-monitor',
+  'pull-engine': 'pull-engine', launchready: 'launchready', arivioo: 'arivioo',
+}
+
+/** The repo this incident belongs to, from its key's first segment or its title. Null when we
+ *  cannot say — never a guess. */
+export function repoOf(inc) {
+  const first = String(inc?.key || '').split(':')[0].trim().toLowerCase()
+  if (REPO_DIRS[first]) return REPO_DIRS[first]
+  const t = String(inc?.title || '')
+  for (const [k, dir] of Object.entries(REPO_DIRS)) {
+    if (new RegExp(`\\b${k.replace('-', '[- ]?')}\\b`, 'i').test(t)) return dir
+  }
+  return null
+}
+
+/**
+ * A STABLE identity for "the work item that belongs to this signal".
+ *
+ * Derived from source+key, never from the title: titles on this board are rewritten constantly
+ * (one row has been re-owned and re-worded four times in three days), and a title-derived slug
+ * would mint a fresh item on every rewording. The readable stub is for a human scanning /work; the
+ * hash is what actually makes it unique and stable.
+ */
+export function workItemSlugFor(inc) {
+  const h = createHash('sha1').update(`${inc?.source || ''}|${inc?.key || ''}`).digest('hex').slice(0, 8)
+  const stub = String(inc?.key || 'signal').toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 38).replace(/-+$/, '')
+  return `monitor-${stub || 'signal'}-${h}`
+}
+
+/** Product names that stay capitalised when everything else shouting in a title is calmed down. */
+const KEEP_CAPS = new Set(['BackOffice', 'ReplyFlow', 'ChannelMover', 'SignalScore', 'ScoutCopilot',
+  'Predivo', 'Valrano', 'BoatBuddy', 'Cockpit', 'GitHub', 'Google', 'Stripe', 'Supabase', 'Sentry',
+  'Claude', 'Roger', 'Smartlead', 'PostHog', 'Playwright', 'OAuth', 'VAT', 'AI', 'CI', 'UX', 'E2E',
+  'REST', 'API', 'SQL', 'RLS', 'FTP', 'SMTP', 'URL', 'SEO', 'MCP', 'PDF', 'DNS', 'HTTP', 'JWT'])
+
+/**
+ * Turn machine text into a sentence a person reads.
+ *
+ * Softer than stripCode() on purpose and for a different consumer: stripCode DELETES identifiers
+ * because a gate must not vote on them, while a human reading "the recurring costs registry" is
+ * better served than one reading a gap. Same removals for genuinely unreadable things — paths,
+ * commit ids, flags, backticked code — plus the shouting calmed down.
+ */
+export function prose(s) {
+  let out = String(s || '')
+    .replace(/^\s*\[[^\]]{1,40}\]\s*/, '')                       // [commit-review] / [live] / [UX]
+    .replace(/^\s*[A-Z][A-Z0-9]+-\d+\s*[-:]\s*/, '')             // REPLYFLOW-3 -
+    .replace(/`[^`]*`/g, ' ')
+    .replace(/(?:^|[\s(])--?[A-Za-z][\w-]*(?:=\S+)?/g, ' ')
+    .replace(/\b[A-Za-z]:[\\/][^\s,;)'"]+/g, ' ')
+    .replace(/\b[\w.@-]+(?:[\\/][\w.@{}*,-]+)+(?::\d+(?:-\d+)?)?/g, ' ')
+    .replace(/\b[\w-]+\.(?:ts|tsx|js|mjs|cjs|json|ya?ml|sql|md|py|sh|html|css|toml)\b(?::\d+(?:-\d+)?)?/gi, ' ')
+    .replace(/\b[0-9a-f]{7,40}\b/g, ' ')
+    .replace(/\b\w+(?:_\w+)+\b/g, (m) => m.replace(/_/g, ' '))   // recurring_costs -> recurring costs
+    .replace(/\(\s*\)/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  // Calm the shouting: SCREAMING words read as an emergency and most of them are just emphasis.
+  out = out.replace(/\b[A-Z][A-Z0-9]{2,}\b/g, (w) => (KEEP_CAPS.has(w) ? w : w.toLowerCase()))
+  return out.replace(/\s+([,.;:])/g, '$1').replace(/^[\s,.;:-]+/, '').trim()
+}
+
+/**
+ * The first sentence that actually SAYS something.
+ *
+ * Not simply the first: half the rows on this board open with a bookkeeping stamp the closer or a
+ * previous drainer run wrote — "RE-OWNED 2026-08-25T02:55Z.", "RESTORED 19:50Z.", "DOWNGRADED
+ * critical -> warning." Taking the first sentence blindly produced the title "RE-owned
+ * 2026-08-25T02:55Z" for `BackOffice:b11c5d2`, which tells a reader nothing at all. So a stamp is
+ * skipped, as is anything too short to be a sentence, and the first real one wins.
+ */
+const BOOKKEEPING = /^(?:re-?owned|restored|re-?verified|verified|unchanged|corrected|downgraded|upgraded|updated|measured|confirmed|note|status|as of)\b/i
+function firstSentence(s) {
+  const parts = String(s || '').split(/(?<=[.?!])\s+/)
+  for (const raw of parts) {
+    const p = raw.trim().replace(/[.]$/, '').trim()
+    if (!p) continue
+    if (BOOKKEEPING.test(p)) continue
+    if (p.split(/\s+/).length < 6) continue
+    return p
+  }
+  return (parts[0] || '').trim().replace(/[.]$/, '')
+}
+
+/**
+ * WHY THE TITLE MUST PASS A TEST.
+ *
+ * Roger's rule (memory: "never hand Roger a task that is mine, in my vocabulary"): the one line on
+ * /work has to be understandable in three seconds with no context. Every objection below is a way
+ * a machine-written title fails that, and each one has a real example on the board today:
+ * `[commit-review] BackOffice 62520d7: …`, `deploy.yml:864`, `AFFILIATE_ALERT_EMAIL`,
+ * `if: steps.playwright-cache.outputs.cache-hit != 'true'`.
+ */
+export function titleObjections(title) {
+  const t = String(title || '')
+  const out = []
+  if (!t.trim()) out.push('empty')
+  if (t.length > 120) out.push(`too long (${t.length} chars, max 120)`)
+  if (/[.?!]\s+\S/.test(t)) out.push('more than one sentence')
+  if (/`/.test(t)) out.push('contains code (backticks)')
+  if (/\[[^\]]+\]/.test(t)) out.push('contains a bracket tag')
+  if (/[\w.-]+[\\/][\w.-]+/.test(t)) out.push('contains a file path')
+  if (/\b[\w-]+\.(?:ts|tsx|js|mjs|cjs|json|ya?ml|sql|md|py|sh|html|css|toml)\b/i.test(t)) out.push('contains a filename')
+  if (/:\d+\b/.test(t)) out.push('contains a line number')
+  if (/\b[0-9a-f]{7,40}\b/.test(t)) out.push('contains a commit id')
+  if (/\b\w+_\w+\b/.test(t)) out.push('contains an identifier')
+  if (/(?:^|\s)--?[A-Za-z]/.test(t)) out.push('contains a command-line flag')
+  if (/[{}();=<>|]/.test(t)) out.push('contains code punctuation')
+  return out
+}
+
+/**
+ * THE ONE LINE ROGER READS.
+ *
+ * Built from the PRESCRIBED ACTION first, not from the incident title, and that ordering is the
+ * whole idea: the title describes what the machine found ("[commit-review] BackOffice 62520d7:
+ * plus-tagged customer emails are counted as internal"), the action describes what HE has to do
+ * ("open the recurring costs registry in BackOffice and enter the amount and renewal date for the
+ * 4 unverified rows"). The second is the one that is readable in three seconds.
+ *
+ * Both candidates are run through titleObjections and the first CLEAN one wins. If neither is
+ * clean the least-objectionable is still used — an item with an imperfect title beats a problem
+ * rotting on the alarm board — but the objections are returned so the caller can record them as
+ * evidence rather than let a bad title pass silently.
+ *
+ * @returns {{title:string, objections:string[], from:'action'|'title'|'fallback'}}
+ */
+export function plainTitle(inc) {
+  const candidates = [
+    { from: 'action', text: cap(firstSentence(prose(actionOf(inc)))) },
+    { from: 'title', text: cap(firstSentence(prose(inc?.title))) },
+  ].filter((c) => c.text)
+  if (!candidates.length) {
+    const t = cap(`Something on the monitoring board needs you: ${inc?.source || 'unknown'}`)
+    return { title: t, objections: titleObjections(t), from: 'fallback' }
+  }
+  // The objections MUST be computed on the string that is actually used. An earlier version
+  // measured them on the raw candidate and then shortened it, so a 138-character title from
+  // `commit-review/Cockpit:2d2415c` was recorded as "too long" while the item carried a
+  // perfectly legal 88-character one. A complaint about a string nobody will ever see is noise.
+  for (const c of candidates) {
+    if (!titleObjections(c.text).length) return { title: c.text, objections: [], from: c.from }
+  }
+  const best = candidates.map((c) => ({ ...c, obj: titleObjections(c.text) }))
+    .sort((a, b) => a.obj.length - b.obj.length)[0]
+  return { title: best.text, objections: best.obj, from: best.from }
+}
+
+/** Sentence-case, and short enough to read at a glance.
+ *  Over-length is cut at the last CLAUSE boundary rather than mid-word: a title that stops at a
+ *  comma is a shorter true sentence, while one that stops at character 120 ends in "…from Roge". */
+function cap(s) {
+  let t = String(s || '').trim()
+  if (t.length > 120) {
+    const cut = t.slice(0, 121)
+    const clause = Math.max(cut.lastIndexOf(', '), cut.lastIndexOf('; '), cut.lastIndexOf(' - '), cut.lastIndexOf(': '))
+    const word = cut.lastIndexOf(' ')
+    t = t.slice(0, clause > 60 ? clause : (word > 60 ? word : 120))
+  }
+  t = t.trim().replace(/[\s,;:-]+$/, '')
+  return t ? t[0].toUpperCase() + t.slice(1) : t
+}
+
+/**
+ * The prompt a session is opened with. Deliberately plain text and deliberately COMPLETE: the
+ * whole point of the hand-off is that Roger never has to reconstruct the context, so the original
+ * prescribed action and the original diagnosis go in VERBATIM, uncleaned. The title is for him;
+ * this is for the session he pastes it into.
+ */
+export function handoffPrompt(inc, cls) {
+  const repo = repoOf(inc)
+  const lines = []
+  if (repo) lines.push(`Working directory: C:/Business/Internal Projects/${repo}`, '')
+  lines.push(
+    `This came off the fleet signals board, which routed it to you because it needs a person:`,
+    `${cls?.reason || 'it needs a human decision'}.`,
+    '',
+    'WHAT TO DO (verbatim, as the monitor wrote it):',
+    inc?.who_must_act || '(no action was recorded — diagnose from the evidence below first)',
+    '',
+    'WHAT WAS FOUND (verbatim):',
+    inc?.root_cause || '(no diagnosis recorded)',
+    '',
+    'PROVENANCE:',
+    `- fleet signal: ${inc?.source}/${inc?.key}`,
+    `- severity ${inc?.severity || 'unknown'}, first seen ${inc?.opened_at || 'unknown'}`,
+    `- the signal is marked superseded, not resolved: if the underlying check goes red again it comes straight back.`,
+    '',
+    'RULES: verify against the live system before believing any of the text above — it can be days',
+    'old. Stage explicit paths only when you commit. Do not promote product code to production.',
+  )
+  return lines.join('\n')
+}
+
+/**
+ * Move one gated incident onto the work board. Every side effect arrives as an injected function,
+ * so the decisions here are testable without a database and without a network.
+ *
+ * @param deps.findItem       (slug) => item|null
+ * @param deps.createItem     (row)  => item
+ * @param deps.addEvidence    (itemId, ev) => void
+ * @param deps.supersedeSignal(inc, slug) => boolean
+ * @returns {{created:boolean, slug:string, title:string, superseded:boolean, objections:string[], reason:string}}
+ */
+export async function routeToWorkBoard(inc, cls, deps) {
+  const slug = workItemSlugFor(inc)
+  const { title, objections, from } = plainTitle(inc)
+  const existing = await deps.findItem(slug)
+
+  let created = false
+  let itemId = existing?.id ?? null
+  if (existing) {
+    // IDEMPOTENCE, and it is checked against the SLUG rather than the title precisely because the
+    // title moves. A closed item is left closed on purpose: re-minting work Roger already finished
+    // is how a board becomes untrustworthy in the other direction.
+    deps.log?.(`    already on the work board as "${existing.slug}" (${existing.status}) — not minting a second item`)
+  } else {
+    const item = await deps.createItem({
+      slug,
+      title,
+      kind: 'task',
+      status: 'next',              // `next` carries no owner (Cockpit sql/061) — nobody is on it yet
+      source: 'monitor',
+      opened_by: 'board-drainer',
+      blocked_owner: 'roger',
+      blocked_question: title,
+    })
+    itemId = item?.id ?? null
+    created = true
+    deps.log?.(`    minted work item "${slug}": ${title}`)
+    if (itemId) {
+      await deps.addEvidence(itemId, {
+        kind: 'note',
+        title: 'PASTE THIS into a new session',
+        detail: handoffPrompt(inc, cls),
+        verified: false,
+      })
+      if (objections.length) {
+        // A title that failed its own readability test says so ON THE ITEM. Silently shipping a
+        // title full of file paths is the failure this guard exists to make visible.
+        await deps.addEvidence(itemId, {
+          kind: 'note',
+          title: 'This title is not yet in plain words',
+          detail: `Derived from the ${from}. Objections: ${objections.join('; ')}. Rename it with work_retitle.`,
+          verified: false,
+        })
+      }
+    }
+  }
+
+  const superseded = await deps.supersedeSignal(inc, slug)
+  return { created, slug, title, superseded, objections, reason: cls?.reason || 'needs a person' }
+}
+
+/**
+ * The LIVE wiring of those four injected functions.
+ *
+ * The work board (Cockpit sql/055: `work_items` + `work_evidence`) lives in the same BackOffice
+ * Supabase as `fleet_signals`, so the drainer's existing secret reaches it and no new credential
+ * is introduced — the same rule the work-board session hooks keep.
+ *
+ * Every one of these swallows its own failure and returns a falsy value. A hand-off that cannot be
+ * written must leave the signal exactly where it was, LOUDLY: the failure mode to avoid above all
+ * others is a signal quietly superseded into a work item that does not exist.
+ */
+export function workBoardDeps(secret, base = BO_BASE) {
+  const H = { apikey: secret, Authorization: `Bearer ${secret}`, 'User-Agent': NON_BROWSER_UA, 'Content-Type': 'application/json' }
+  return {
+    log,
+    async findItem(slug) {
+      const res = await fetch(`${base}/rest/v1/work_items?slug=eq.${encodeURIComponent(slug)}&select=id,slug,status&limit=1`, { headers: H })
+      if (!res.ok) throw new Error(`work_items read HTTP ${res.status}: ${(await res.text()).slice(0, 160)}`)
+      const rows = await res.json()
+      return rows[0] || null
+    },
+    async createItem(row) {
+      const res = await fetchWithTransportRetry(`${base}/rest/v1/work_items`, {
+        method: 'POST', headers: { ...H, Prefer: 'return=representation' }, body: JSON.stringify(row),
+      })
+      if (!res.ok) throw new Error(`work_items insert HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`)
+      const rows = await res.json()
+      return rows[0] || null
+    },
+    async addEvidence(itemId, ev) {
+      const res = await fetchWithTransportRetry(`${base}/rest/v1/work_evidence`, {
+        method: 'POST', headers: { ...H, Prefer: 'return=minimal' },
+        body: JSON.stringify({ item_id: itemId, kind: ev.kind, title: ev.title, detail: ev.detail, verified: false }),
+      })
+      if (!res.ok) log(`    evidence NOT attached (HTTP ${res.status}) — the item exists but carries no prompt yet`)
+    },
+    /**
+     * `superseded`, never `resolved`. Resolved means the problem is gone; this problem is very
+     * much still here, it simply lives on the work board now. The distinction is not cosmetic:
+     * upsert_signal treats both as closed for paging, so the pending page is cancelled either
+     * way, but a person reading /signals can tell "fixed" from "handed over".
+     *
+     * Written as a direct PATCH rather than through upsert_incident because writing the INCIDENT
+     * row fires the mirror trigger, which maps `blocked` back to `open` and would un-supersede the
+     * signal on the same tick.
+     */
+    async supersedeSignal(inc, slug) {
+      const filter = `source=eq.${encodeURIComponent(inc.source)}&key=eq.${encodeURIComponent(inc.key)}`
+      const cur = await fetch(`${base}/rest/v1/fleet_signals?select=id,state,detail&${filter}`, { headers: H })
+      if (!cur.ok) throw new Error(`signal read HTTP ${cur.status}`)
+      const rows = await cur.json()
+      if (!rows.length) { log(`    signal ${inc.source}/${inc.key} not found — nothing superseded`); return false }
+      const res = await fetchWithTransportRetry(`${base}/rest/v1/fleet_signals?${filter}`, {
+        method: 'PATCH', headers: { ...H, Prefer: 'return=minimal' },
+        body: JSON.stringify({
+          state: 'superseded',
+          resolved_at: new Date().toISOString(),
+          page_due_at: null,
+          page_suppressed_reason: 'routed-to-work-board',
+          detail: {
+            ...(rows[0].detail || {}),
+            ...parkedFields(null),
+            work_item: slug,
+            routed_to_work_board_at: new Date().toISOString(),
+          },
+        }),
+      })
+      if (!res.ok) throw new Error(`signal supersede HTTP ${res.status}: ${(await res.text()).slice(0, 160)}`)
+      return true
+    },
+  }
 }
 
 // ── Tier-B agent policy (the boundary is enforced here + in allowedTools) ─────────────────
@@ -646,7 +1261,9 @@ export function stuckWhoMustAct(whoMustAct) {
     .replace(/^(?:Roger|Claude)\s*[-:]\s*auto-fix stuck[^;]*;\s*/gi, '')
     .replace(/^(?:Roger|Claude)\s*[-:]\s*/i, '')   // strip the owner prefix; it is re-added below, so it must not double up
     .trim()
-  const owner = HUMAN_HANDS.test(priorAction) ? 'Roger' : 'Claude'
+  // Same gate as classify(), for the same reason: the old noun list re-owned "delete deploy.yml:864"
+  // to Roger every time an item went stuck, which is how a one-line CI edit acquired a human owner.
+  const owner = gateFor({ who_must_act: priorAction }) ? 'Roger' : 'Claude'
   return { owner, priorAction, value: `${owner} - ${priorAction}` }
 }
 
@@ -727,16 +1344,30 @@ export function timeoutCostsAnAttempt(consecutiveTimeouts, maxFree = MAX_FREE_TI
  */
 export function selectWorkQueue({
   routed, state, maxPerRun = MAX_PER_RUN, maxAttempts = MAX_ATTEMPTS, priorityKeys = [],
-  now = Date.now(), parkedRetryIntervalMs = PARKED_RETRY_INTERVAL_MS,
+  now = Date.now(), parkedRetryIntervalMs = PARKED_RETRY_INTERVAL_MS, handoff = HANDOFF_ENABLED,
 }) {
   const attempts = state?.attempts || {}
   const stuck = state?.stuck || {}
   const priority = new Set(priorityKeys)
 
-  const eligible = routed.filter(({ inc }) => meetsThreshold(inc))
-  const belowBar = routed.length - eligible.length
+  // ── B3 part 3, taken out FIRST and deliberately ahead of the severity bar ───────────────
+  // The threshold is a blast-radius dial: it decides how much AUTONOMOUS CODE CHANGE a run may
+  // make. A hand-off changes no code — it is one insert and one state flip, the same category as
+  // `note`, which is likewise not charged to MAX_PER_RUN. Leaving hand-offs behind the bar was
+  // measured on the live board and it lost one: `backoffice-recurring-costs-unverified-rows` is
+  // severity `info`, needs Roger's bank statements and nothing else, and sat on the alarm surface
+  // precisely because it was too quiet to be worked and too human to be fixed.
+  // "Hand to Claude" still outranks everything: if Roger asks for it, he is overriding the
+  // routing, and the item goes to the agent rather than to his own queue.
+  const priorityFirst = (e) => priority.has(e.inc.key)
+  const handoffs = handoff ? routed.filter((e) => e.cls.handoff && !priorityFirst(e)) : []
+  const remaining = handoffs.length ? routed.filter((e) => !handoffs.includes(e)) : routed
 
-  const toEscalate = [], parked = [], workable = [], hoisted = []
+  const eligible = remaining.filter(({ inc }) => meetsThreshold(inc))
+  const belowBar = remaining.length - eligible.length
+
+  const toEscalate = handoffs.map((e) => ({ ...e, why: 'handoff' }))
+  const parked = [], workable = [], hoisted = []
   for (const entry of eligible) {
     const key = entry.inc.key
     // A human override outranks the breaker. Roger asking for an item IS the new evidence that
@@ -933,7 +1564,15 @@ async function main() {
   if (belowBar) log(`  severity threshold '${THRESHOLD}': ${belowBar} item(s) below the bar, classified and logged above but not dispatched.`)
   if (hoisted.length) log(`  hoisted to the front by "Hand to Claude": ${hoisted.join(', ')}`)
   if (eligible > MAX_PER_RUN) log(`  blast-radius cap: ${eligible} dispatchable, taking ${MAX_PER_RUN} this run.`)
-  if (toEscalate.length) log(`  ${toEscalate.length} item(s) to record without an agent (${toEscalate.filter((e) => e.why === 'stuck').length} newly stuck, ${toEscalate.filter((e) => e.why === 'note').length} expected-state) — these do NOT consume the blast-radius budget.`)
+  const handoffs = toEscalate.filter((e) => e.why === 'handoff')
+  runStats.handoff = handoffs.length
+  if (toEscalate.length) log(`  ${toEscalate.length} item(s) to record without an agent (${toEscalate.filter((e) => e.why === 'stuck').length} newly stuck, ${toEscalate.filter((e) => e.why === 'note').length} expected-state, ${handoffs.length} needing a person) — these do NOT consume the blast-radius budget.`)
+  // B3 part 3. Named individually and every run, for the same reason parked items are: an item
+  // that LEAVES the alarm surface must be more visible on its way out, not less.
+  if (handoffs.length) {
+    log(`  ${LIVE && !FIXTURE ? 'HANDING OVER' : 'would HAND OVER'} ${handoffs.length} item(s) to the work board — these need a person, so no agent run can close them:`)
+    for (const { inc, cls } of handoffs) log(`    → ${inc.source}/${inc.key} (${cls.reason})`)
+  }
   // A parked item is a SUPPRESSED item, so it is named out loud every single run. Silence here
   // is what let 34 items rot behind 3 for 30 hours.
   if (parked.length) {
@@ -954,7 +1593,11 @@ async function main() {
   // In DRY-RUN or FIXTURE we stop here: classification only, nothing dispatched or written.
   if (!LIVE || FIXTURE) {
     const fixes = toWork.filter((r) => r.cls.mode === 'fix').length
-    log(`DRY-RUN: would FIX ${fixes}, VERIFY ${toWork.length - fixes}, RECORD-without-agent ${toEscalate.length}, PARK ${parked.length}, REVIVE ${parkedRetry ? 1 : 0}. No agent run, no write-back.`)
+    log(`DRY-RUN: would FIX ${fixes}, VERIFY ${toWork.length - fixes}, RECORD-without-agent ${toEscalate.length} (of which HAND OVER to the work board ${handoffs.length}), PARK ${parked.length}, REVIVE ${parkedRetry ? 1 : 0}. No agent run, no write-back.`)
+    for (const { inc, cls } of handoffs) {
+      const { title, objections } = plainTitle(inc)
+      log(`  DRY-RUN would mint ${workItemSlugFor(inc)} :: ${title}${objections.length ? `  ⚠ title objections: ${objections.join('; ')}` : ''}`)
+    }
     saveState(state)
     return
   }
@@ -971,8 +1614,20 @@ async function main() {
   // 3a. Record-only pass: notes and first-time stuck escalations. Neither runs an agent, so
   // neither is charged against MAX_PER_RUN — that cap bounds autonomous CODE CHANGES, and the
   // old code spending it on three permanently-stuck items is precisely what killed the loop.
-  for (const { inc, why } of toEscalate) {
+  const wbDeps = workBoardDeps(secret)
+  for (const { inc, why, cls } of toEscalate) {
     try {
+      // B3 part 3: a signal that needs a person is a TASK. It becomes a work-board item and leaves
+      // the alarm surface. Scout-derived rows are excluded on the same principle that keeps them
+      // off the incidents board: a report is not an alarm and must not become a task either.
+      if (why === 'handoff') {
+        if (isScoutDerived(inc)) { log(`  ${inc.key}: scout-derived — recorded on the report, never handed to the work board`); continue }
+        log(`  ${inc.key}: needs a person (${cls.reason}) — routing to the work board.`)
+        const r = await routeToWorkBoard(inc, cls, wbDeps)
+        log(`    ${r.created ? 'created' : 'already existed'}: ${r.slug} — signal ${r.superseded ? 'superseded (off the alarm surface)' : 'LEFT OPEN (supersede failed)'}`)
+        if (r.superseded) { delete state.attempts[inc.key]; delete state.stuck[inc.key]; saveState(state) }
+        continue
+      }
       if (why === 'note') {
         log(`  ${inc.key}: expected business state — upserting status=expected (noted, no action).`)
         if (isScoutDerived(inc)) { log('    (scout-derived: recorded on the report, never on the incidents board)'); continue }
