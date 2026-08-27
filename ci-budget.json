@@ -7,6 +7,11 @@
   ],
   "_why": "The May 2026 CI optimisation was silently undone twice: keep-alive.yml deleted 2026-05-22 and re-added 2026-06-08; test.yml deleted 2026-05-22 and re-added 2026-07-09 by a commit titled \"chore: commit pending docs/CI/assets (working-tree cleanup)\". Nothing failed, so nobody saw it, and the bill came back three times. This file is the thing that fails.",
   "monthly_minute_budget": 12000,
+  "self_hosted_labels": [
+    "self-hosted",
+    "predivo-wsl"
+  ],
+  "self_hosted_runner_prefix": "wsl-",
   "_budget_note": "12000 x $0.006 = $72/month gross. Measured 30d before this programme: 24870 min = $149.22. GitHub cap is $161 with stop-usage ON, which halts EVERY repo when hit.",
   "repos": {
     "backoffice": {

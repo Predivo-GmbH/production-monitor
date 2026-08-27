@@ -32,6 +32,27 @@
  * Do NOT use /actions/runs/{id}/timing: it returns total_ms 0 on this account (verified
  * 2026-08-24 on run 32712888819, a 23-minute run). Public repositories are free on standard
  * runners, so their minutes are reported but excluded from the budget total.
+ *
+ * SELF-HOSTED (added 2026-08-27, before this guard had ever run once).
+ * This file was written on 2026-08-24. The 24 self-hosted runners moved onto the CI laptop on
+ * 2026-08-24/25. The two facts never met: the original accounting was `if (repo.private)
+ * billedMinutes += min`, with no test for WHERE the job ran, so every minute the fleet spends on
+ * OUR OWN hardware was counted as money owed to GitHub. The real bill over the two days after
+ * the move went up by 37 cents; this guard would have projected the whole fleet's workload as
+ * spend and failed on it, every Monday, for ever.
+ *
+ * So a job is billed only when its repo is private AND it did not run on a self-hosted runner,
+ * judged by `self-hosted` appearing in the job's own labels. Self-hosted minutes are still
+ * REPORTED, because "how much work moved off the paid runners" is worth seeing, and they still
+ * count toward the absence check, because they are real evidence the harness is seeing the
+ * fleet. They just are not money. The per-job CEILING check is likewise applied only to billed
+ * runs: a job that got slower on our laptop costs nothing, and failing on it would be an alarm
+ * about money that was never spent.
+ *
+ * The near miss is the lesson. This guard was never wrong in production because it had never
+ * run: it was committed at 20:41 UTC on a Monday, after its own 07:10 Monday cron, so its first
+ * scheduled fire would have been the following week. It was found by asking why its heartbeat
+ * check had never received a single ping.
  */
 import fs from 'node:fs'
 
@@ -121,12 +142,39 @@ if (!privateRepos.length) {
 const key = (...parts) => JSON.stringify(parts)
 const unkey = (k) => JSON.parse(k)
 
-const seen = new Map() // key(repo, workflow, job) -> minutes[]
+// OUR self-hosted runners, declared rather than guessed. Read from ci-budget.json so adding a
+// runner label is a config change, not a code change.
+//
+// GUESSING THIS WRONG IS SILENT. The first attempt at this fix tested for the label
+// `self-hosted`, which is what the GitHub docs suggest and what everyone expects. Our workflows
+// say `runs-on: predivo-wsl`, so the jobs API reports `labels: ["predivo-wsl"]` and nothing
+// else: the test would have matched NOTHING and the guard would have gone on billing us for our
+// own laptop while looking fixed. Verified 2026-08-27 by reading the live jobs API across five
+// repos - GitHub-hosted jobs came back `labels:["ubuntu-latest"], runner_name:"GitHub Actions
+// 1000022991"`, ours came back `labels:["predivo-wsl"], runner_name:"wsl-LAPTOP-88N97BGG-<repo>"`.
+const SELF_HOSTED_LABELS = new Set(
+  (cfg.self_hosted_labels || ['self-hosted', 'predivo-wsl']).map((s) => String(s).toLowerCase()),
+)
+const SELF_HOSTED_RUNNER_PREFIX = String(cfg.self_hosted_runner_prefix || 'wsl-').toLowerCase()
+
+// Deliberately asymmetric: a job counts as ours only on POSITIVE identification. Anything
+// unrecognised is treated as billed. For a cost guard the safe error is over-reporting spend,
+// because that fails loudly, while under-reporting reports a clean fleet on a rising bill.
+const isSelfHosted = (job) => {
+  if (Array.isArray(job.labels) && job.labels.some((l) => SELF_HOSTED_LABELS.has(String(l).toLowerCase()))) return true
+  if (job.runner_name && String(job.runner_name).toLowerCase().startsWith(SELF_HOSTED_RUNNER_PREFIX)) return true
+  return false
+}
+
+const seen = new Map() // key(repo, workflow, job) -> {min, billed}[]
 const workflowsSeen = new Set()
 let totalRuns = 0
 let billedMinutes = 0
 let freeMinutes = 0
+let selfHostedMinutes = 0   // private-repo work that runs on our own laptop, so GitHub bills none of it
 
+// PASS 1: list the runs. Cheap - one call per 100 runs.
+const pending = [] // {repo, run}
 for (const repo of repos) {
   if (repo.archived) continue
   for (let page = 1; page <= 20; page++) {
@@ -137,24 +185,52 @@ for (const repo of repos) {
     for (const run of runs) {
       totalRuns++
       workflowsSeen.add(key(repo.name, run.name))
-      const jj = await gh(
-        `https://api.github.com/repos/${OWNER}/${repo.name}/actions/runs/${run.id}/jobs?per_page=100&filter=all`,
-      )
-      for (const job of jj?.jobs || []) {
-        if (!job.started_at || !job.completed_at) continue
-        const ms = new Date(job.completed_at) - new Date(job.started_at)
-        if (ms <= 0) continue
-        const min = Math.ceil(ms / 60000)
-        if (repo.private) billedMinutes += min
-        else freeMinutes += min
-        const k = key(repo.name, run.name, job.name)
-        if (!seen.has(k)) seen.set(k, [])
-        seen.get(k).push(min)
-      }
+      pending.push({ repo, run })
     }
     if (runs.length < 100) break
   }
 }
+
+// PASS 2: the expensive half - ONE jobs call per run, and there is no cheaper aggregate
+// (/actions/runs/{id}/timing returns 0 on this account, see BILLING MODEL above).
+//
+// WHY THIS IS A POOL AND NOT A LOOP (2026-08-27). Serially, this step could not finish inside
+// the workflow's own `timeout-minutes: 30`: the first manual run started 09:46:32Z and was
+// killed at 10:16:54Z, thirty minutes and twenty-two seconds later, still on this step. A
+// 2-day window alone examined 681 runs, so the scheduled 7-day window is roughly three and a
+// half times that. Quota was never the problem - the primary limit is 5000 requests an hour and
+// a 7-day sweep needs around 2400 - it was WALL CLOCK, one round trip at a time.
+//
+// Concurrency is kept low on purpose. GitHub's SECONDARY limit punishes bursts regardless of
+// remaining quota, and gh() already backs off on 403/429, so a big pool would spend its time
+// sleeping. Shared counters are safe: JavaScript runs this on one thread, and only complete
+// awaits interleave.
+const CONCURRENCY = Number(process.env.CI_BUDGET_CONCURRENCY || 6)
+let nextIdx = 0
+const consumeJobs = async () => {
+  while (nextIdx < pending.length) {
+    const { repo, run } = pending[nextIdx++]
+    const jj = await gh(
+      `https://api.github.com/repos/${OWNER}/${repo.name}/actions/runs/${run.id}/jobs?per_page=100&filter=all`,
+    )
+    for (const job of jj?.jobs || []) {
+      if (!job.started_at || !job.completed_at) continue
+      const ms = new Date(job.completed_at) - new Date(job.started_at)
+      if (ms <= 0) continue
+      const min = Math.ceil(ms / 60000)
+      // A job on OUR OWN hardware costs nothing, whatever repo it belongs to. See SELF-HOSTED
+      // in the header: without this test the guard bills us for our own laptop.
+      const billed = repo.private && !isSelfHosted(job)
+      if (billed) billedMinutes += min
+      else if (repo.private) selfHostedMinutes += min
+      else freeMinutes += min
+      const k = key(repo.name, run.name, job.name)
+      if (!seen.has(k)) seen.set(k, [])
+      seen.get(k).push({ min, billed })
+    }
+  }
+}
+await Promise.all(Array.from({ length: CONCURRENCY }, consumeJobs))
 
 // EMIT MODE: regenerate ci-budget.json from what is actually running now, instead of
 // hand-maintaining 120 entries. Review the diff before committing it - this writes down
@@ -165,7 +241,11 @@ if (process.env.CI_BUDGET_EMIT === '1') {
   for (const [k, mins] of seen) {
     const [repo, wf, job] = unkey(k)
     if (!privateRepos.some((r) => r.name === repo)) continue
-    const sorted = mins.slice().sort((a, b) => a - b)
+    // Ceilings are declared from BILLED runs only, for the same reason the check reads them that
+    // way. A job that runs solely on our own hardware still gets an entry, so it is never later
+    // reported as an undeclared workflow, but its ceiling is marked as not a cost ceiling.
+    const billedRuns = mins.filter((m) => m.billed).map((m) => m.min)
+    const sorted = (billedRuns.length ? billedRuns : mins.map((m) => m.min)).slice().sort((a, b) => a - b)
     const median = sorted[Math.floor(sorted.length / 2)]
     const p90 = sorted[Math.floor(sorted.length * 0.9)]
     ;((out[repo] ||= {})[wf] ||= {})[job] = {
@@ -173,6 +253,8 @@ if (process.env.CI_BUDGET_EMIT === '1') {
       p90,
       ceiling_min_per_run: Math.max(3, p90 * 2),
       runs_in_window: mins.length,
+      billed_runs_in_window: billedRuns.length,
+      ...(billedRuns.length ? {} : { _note: 'runs only on self-hosted runners in this window, so this ceiling is not a cost ceiling' }),
     }
   }
   const next = { ...cfg, _emitted_at: new Date().toISOString(), _emitted_window_days: WINDOW_DAYS, repos: out }
@@ -202,11 +284,15 @@ for (const [k, mins] of seen) {
   const [repo, wf, job] = unkey(k)
   const declared = cfg.repos?.[repo]?.[wf]?.[job]
   if (!declared) continue
-  const sorted = mins.slice().sort((a, b) => a - b)
+  // Only BILLED runs of this job can breach a cost ceiling. A job that got slower on our own
+  // laptop costs nothing, and failing on it would be an alarm about money that was never spent.
+  const billedRuns = mins.filter((m) => m.billed).map((m) => m.min)
+  if (!billedRuns.length) continue
+  const sorted = billedRuns.slice().sort((a, b) => a - b)
   const median = sorted[Math.floor(sorted.length / 2)]
   if (median > declared.ceiling_min_per_run) {
     failures.push(
-      `CEILING: ${repo} / ${wf} / ${job} median ${median} min per run over ${mins.length} runs, ceiling ${declared.ceiling_min_per_run}. ${declared._note || ''}`,
+      `CEILING: ${repo} / ${wf} / ${job} median ${median} min per run over ${billedRuns.length} BILLED runs, ceiling ${declared.ceiling_min_per_run}. ${declared._note || ''}`,
     )
   }
 }
@@ -234,7 +320,8 @@ if (projected > cfg.monthly_minute_budget) {
 console.log(`window            : last ${WINDOW_DAYS} days (created >= ${since})`)
 console.log(`repos scanned     : ${repos.filter((r) => !r.archived).length} (${privateRepos.length} private, which are the ones that cost money)`)
 console.log(`runs examined     : ${totalRuns}`)
-console.log(`billed minutes    : ${billedMinutes} (private repos)   free: ${freeMinutes} (public repos)`)
+console.log(`billed minutes    : ${billedMinutes} (private repos on GitHub-hosted runners)`)
+console.log(`free minutes      : ${freeMinutes} (public repos)   ${selfHostedMinutes} (private repos on our own runners)`)
 console.log(
   `projected 30 days : ${billedMinutes} x 30 / ${WINDOW_DAYS} = ${projected} min = $${(projected * RATE).toFixed(2)}   budget ${cfg.monthly_minute_budget} min = $${(cfg.monthly_minute_budget * RATE).toFixed(2)}`,
 )
