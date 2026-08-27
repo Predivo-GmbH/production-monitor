@@ -5,7 +5,7 @@
  * Run: node test/board-drainer.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
-import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT } from '../scripts/board-drainer.mjs'
+import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, parkedFields } from '../scripts/board-drainer.mjs'
 
 let n = 0
 const t = (name, fn) => { fn(); n++; console.log(`  ok - ${name}`) }
@@ -218,19 +218,33 @@ t('CONSTRAINT GUARD: no scout source is one the incidents CHECK accepts', () => 
 
 const wq = (key, over = {}) => ({ inc: { key, source: 'silent-failure', severity: 'warning', title: key, ...over }, cls: { mode: 'fix', owner: 'claude' } })
 const atCeiling = { 'stuck-1': 3, 'stuck-2': 3, 'stuck-3': 3 }
+// The deadlock tests below isolate ONE dimension: what a parked pile does to the dispatch budget.
+// Since 2026-08-27 a second dimension exists — one parked item is revived every 24 hours (Plan B
+// B3 part 2) — so these fixtures say "the scheduled retry already fired" to keep the two apart.
+// The retry's own behaviour is pinned by its own block at the end of this file.
+const justRetried = () => ({ lastParkedRetryAt: new Date().toISOString() })
 
 t('DEADLOCK: three ceiling-stuck items at the head do NOT consume the dispatch budget', () => {
   const routed = [wq('stuck-1'), wq('stuck-2'), wq('stuck-3'), wq('fixable-a'), wq('fixable-b'), wq('fixable-c'), wq('fixable-d')]
-  const state = { attempts: { ...atCeiling }, stuck: { 'stuck-1': {}, 'stuck-2': {}, 'stuck-3': {} } }
+  const state = { attempts: { ...atCeiling }, stuck: { 'stuck-1': {}, 'stuck-2': {}, 'stuck-3': {} }, ...justRetried() }
   const { toWork, parked } = selectWorkQueue({ routed, state })
   assert.equal(parked.length, 3, 'the three ceiling items are parked')
   assert.equal(toWork.length, 3, 'and the run still dispatches a full budget')
   assert.deepEqual(toWork.map((r) => r.inc.key), ['fixable-a', 'fixable-b', 'fixable-c'])
 })
 
+t('DEADLOCK: fresh work keeps its FULL budget even on the run that revives a parked item', () => {
+  // The 2026-08-27 retry must not reintroduce the very starvation this block exists for.
+  const routed = [wq('stuck-1'), wq('stuck-2'), wq('stuck-3'), wq('fixable-a'), wq('fixable-b'), wq('fixable-c'), wq('fixable-d')]
+  const state = { attempts: { ...atCeiling }, stuck: { 'stuck-1': {}, 'stuck-2': {}, 'stuck-3': {} } }
+  const { toWork } = selectWorkQueue({ routed, state })
+  assert.deepEqual(toWork.slice(0, 3).map((r) => r.inc.key), ['fixable-a', 'fixable-b', 'fixable-c'])
+  assert.equal(toWork.length, 4, 'the revived item is the 4th, not one of the three')
+})
+
 t('DEADLOCK: a board of NOTHING BUT stuck items dispatches nothing and parks everything', () => {
   const routed = [wq('stuck-1'), wq('stuck-2'), wq('stuck-3')]
-  const state = { attempts: { ...atCeiling }, stuck: { 'stuck-1': {}, 'stuck-2': {}, 'stuck-3': {} } }
+  const state = { attempts: { ...atCeiling }, stuck: { 'stuck-1': {}, 'stuck-2': {}, 'stuck-3': {} }, ...justRetried() }
   const { toWork, parked, toEscalate } = selectWorkQueue({ routed, state })
   assert.equal(toWork.length, 0); assert.equal(parked.length, 3); assert.equal(toEscalate.length, 0)
 })
@@ -250,7 +264,7 @@ t('an ALREADY-escalated stuck item is silent: parked, never re-written', () => {
   // This is the `board-drainer-stuck-stub-erases-root-cause` incident: the old code re-upserted
   // a stub over the real diagnosis on every run, 138 times in one day.
   const routed = [wq('stuck-1')]
-  const state = { attempts: { 'stuck-1': 3 }, stuck: { 'stuck-1': { at: 'x', attempts: 3 } } }
+  const state = { attempts: { 'stuck-1': 3 }, stuck: { 'stuck-1': { at: 'x', attempts: 3 } }, ...justRetried() }
   const { toEscalate, parked } = selectWorkQueue({ routed, state })
   assert.equal(toEscalate.length, 0, 'no second write')
   assert.equal(parked.length, 1)
@@ -275,7 +289,7 @@ t('HAND TO CLAUDE hoists an item to the front, past oldest-first', () => {
 
 t('HAND TO CLAUDE overrides the attempt ceiling — the button is the escape hatch', () => {
   const routed = [wq('stuck-1'), wq('stuck-2'), wq('stuck-3')]
-  const state = { attempts: { ...atCeiling }, stuck: { 'stuck-1': {}, 'stuck-2': {}, 'stuck-3': {} } }
+  const state = { attempts: { ...atCeiling }, stuck: { 'stuck-1': {}, 'stuck-2': {}, 'stuck-3': {} }, ...justRetried() }
   const { toWork, parked } = selectWorkQueue({ routed, state, priorityKeys: ['stuck-2'] })
   assert.equal(toWork[0].inc.key, 'stuck-2', 'Roger asking IS the new evidence')
   assert.equal(parked.length, 2)
@@ -323,6 +337,289 @@ t('TRAP GUARD: the timeout sentinel is TRUTHY, so `!verdict` can never catch it'
 t('the free allowance is configurable and respected', () => {
   assert.equal(timeoutCostsAnAttempt(1, 1), true)
   assert.equal(timeoutCostsAnAttempt(0, 1), false)
+})
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// PLAN A STEP 1 — the work-list is read from fleet_signals, the single store
+// (Cockpit/docs/PLAN-ONE-STORE-2026-08-27.md, approved 2026-08-27)
+//
+// THE DEFECT THESE GUARD. The healthchecks monitor writes DIRECT to signal-intake and never
+// touches monitoring_incidents, so anything only that producer saw was invisible to the
+// auto-fixer. Measured on production 2026-08-27: 45 active signals, 42 active incidents, and
+// four active signals the drainer could not see at all — healthchecks/kb-learning-phase0,
+// kb-learning-backfill, knowledge-apply-loop, kb-learning-loop.
+// ══════════════════════════════════════════════════════════════════════════════════════════
+
+t('READ MOVED: the work-list is fetched from fleet_signals, not monitoring_incidents', () => {
+  const url = boardQueryUrl('https://example.supabase.co')
+  assert.match(url, /\/rest\/v1\/fleet_signals\?/, 'the single store is the work-list')
+  assert.ok(!/monitoring_incidents/.test(url), 'the old table is no longer the read path')
+})
+
+t('READ MOVED: the filter is state in (open,acknowledged) — not the old status vocabulary', () => {
+  const url = boardQueryUrl('https://example.supabase.co')
+  assert.match(url, /state=in\.\(open,acknowledged\)/)
+  assert.ok(!/status=in\./.test(url), 'monitoring_incidents.status does not exist on fleet_signals')
+})
+
+t('READ MOVED: oldest-first is preserved, on the signal timestamp', () => {
+  assert.match(boardQueryUrl('https://x'), /order=first_seen_at\.asc/)
+})
+
+t('READ MOVED: the select asks for every field the mapping needs, and no more', () => {
+  const url = boardQueryUrl('https://x')
+  for (const col of ['source', 'key', 'title', 'severity', 'state', 'summary', 'detail', 'first_seen_at']) {
+    assert.match(url, new RegExp(`[?&=,]${col}[,&]`), `select must include ${col}`)
+  }
+})
+
+// The four rows, exactly as production served them on 2026-08-27.
+const kbSignal = (key) => ({
+  source: 'healthchecks', key, title: 'Scheduled job stopped running', severity: 'critical',
+  state: 'open', summary: 'Healthchecks reports this job DOWN (last ping 2026-08-26T11:00:06Z).',
+  detail: { slug: key, status: 'down', last_ping: '2026-08-26T11:00:06+00:00', tags: 'fleet kb automation' },
+  first_seen_at: '2026-08-26T12:00:00+00:00',
+})
+// A real mirrored row, production 2026-08-27, trimmed.
+const mirroredSignal = {
+  source: 'silent-failure', key: 'ChannelMover:fe87378:staging-assets-dir-not-preuploaded',
+  title: 'Staging assets dir is never pre-uploaded', severity: 'critical', state: 'open',
+  summary: 'The staging deploy publishes index.html before the hashed assets it references exist.',
+  detail: { who_must_act: 'Claude - add a staging pre-upload pass for the hashed assets dir', incident_status: 'blocked' },
+  first_seen_at: '2026-08-24T09:00:00+00:00',
+}
+
+t('THE FOUR INVISIBLE ROWS: a healthchecks signal maps onto the incident shape the loop speaks', () => {
+  // The raw row is NOT an incident: the old field names simply do not exist on it. That is the
+  // whole reason a mapping has to happen rather than the rows being passed through.
+  const raw = kbSignal('kb-learning-phase0')
+  assert.equal(raw.root_cause, undefined)
+  assert.equal(raw.who_must_act, undefined)
+  assert.equal(raw.opened_at, undefined)
+
+  const inc = signalToIncident(raw)
+  assert.equal(inc.source, 'healthchecks')
+  assert.equal(inc.key, 'kb-learning-phase0')
+  assert.equal(inc.severity, 'critical')
+  assert.equal(inc.root_cause, raw.summary, 'summary -> root_cause')
+  assert.equal(inc.opened_at, raw.first_seen_at, 'first_seen_at -> opened_at')
+})
+
+t('THE FOUR INVISIBLE ROWS: with no owner in detail, the item is CLASSIFIED, never crashed or dropped', () => {
+  // These four rows have no detail.who_must_act at all on production, because migration 136
+  // (detail merge) has not been promoted there yet. An unowned row must route to Claude/FIX —
+  // never park on Roger, never throw.
+  for (const key of ['kb-learning-phase0', 'kb-learning-backfill', 'knowledge-apply-loop', 'kb-learning-loop']) {
+    const inc = signalToIncident(kbSignal(key))
+    assert.equal(inc.who_must_act, null, `${key}: absent owner is null, not undefined`)
+    const c = classify(inc)
+    assert.equal(c.owner, 'claude', `${key} must be workable`)
+    assert.equal(c.mode, 'fix', `${key} must be workable`)
+  }
+})
+
+t('a MIRRORED signal carries its owner and its incident status through detail', () => {
+  const inc = signalToIncident(mirroredSignal)
+  assert.match(inc.who_must_act, /^Claude - add a staging pre-upload pass/, 'detail.who_must_act -> who_must_act')
+  assert.equal(inc.status, 'blocked', 'detail.incident_status -> status')
+  assert.equal(classify(inc).mode, 'fix')
+})
+
+t('status NEVER invents "open": with no incident behind it, the signal\'s own state is reported', () => {
+  assert.equal(signalToIncident(kbSignal('k')).status, 'open')
+  assert.equal(signalToIncident({ ...kbSignal('k'), state: 'acknowledged' }).status, 'acknowledged')
+  // A fabricated status reads identically to a real one, which is how a board starts lying.
+  assert.equal(signalToIncident({ ...mirroredSignal, state: 'acknowledged' }).status, 'blocked')
+})
+
+t('a null/absent detail does not throw — the mapping survives a row nothing has annotated', () => {
+  assert.equal(signalToIncident({ source: 's', key: 'k', state: 'open', detail: null }).who_must_act, null)
+  assert.equal(signalToIncident({ source: 's', key: 'k', state: 'open' }).status, 'open')
+})
+
+t('WRITE-TARGET GUARD: only sources monitoring_incidents accepts may be worked', () => {
+  // Verified live against BOTH databases 2026-08-27: the source CHECK is
+  // healthchecks|sentry|production-monitor|cron|silent-failure|commit-review. fleet_signals has
+  // no such constraint and has carried __drill__ and board-drainer rows. Working one of those
+  // would 400 on upsert_incident and throw the item out of its own run — the fail-open class
+  // isScoutDerived() exists for.
+  for (const source of ['healthchecks', 'sentry', 'production-monitor', 'cron', 'silent-failure', 'commit-review']) {
+    assert.equal(writableToIncidentBoard({ source }), true, `${source} is on the incidents CHECK`)
+  }
+  for (const source of ['__drill__', 'board-drainer', 'scout-ux', 'kb-learning', undefined]) {
+    assert.equal(writableToIncidentBoard({ source }), false, `${source} would 400 on upsert_incident`)
+  }
+})
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// PLAN B B3 part 1 — parked state is PUBLISHED
+// (Cockpit/docs/PLAN-QUIET-BOARD-2026-08-27.md, approved 2026-08-27)
+//
+// Parking lived only in C:\Business\_board-drainer\state.json on one machine. Nothing could see
+// it, so 41 of 42 blocked incidents were indistinguishable from things breaking right now.
+// These three key names are a CONTRACT with the cockpit lane being built against them.
+// ══════════════════════════════════════════════════════════════════════════════════════════
+
+t('PARKED CONTRACT: parking stamps parked / parked_at / parked_attempts', () => {
+  const f = parkedFields({ parked: true, at: '2026-08-25T04:00:00.000Z', attempts: 3 })
+  assert.deepEqual(f, { parked: true, parked_at: '2026-08-25T04:00:00.000Z', parked_attempts: 3 })
+})
+
+t('PARKED CONTRACT: not-parked is stated EXPLICITLY, never left unsaid', () => {
+  // upsert_signal MERGES detail since migration 136, so an omitted key leaves the old value
+  // standing. "Nothing said" would read as "still parked", forever.
+  const f = parkedFields(null)
+  assert.deepEqual(f, { parked: false, parked_at: null, parked_attempts: null })
+  assert.ok('parked_at' in f && 'parked_attempts' in f, 'the cleared keys must be present, not absent')
+  assert.deepEqual(parkedFields({ parked: false, at: 'x', attempts: 9 }), f, 'parked:false wins over stale fields')
+})
+
+t('PARKED CONTRACT: a normal write-back publishes parked=false, which is what un-parks a revived item', () => {
+  const p = verdictToUpsert(inc, { class: 'D-ESCALATE', status: 'blocked', action: 'none', who_must_act: 'Roger - do X' })
+  assert.equal(p.p_evidence.parked, false)
+  assert.equal(p.p_evidence.parked_at, null)
+  assert.equal(p.p_evidence.parked_attempts, null)
+})
+
+const mark = { at: '2026-08-20T06:00:00.000Z', attempts: 3, source: 'production-monitor' }
+
+t('PARKED CONTRACT: a scheduled retry that did NOT close the item leaves it parked, timestamp intact', () => {
+  const p = verdictToUpsert(inc, { class: 'D-ESCALATE', status: 'blocked', action: 'none' }, mark)
+  assert.equal(p.p_evidence.parked, true, 'one more failed try is not progress')
+  assert.equal(p.p_evidence.parked_at, '2026-08-20T06:00:00.000Z', 'the ORIGINAL park time — not now')
+  assert.equal(p.p_evidence.parked_attempts, 3)
+})
+
+t('PARKED CONTRACT: a scheduled retry that CLOSED the item un-parks it', () => {
+  const p = verdictToUpsert(inc, { class: 'A-INFRA', status: 'fixed', action: 'pushed abc123', receipt: 'run 999 green' }, mark)
+  assert.equal(p.p_status, 'fixed')
+  assert.equal(p.p_evidence.parked, false)
+  assert.equal(p.p_evidence.parked_at, null)
+})
+
+t('PARKED CONTRACT: a receipt-less "fixed" is downgraded AND stays parked — the guard is not a way out', () => {
+  const p = verdictToUpsert(inc, { class: 'C-CLOSED', status: 'fixed', action: 'looks fine', receipt: '' }, mark)
+  assert.equal(p.p_status, 'investigating', 'still no shallow close')
+  assert.equal(p.p_evidence.parked, true, 'and a downgraded close does not un-park anything')
+})
+
+t('PARKED CONTRACT: nothing else about the write-back changed shape', () => {
+  const p = verdictToUpsert(inc, { class: 'A-INFRA', status: 'fixed', action: 'a', receipt: 'r' })
+  assert.equal(p.p_evidence.by, 'board-drainer')
+  assert.equal(p.p_evidence.class, 'A-INFRA')
+  assert.equal(p.p_evidence.action, 'a')
+  assert.equal(p.p_evidence.receipt, 'r')
+})
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// PLAN B B3 part 2 — a parked item is RETRIED on a schedule instead of never
+//
+// Before today a parked item cleared in exactly two ways: the incident left the board, or Roger
+// pressed "Hand to Claude". Nothing retried on its own. Measured on production 2026-08-27:
+// 41 of 42 active incidents were `blocked`, 36 of 45 signals named Claude, 2 rows were younger
+// than a day. The board was a graveyard, and a graveyard looks exactly like an alarm going off.
+// ══════════════════════════════════════════════════════════════════════════════════════════
+
+const HOUR = 3600_000
+const iso = (msAgo) => new Date(Date.UTC(2026, 7, 27, 12, 0, 0) - msAgo).toISOString()
+const NOW = Date.UTC(2026, 7, 27, 12, 0, 0)
+// Three parked items of different ages, plus four fixable ones behind them.
+const parkedBoard = () => ({
+  routed: [
+    wq('parked-newest'), wq('parked-oldest'), wq('parked-middle'),
+    wq('fixable-a'), wq('fixable-b'), wq('fixable-c'), wq('fixable-d'),
+  ],
+  state: {
+    attempts: { 'parked-newest': 3, 'parked-oldest': 3, 'parked-middle': 3 },
+    stuck: {
+      'parked-newest': { at: iso(2 * HOUR), attempts: 3, source: 'silent-failure' },
+      'parked-oldest': { at: iso(400 * HOUR), attempts: 5, source: 'silent-failure' },
+      'parked-middle': { at: iso(50 * HOUR), attempts: 3, source: 'silent-failure' },
+    },
+  },
+})
+
+t('RETRY: a parked item is handed back to the agent — exactly ONE of them', () => {
+  const { parkedRetry, parked } = selectWorkQueue({ ...parkedBoard(), now: NOW })
+  assert.ok(parkedRetry, 'a parked pile that nothing ever retries is a graveyard')
+  assert.equal(parked.length, 2, 'the other two stay parked, and the revived one is not double-counted')
+})
+
+t('RETRY: OLDEST parked first — not whichever happens to sort first', () => {
+  const { parkedRetry } = selectWorkQueue({ ...parkedBoard(), now: NOW })
+  assert.equal(parkedRetry.inc.key, 'parked-oldest')
+})
+
+t('RETRY: the retry does NOT consume the blast-radius cap for normal work', () => {
+  // This is the whole point. Charging it to MAX_PER_RUN would let a parked pile starve fresh
+  // problems — the same head-of-line failure selectWorkQueue was written to fix, in a new hat.
+  const { toWork } = selectWorkQueue({ ...parkedBoard(), now: NOW, maxPerRun: 3 })
+  assert.equal(toWork.length, 4, 'three normal items PLUS the revived one')
+  assert.deepEqual(toWork.slice(0, 3).map((r) => r.inc.key), ['fixable-a', 'fixable-b', 'fixable-c'],
+    'fresh work keeps its full budget and its FIFO order')
+  assert.equal(toWork[3].inc.key, 'parked-oldest', 'the revived item is appended, never inserted')
+})
+
+t('RETRY: only ONE per interval — a retry 2 hours ago means no retry now', () => {
+  const b = parkedBoard()
+  b.state.lastParkedRetryAt = iso(2 * HOUR)
+  const { parkedRetry, parked, toWork } = selectWorkQueue({ ...b, now: NOW })
+  assert.equal(parkedRetry, null, 'the interval is a real gate, not decoration')
+  assert.equal(parked.length, 3, 'all three stay parked and stay visible')
+  assert.equal(toWork.length, 3, 'and the run is back to its plain blast-radius cap')
+})
+
+t('RETRY: 23h59m is still inside the window; 24h01m is not', () => {
+  const b1 = parkedBoard(); b1.state.lastParkedRetryAt = iso(24 * HOUR - 60_000)
+  assert.equal(selectWorkQueue({ ...b1, now: NOW }).parkedRetry, null)
+  const b2 = parkedBoard(); b2.state.lastParkedRetryAt = iso(24 * HOUR + 60_000)
+  assert.equal(selectWorkQueue({ ...b2, now: NOW }).parkedRetry.inc.key, 'parked-oldest')
+})
+
+t('RETRY: a clock that was never set retries immediately — everything parked has waited long enough', () => {
+  const { parkedRetry } = selectWorkQueue({ ...parkedBoard(), now: NOW })
+  assert.equal(parkedRetry.inc.key, 'parked-oldest')
+})
+
+t('RETRY: a parked marker with an unreadable timestamp is treated as the OLDEST, not skipped', () => {
+  const b = parkedBoard()
+  b.state.stuck['parked-newest'] = { attempts: 3 }   // no `at` at all (a marker written by an older build)
+  const { parkedRetry } = selectWorkQueue({ ...b, now: NOW })
+  assert.equal(parkedRetry.inc.key, 'parked-newest', 'an item whose bookkeeping we lost waits last, not forever')
+})
+
+t('RETRY: nothing parked means nothing is revived, and the cap is untouched', () => {
+  const routed = [wq('fixable-a'), wq('fixable-b'), wq('fixable-c'), wq('fixable-d')]
+  const { parkedRetry, toWork } = selectWorkQueue({ routed, state: { attempts: {}, stuck: {} }, now: NOW })
+  assert.equal(parkedRetry, null)
+  assert.equal(toWork.length, 3)
+})
+
+t('RETRY: "Hand to Claude" STILL revives immediately, inside the interval and past the ceiling', () => {
+  // The button must not be demoted to "wait your turn, up to 24 hours". main() clears the parked
+  // marker for a hoisted key before this runs, so the item arrives here as ordinary work.
+  const b = parkedBoard()
+  b.state.lastParkedRetryAt = iso(1 * HOUR)               // scheduled retry firmly closed
+  delete b.state.stuck['parked-middle']                    // what main() does on a hand-off
+  delete b.state.attempts['parked-middle']
+  const { toWork, hoisted, parkedRetry } = selectWorkQueue({ ...b, now: NOW, priorityKeys: ['parked-middle'] })
+  assert.deepEqual(hoisted, ['parked-middle'])
+  assert.equal(toWork[0].inc.key, 'parked-middle', 'Roger asking outranks both the queue and the clock')
+  assert.equal(parkedRetry, null, 'and it does not also burn the scheduled retry')
+})
+
+t('RETRY: a hand-off is not double-served — an item at the ceiling that Roger picked is never also the scheduled retry', () => {
+  const b = parkedBoard()
+  const { toWork, parkedRetry } = selectWorkQueue({ ...b, now: NOW, priorityKeys: ['parked-oldest'] })
+  assert.equal(toWork[0].inc.key, 'parked-oldest', 'the human override takes it first')
+  assert.notEqual(parkedRetry?.inc.key, 'parked-oldest', 'so the scheduler must not pick the same key')
+})
+
+t('RETRY: the interval is configurable, and a 1-hour dial behaves like a 1-hour dial', () => {
+  const b = parkedBoard()
+  b.state.lastParkedRetryAt = iso(2 * HOUR)
+  assert.equal(selectWorkQueue({ ...b, now: NOW }).parkedRetry, null, 'closed at 24h')
+  assert.ok(selectWorkQueue({ ...b, now: NOW, parkedRetryIntervalMs: HOUR }).parkedRetry, 'open at 1h')
 })
 
 console.log(`

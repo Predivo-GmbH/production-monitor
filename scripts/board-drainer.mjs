@@ -4,9 +4,11 @@
  * Closes the one structural gap the fleet had: detect -> diagnose -> prescribe was strong, but the
  * EXECUTE step depended on a human (Roger) opening a session. production-monitor's autonomous stack
  * (auto-fix / agent-triage / deploy-triage) is live but each only sees its own GitHub-Actions slice;
- * NONE reads the aggregated Monitoring Board. This runner does: it reads `monitoring_incidents`
- * (BO Supabase), works the owner=Claude items an autonomous dev session may safely fix, escalates the
- * rest, and writes the result back — so the board drains to zero without Roger in the loop.
+ * NONE reads the aggregated Monitoring Board. This runner does: it reads `fleet_signals` (BO
+ * Supabase — the single store, since Plan A step 1 on 2026-08-27; it read `monitoring_incidents`
+ * before that and could not see four active problems), works the owner=Claude items an autonomous
+ * dev session may safely fix, escalates the rest, and writes the result back to
+ * `monitoring_incidents` — so the board drains to zero without Roger in the loop.
  *
  * Reuses the existing primitives (agent-triage.mjs's headless-Claude dispatch, Tier-B policy,
  * allowedTools allowlist, dedup-state, local-first, upsert_incident writer) — nothing rebuilt.
@@ -71,6 +73,23 @@ export function meetsThreshold(inc, thresholdRank = THRESHOLD_RANK) {
 }
 const MAX_FREE_TIMEOUTS = 3    // consecutive agent timeouts on one key that do NOT cost an attempt
 const MAX_ATTEMPTS = 3         // dedup-stuck: after N failed attempts on a key, escalate as "auto-fix stuck"
+
+/**
+ * PLAN B, B3 part 2 (Cockpit/docs/PLAN-QUIET-BOARD-2026-08-27.md, approved 2026-08-27).
+ *
+ * Until today a parked item was parked FOREVER. It cleared in exactly two ways — the incident
+ * left the board, or Roger pressed "Hand to Claude" — so nothing the drainer could not fix in
+ * three tries was ever tried a fourth time. Measured on production 2026-08-27: 41 of 42 active
+ * incidents were status `blocked`, 36 of 45 active signals named Claude as the owner, and only 2
+ * rows were younger than a day. The board had become a graveyard, and a graveyard looks exactly
+ * like an alarm going off.
+ *
+ * So: ONE parked item, oldest-parked first, gets one dispatch every 24 hours. Deliberately one,
+ * and deliberately not a reset of its attempt counter — a permanently-broken item earns exactly
+ * one agent run per day and never re-enters the normal queue to starve fresh work. It stays
+ * parked unless that run actually closes it.
+ */
+const PARKED_RETRY_INTERVAL_MS = Number(process.env.BOARD_DRAINER_PARKED_RETRY_HOURS || 24) * 3600_000
 const MODEL = 'claude-opus-4-8'
 const MAX_TURNS = 40
 const AGENT_TIMEOUT_MS = 12 * 60 * 1000
@@ -114,10 +133,11 @@ function readBoSecret() {
  */
 const runStats = {
   started_at: new Date().toISOString(),
-  considered: 0,      // open/blocked/investigating incidents on the board
+  considered: 0,      // open/acknowledged signals on the board (fleet_signals, since 2026-08-27)
   dispatchable: 0,    // passed the severity bar and not parked — work the drainer MAY take
   dispatched: 0,      // agents actually launched this run
-  parked: 0,          // at the attempt ceiling: suppressed, deliberately
+  parked: 0,          // at the attempt ceiling: suppressed, deliberately (excludes the one revived below)
+  parked_retry: null, // the one parked key handed back to the agent this run, or null (Plan B B3.2)
   escalated: 0,       // recorded without an agent (notes + first-time stuck)
   dry: !LIVE || !!FIXTURE,
   last_dispatch_at: null,
@@ -149,7 +169,7 @@ async function writeRunHeartbeat(secret) {
         title: 'Board drainer run',
         summary: runStats.error
           ? `run ERRORED: ${String(runStats.error).slice(0, 200)}`
-          : `${runStats.considered} on the board, ${runStats.dispatchable} dispatchable, ${runStats.dispatched} dispatched, ${runStats.parked} parked${runStats.dry ? ' (dry run)' : ''}`,
+          : `${runStats.considered} on the board, ${runStats.dispatchable} dispatchable, ${runStats.dispatched} dispatched, ${runStats.parked} parked${runStats.parked_retry ? `, 1 parked item revived (${runStats.parked_retry})` : ''}${runStats.dry ? ' (dry run)' : ''}`,
         detail: { ...runStats, finished_at: new Date().toISOString() },
         link: 'https://cockpit.predivo.ch/signals',
       }),
@@ -162,15 +182,86 @@ async function writeRunHeartbeat(secret) {
 }
 
 // ── board I/O (PostgREST; non-browser UA is mandatory) ───────────────────────────────────
+/**
+ * PLAN A STEP 1 (Cockpit/docs/PLAN-ONE-STORE-2026-08-27.md, approved 2026-08-27): the work-list
+ * is read from `fleet_signals`, the single store, instead of `monitoring_incidents`.
+ *
+ * WHY. The healthchecks monitor writes DIRECT to signal-intake (check-healthchecks-down.mjs:131)
+ * and never touches the old table, so any problem only that producer sees was invisible to the
+ * auto-fixer. Measured on production 2026-08-27 ~10:00 CET: 45 active signals, 42 active
+ * incidents, and FOUR active signals the drainer could not see at all —
+ * healthchecks/kb-learning-phase0, kb-learning-backfill, knowledge-apply-loop and
+ * kb-learning-loop, every one of them "Scheduled job stopped running".
+ *
+ * THE WRITE DOES NOT MOVE. This is deliberately a read-only cutover: results still go to
+ * `monitoring_incidents` through upsert_incident, and the mirror trigger carries them back into
+ * fleet_signals. Step 2 of the plan dual-writes for a week before anything is retired.
+ *
+ * ORDER. `first_seen_at asc` preserves the oldest-first queue the old `opened_at asc` gave, so
+ * the per-run cap keeps taking the head of the same queue.
+ */
+export function boardQueryUrl(base = BO_BASE) {
+  return `${base}/rest/v1/fleet_signals`
+    + `?select=source,key,title,severity,state,summary,detail,first_seen_at`
+    + `&state=in.(open,acknowledged)&order=first_seen_at.asc`
+}
+
+/**
+ * Map one fleet_signals row onto the incident shape every downstream function already speaks
+ * (classify, selectWorkQueue, buildUserPrompt, verdictToUpsert). Field mapping verified against
+ * live production rows 2026-08-27:
+ *   summary               -> root_cause     (present on 45 of 45 active rows)
+ *   detail.who_must_act   -> who_must_act   (written by the mirror, migrations 134/136)
+ *   detail.incident_status-> status         (ditto)
+ *   first_seen_at         -> opened_at
+ *
+ * Those two detail keys are only RELIABLE because migration 136_upsert_signal_detail_merge.sql
+ * made upsert_signal MERGE detail instead of replacing it. Before that, a direct write from the
+ * healthchecks producer (detail = {slug,status,last_ping,tags}) erased the owner and status the
+ * mirror had put there — which is exactly why those four rows had neither.
+ *
+ * A row with no incident behind it has no `incident_status`, and then the SIGNAL'S OWN state is
+ * the honest answer. Never invent 'open': a fabricated status reads identically to a real one.
+ */
+export function signalToIncident(sig) {
+  const detail = (sig && typeof sig.detail === 'object' && sig.detail !== null) ? sig.detail : {}
+  return {
+    source: sig.source,
+    key: sig.key,
+    title: sig.title,
+    severity: sig.severity,
+    status: detail.incident_status || sig.state,
+    root_cause: sig.summary ?? null,
+    who_must_act: detail.who_must_act ?? null,
+    opened_at: sig.first_seen_at,
+  }
+}
+
+/**
+ * monitoring_incidents.source CHECK, read back from BOTH live databases 2026-08-27:
+ *   healthchecks | sentry | production-monitor | cron | silent-failure | commit-review
+ * `fleet_signals` has NO such constraint and has carried `__drill__` and `board-drainer` rows.
+ *
+ * Since the WRITE still goes to monitoring_incidents (this step moves the read only), a signal
+ * whose source that table rejects cannot be worked: upsertIncident would take a 400 and throw,
+ * which is the exact fail-open class documented at isScoutDerived() above. So it is held back —
+ * and NAMED in the log every single run, because a work item nobody can see is how this whole
+ * defect started. Plan A step 2 (write to both stores) is what removes this limit.
+ */
+const INCIDENT_BOARD_SOURCES = new Set(['healthchecks', 'sentry', 'production-monitor', 'cron', 'silent-failure', 'commit-review'])
+export function writableToIncidentBoard(inc) { return INCIDENT_BOARD_SOURCES.has(inc?.source) }
+
 async function readBoard(secret) {
-  const url = `${BO_BASE}/rest/v1/monitoring_incidents`
-    + `?select=source,key,title,severity,status,root_cause,who_must_act,opened_at`
-    + `&status=in.(open,blocked,investigating)&order=opened_at.asc`
-  const res = await fetch(url, {
+  const res = await fetch(boardQueryUrl(), {
     headers: { apikey: secret, Authorization: `Bearer ${secret}`, 'User-Agent': NON_BROWSER_UA },
   })
   if (!res.ok) throw new Error(`board read HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`)
-  return res.json()
+  const rows = (await res.json()).map(signalToIncident)
+  const held = rows.filter((r) => !writableToIncidentBoard(r))
+  if (held.length) {
+    log(`  ${held.length} active signal(s) HELD BACK — monitoring_incidents (still the write target) rejects their source, so working them would 400: ${held.map((r) => `${r.source}/${r.key}`).join(', ')}`)
+  }
+  return rows.filter(writableToIncidentBoard)
 }
 
 /** The ONLY manual control over an otherwise fully automatic queue.
@@ -235,6 +326,77 @@ async function fetchWithTransportRetry(url, init) {
  *  scout_reports. This guard makes that structural rather than a convention. */
 export function isScoutDerived(inc) {
   return Boolean(inc && (inc.scoutReportId || inc.source === 'scout-ux'))
+}
+
+/**
+ * PLAN B, B3 part 1: PUBLISH parked state.
+ *
+ * Parking existed only in `C:\Business\_board-drainer\state.json` on one machine. No page, no
+ * query and no person could see it, so a pile of things we had given up on was indistinguishable
+ * on the board from things going wrong right now. These three keys are the CONTRACT the cockpit
+ * lane is being built against — do not change their names or shapes:
+ *
+ *   detail.parked           true while suppressed, false once it is not
+ *   detail.parked_at        ISO timestamp of the moment it was parked (null when not parked)
+ *   detail.parked_attempts  how many failed tries earned the park (null when not parked)
+ *
+ * They ride in `p_evidence`, because upsert_incident stores evidence verbatim and the mirror
+ * trigger merges it straight into fleet_signals.detail
+ * (136_mirror_owner_from_prefix.sql: `p_detail => coalesce(new.evidence,'{}') || ...`).
+ *
+ * NOT-PARKED IS WRITTEN OUT EXPLICITLY, never omitted. upsert_incident does
+ * `evidence = excluded.evidence` (a full replace), but upsert_signal MERGES detail since
+ * migration 136 — so an absent key leaves the OLD value standing on the signal. "Nothing said"
+ * would read as "still parked", forever.
+ */
+export function parkedFields(mark) {
+  return mark && mark.parked
+    ? { parked: true, parked_at: mark.at ?? null, parked_attempts: mark.attempts ?? null }
+    : { parked: false, parked_at: null, parked_attempts: null }
+}
+
+/**
+ * Clear the parked flag directly on the SIGNAL row.
+ *
+ * WHY NOT through upsert_incident like every other stamp: by the time an item leaves the board
+ * its incident is already closed, and writing an incident row is precisely what REOPENS it
+ * (upsert_incident sets status and nulls resolved_at). Clearing a bookkeeping flag must never
+ * resurrect an alarm.
+ *
+ * AND IT CANNOT BE SKIPPED AS HARMLESS. fleet_signals is unique(source,key) and migration 136
+ * made `detail` MERGE, so a `parked: true` left on a resolved row survives the resolve and comes
+ * straight back the next time that same check goes down — the item would be born parked.
+ *
+ * detail is read-modify-written because a PostgREST PATCH replaces the whole jsonb column.
+ * Every failure is logged and swallowed: this is bookkeeping, not the run.
+ */
+async function clearParkedOnSignal(secret, source, key) {
+  const H = { apikey: secret, Authorization: `Bearer ${secret}`, 'User-Agent': NON_BROWSER_UA }
+  const filter = `key=eq.${encodeURIComponent(key)}` + (source ? `&source=eq.${encodeURIComponent(source)}` : '')
+  try {
+    const cur = await fetch(`${BO_BASE}/rest/v1/fleet_signals?select=source,detail&${filter}`, { headers: H })
+    if (!cur.ok) throw new Error(`read HTTP ${cur.status}`)
+    const rows = await cur.json()
+    if (rows.length === 0) return false
+    if (rows.length > 1) {
+      // Only possible for a legacy state entry recorded before the source was stored alongside
+      // the key. Guessing which row to write is worse than saying so.
+      log(`  parked flag NOT cleared for ${key}: ${rows.length} signals share that key and this parked marker predates source tracking — clear it by hand or let "Hand to Claude" do it.`)
+      return false
+    }
+    if (rows[0].detail?.parked !== true) return false   // already agrees; do not write for nothing
+    const res = await fetch(`${BO_BASE}/rest/v1/fleet_signals?${filter}`, {
+      method: 'PATCH',
+      headers: { ...H, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+      body: JSON.stringify({ detail: { ...(rows[0].detail || {}), ...parkedFields(null) } }),
+    })
+    if (!res.ok) throw new Error(`patch HTTP ${res.status}`)
+    log(`  ${rows[0].source}/${key}: parked flag cleared on the signal row.`)
+    return true
+  } catch (e) {
+    log(`  parked flag NOT cleared for ${key} (${String(e).slice(0, 120)}) — the row may still read parked on /signals until the next write.`)
+    return false
+  }
 }
 
 async function upsertIncident(secret, payload) {
@@ -443,13 +605,23 @@ function dispatchAgent(inc, mode) {
 }
 
 // ── write-back: turn the agent verdict into a board state transition ──────────────────────
-function verdictToUpsert(inc, verdict) {
+/**
+ * @param {object} parkedBefore  the item's parked marker (`state.stuck[key]`) at the moment the
+ *   agent was dispatched, or null when it was not parked. Only the 24-hour scheduled retry ever
+ *   passes a non-null one. The rule it encodes: a retry that CLOSED the item un-parks it; a retry
+ *   that did not leaves it parked, because one more failed try is not progress. Everything else
+ *   publishes `parked: false` — which is what un-parks a revived item, and what keeps a stale
+ *   flag from surviving on a merged detail (see parkedFields).
+ */
+function verdictToUpsert(inc, verdict, parkedBefore = null) {
   // Guard: fixed/self-healed REQUIRES a receipt — never close on a shallow verdict.
   let status = verdict.status
   if ((status === 'fixed' || status === 'self-healed') && !(verdict.receipt || '').trim()) {
     status = 'investigating'   // no receipt -> refuse to close; leave visible with progress
   }
   const sev = status === 'blocked' ? (inc.severity || 'warning') : 'warning'
+  const closed = status === 'fixed' || status === 'self-healed'
+  const stillParked = Boolean(parkedBefore) && !closed
   return {
     p_source: inc.source,
     p_key: inc.key,
@@ -458,7 +630,10 @@ function verdictToUpsert(inc, verdict) {
     p_status: status,
     p_root_cause: `[board-drainer ${new Date().toISOString().slice(0, 16)}] ${verdict.diagnosis || ''} | ${verdict.action || ''}${verdict.receipt ? ' | receipt: ' + verdict.receipt : ''}`.slice(0, 2000),
     p_who_must_act: status === 'blocked' ? (verdict.who_must_act || inc.who_must_act || null) : null,
-    p_evidence: { by: 'board-drainer', class: verdict.class, action: verdict.action, receipt: verdict.receipt || null },
+    p_evidence: {
+      by: 'board-drainer', class: verdict.class, action: verdict.action, receipt: verdict.receipt || null,
+      ...parkedFields(stillParked ? { parked: true, at: parkedBefore.at, attempts: parkedBefore.attempts } : null),
+    },
   }
 }
 
@@ -524,17 +699,36 @@ export function timeoutCostsAnAttempt(consecutiveTimeouts, maxFree = MAX_FREE_TI
  * stuck, recorded in `state.stuck`, and thereafter PARKED: no write, no dispatch, no cost.
  *
  * ── PARKED IS A SUPPRESSION, SO IT HAS A CLEARING PATH AND IT ANNOUNCES ITSELF ───────────
- * Three ways out, all live in this same commit (the rule: a suppression flag ships with the
- * thing that clears it, and a default nobody chose must announce itself):
+ * Four ways out (the rule: a suppression flag ships with the thing that clears it, and a default
+ * nobody chose must announce itself):
  *   1. the key leaves the board            -> pruned with the attempt counter (see main)
  *   2. Roger presses "Hand to Claude"      -> priorityKeys clears stuck AND attempts, so the
  *                                             item gets a fresh run of tries at the FRONT
  *   3. BOARD_DRAINER_RESET_STUCK=all|<key> -> manual reset for an operator
+ *   4. the 24-hour scheduled retry         -> added 2026-08-27, Plan B B3 part 2, below
  * and every run logs the parked count and keys, so a parked item can never be a silent one.
  *
- * @returns {{toWork:Array, toEscalate:Array, parked:Array, belowBar:number, hoisted:string[]}}
+ * ── THE SCHEDULED RETRY (2026-08-27) ────────────────────────────────────────────────────
+ * Ways 1-3 all needed something to HAPPEN — the problem to go away by itself, or a person to
+ * press a button. Nothing retried on its own, which is how 41 of 42 incidents came to sit
+ * blocked. So exactly ONE parked item, the one parked longest, is handed back to the agent every
+ * PARKED_RETRY_INTERVAL_MS.
+ *
+ * It is appended AFTER the maxPerRun slice on purpose: MAX_PER_RUN is the blast-radius budget for
+ * NORMAL work, and charging the retry to it would let a parked pile starve fresh problems — the
+ * same head-of-line failure this function was written to fix, wearing a different hat. One run in
+ * twenty-four therefore dispatches maxPerRun + 1, and that +1 is the whole mechanism.
+ *
+ * The revived item is REMOVED from `parked` so the run log cannot call it suppressed and revived
+ * in the same breath.
+ *
+ * @returns {{toWork:Array, toEscalate:Array, parked:Array, belowBar:number, hoisted:string[],
+ *            eligible:number, parkedRetry:object|null}}
  */
-export function selectWorkQueue({ routed, state, maxPerRun = MAX_PER_RUN, maxAttempts = MAX_ATTEMPTS, priorityKeys = [] }) {
+export function selectWorkQueue({
+  routed, state, maxPerRun = MAX_PER_RUN, maxAttempts = MAX_ATTEMPTS, priorityKeys = [],
+  now = Date.now(), parkedRetryIntervalMs = PARKED_RETRY_INTERVAL_MS,
+}) {
   const attempts = state?.attempts || {}
   const stuck = state?.stuck || {}
   const priority = new Set(priorityKeys)
@@ -560,7 +754,30 @@ export function selectWorkQueue({ routed, state, maxPerRun = MAX_PER_RUN, maxAtt
     }
     workable.push(entry)
   }
-  return { toWork: workable.slice(0, maxPerRun), toEscalate, parked, belowBar, hoisted, eligible: workable.length }
+
+  // ── way 4 out of parked: the scheduled retry ──────────────────────────────────────────
+  // A never-yet-recorded clock retries immediately. That is the intended first behaviour, not an
+  // oversight: on the run this ships, everything parked has been parked for days already.
+  const lastAt = Date.parse(state?.lastParkedRetryAt || '')
+  const due = Number.isNaN(lastAt) || (now - lastAt) >= parkedRetryIntervalMs
+  let parkedRetry = null
+  if (due && parked.length) {
+    // Oldest parked FIRST — the one we gave up on longest ago, not the one that happens to sort
+    // first. A marker with no readable timestamp counts as the oldest of all: an item whose
+    // bookkeeping we lost is the last one that should keep waiting.
+    const parkedAt = (k) => { const t = Date.parse(stuck[k]?.at || ''); return Number.isNaN(t) ? 0 : t }
+    parkedRetry = [...parked].sort((a, b) => parkedAt(a.inc.key) - parkedAt(b.inc.key))[0]
+  }
+
+  return {
+    toWork: parkedRetry ? [...workable.slice(0, maxPerRun), parkedRetry] : workable.slice(0, maxPerRun),
+    toEscalate,
+    parked: parkedRetry ? parked.filter((e) => e !== parkedRetry) : parked,
+    belowBar,
+    hoisted,
+    eligible: workable.length,
+    parkedRetry,
+  }
 }
 
 // ── main ────────────────────────────────────────────────────────────────────────────────
@@ -593,8 +810,10 @@ async function main() {
   runStats.last_dispatch_at = state.lastDispatchAt || null
   log(`Board Drainer start — mode=${LIVE ? 'LIVE' : 'DRY-RUN'}${FIXTURE ? ' [FIXTURE]' : ''}`)
 
-  // Clearing path 3 of 3 for the parked suppression: an operator reset. Runs before anything
-  // reads state.stuck, and says out loud what it cleared.
+  // Clearing path 3 of 4 for the parked suppression: an operator reset. Runs before anything
+  // reads state.stuck, and says out loud what it cleared. It clears the LOCAL marker only; the
+  // published `detail.parked` flag is corrected by the write-back of the dispatch that follows
+  // immediately (verdictToUpsert stamps parked:false), which is the same run.
   const reset = (process.env.BOARD_DRAINER_RESET_STUCK || '').trim()
   if (reset) {
     const keys = reset === 'all' ? Object.keys(state.stuck) : [reset]
@@ -660,31 +879,42 @@ async function main() {
   if (!FIXTURE && allSourcesLoaded) {
     const live = new Set(incidents.map((i) => i.key))
     const stale = Object.keys(state.attempts).filter((k) => !live.has(k))
-    // Clearing path 1 of 3: state.stuck rides the SAME prune as state.attempts and under the
+    // Clearing path 1 of 4: state.stuck rides the SAME prune as state.attempts and under the
     // same fail-safe. If it did not, an item could leave the board, come back, and be parked on
     // sight forever — which is the exact bug this prune was written for in the first place.
     const staleStuck = Object.keys(state.stuck).filter((k) => !live.has(k))
     if (stale.length || staleStuck.length) {
       for (const k of stale) { delete state.attempts[k]; delete state.timeouts[k] }
-      for (const k of staleStuck) delete state.stuck[k]
+      for (const k of staleStuck) {
+        // The PUBLISHED flag has to be cleared too, and it has to be cleared HERE. detail merges
+        // (migration 136), so a parked:true left on a row that resolved is still there when the
+        // same check goes down again — the item would come back already parked.
+        if (LIVE) await clearParkedOnSignal(secret, state.stuck[k]?.source, k)
+        delete state.stuck[k]
+      }
       saveState(state)
       log(`  pruned ${stale.length} stale attempt counter(s) and ${staleStuck.length} parked marker(s) for incidents no longer open`)
     }
   }
 
-  // Clearing path 2 of 3: a human override. Pressing "Hand to Claude" on /signals is Roger
+  // Clearing path 2 of 4: a human override. Pressing "Hand to Claude" on /signals is Roger
   // saying "try again", so it resets BOTH the attempt counter and the parked marker — otherwise
   // the button would hoist an item to the front of a queue it is still forbidden to enter.
+  // Unchanged by the 24-hour scheduled retry: the button still revives IMMEDIATELY, and it is
+  // still the only path that also wipes the attempt counter.
   const revived = priorityKeys.filter((k) => state.stuck[k] || state.attempts[k])
   if (revived.length) {
-    for (const k of revived) { delete state.stuck[k]; delete state.attempts[k]; delete state.timeouts[k] }
+    for (const k of revived) {
+      if (LIVE && state.stuck[k]) await clearParkedOnSignal(secret, state.stuck[k]?.source, k)
+      delete state.stuck[k]; delete state.attempts[k]; delete state.timeouts[k]
+    }
     saveState(state)
     log(`  ${revived.length} item(s) revived by "Hand to Claude" — attempt counter and parked marker cleared: ${revived.join(', ')}`)
   }
 
   if (!FIXTURE && !allSourcesLoaded) log('  prune SKIPPED this run: a work-list source failed to load, so a stale counter cannot be told from an unfetched one')
 
-  log(`board: ${incidents.length} open/blocked/investigating incident(s)`)
+  log(`board: ${incidents.length} open/acknowledged signal(s) on fleet_signals`)
   runStats.considered = incidents.length
   if (incidents.length === 0) { log('nothing to drain — board is clean.'); return }
 
@@ -693,11 +923,12 @@ async function main() {
   for (const { inc, cls } of routed) {
     log(`  • [${cls.owner}/${cls.mode.toUpperCase()}] ${inc.source}/${inc.key} (${cls.reason}) :: ${inc.title}`)
   }
-  const { toWork, toEscalate, parked, belowBar, hoisted, eligible } = selectWorkQueue({ routed, state, priorityKeys })
+  const { toWork, toEscalate, parked, belowBar, hoisted, eligible, parkedRetry } = selectWorkQueue({ routed, state, priorityKeys })
   // Published in the heartbeat: `dispatchable > 0` with nothing dispatched, run after run, is
   // the exact 30-hour failure, and it is invisible to any alarm that only asks "did it run?".
   runStats.dispatchable = eligible
   runStats.parked = parked.length
+  runStats.parked_retry = parkedRetry ? `${parkedRetry.inc.source}/${parkedRetry.inc.key}` : null
   runStats.escalated = toEscalate.length
   if (belowBar) log(`  severity threshold '${THRESHOLD}': ${belowBar} item(s) below the bar, classified and logged above but not dispatched.`)
   if (hoisted.length) log(`  hoisted to the front by "Hand to Claude": ${hoisted.join(', ')}`)
@@ -708,15 +939,33 @@ async function main() {
   if (parked.length) {
     log(`  PARKED at the attempt ceiling (${MAX_ATTEMPTS} failed tries), not dispatched and not re-escalated: ${parked.length}`)
     for (const { inc } of parked) log(`    ⏸ ${inc.source}/${inc.key} :: ${inc.title}`)
-    log(`    To retry one: press "Hand to Claude" on /signals, or run with BOARD_DRAINER_RESET_STUCK=<key> (or =all).`)
+    log(`    Each is published as detail.parked=true on its signal row, and one of them is retried every ${PARKED_RETRY_INTERVAL_MS / 3600_000}h. To jump that queue: press "Hand to Claude" on /signals, or run with BOARD_DRAINER_RESET_STUCK=<key> (or =all).`)
+  }
+  // Clearing path 4 of 4, and the reason the board can now drain on its own. Named loudly with
+  // WHY it was chosen, because "the machine picked one" is not an explanation anybody can audit.
+  if (parkedRetry) {
+    const mark = state.stuck[parkedRetry.inc.key] || {}
+    const sinceH = mark.at ? Math.round((Date.now() - Date.parse(mark.at)) / 3600_000) : null
+    log(`  ⏵ ${LIVE && !FIXTURE ? 'REVIVING' : 'would REVIVE'} 1 parked item — the OLDEST parked, one per ${PARKED_RETRY_INTERVAL_MS / 3600_000}h: ${parkedRetry.inc.source}/${parkedRetry.inc.key}`)
+    log(`      why: parked ${mark.at ? `since ${mark.at}${sinceH === null ? '' : ` (${sinceH}h)`}` : 'at an unrecorded time, which makes it the most neglected of all'} after ${mark.attempts ?? MAX_ATTEMPTS} failed attempts; last scheduled retry ${state.lastParkedRetryAt || 'never'}.`)
+    log(`      it is dispatched OUTSIDE the blast-radius cap (${MAX_PER_RUN} + 1 this run), so reviving it never displaces fresh work.`)
   }
 
   // In DRY-RUN or FIXTURE we stop here: classification only, nothing dispatched or written.
   if (!LIVE || FIXTURE) {
     const fixes = toWork.filter((r) => r.cls.mode === 'fix').length
-    log(`DRY-RUN: would FIX ${fixes}, VERIFY ${toWork.length - fixes}, RECORD-without-agent ${toEscalate.length}, PARK ${parked.length}. No agent run, no write-back.`)
+    log(`DRY-RUN: would FIX ${fixes}, VERIFY ${toWork.length - fixes}, RECORD-without-agent ${toEscalate.length}, PARK ${parked.length}, REVIVE ${parkedRetry ? 1 : 0}. No agent run, no write-back.`)
     saveState(state)
     return
+  }
+
+  // The retry clock is stamped at the moment the DECISION is made, not after the agent returns:
+  // a dispatch that crashes has still spent this window's retry, and re-spending it on the next
+  // tick would turn "one per 24 hours" into "every 20 minutes" against the most broken item we
+  // have.
+  if (parkedRetry) {
+    state.lastParkedRetryAt = new Date().toISOString()
+    saveState(state)
   }
 
   // 3a. Record-only pass: notes and first-time stuck escalations. Neither runs an agent, so
@@ -731,7 +980,9 @@ async function main() {
           p_source: inc.source, p_key: inc.key, p_title: inc.title, p_severity: 'info', p_status: 'expected',
           p_root_cause: `[board-drainer] ${inc.root_cause || inc.title} — vendor plan expired — noted, no action`.slice(0, 2000),
           p_who_must_act: null,
-          p_evidence: { by: 'board-drainer', class: 'EXPECTED', note: 'vendor plan expired — noted, no action' },
+          // parked:false because this branch un-parks the item two lines below. detail merges, so
+          // saying nothing would leave a stale parked:true standing on the signal.
+          p_evidence: { by: 'board-drainer', class: 'EXPECTED', note: 'vendor plan expired — noted, no action', ...parkedFields(null) },
         })
         delete state.attempts[inc.key]
         delete state.stuck[inc.key]
@@ -744,20 +995,27 @@ async function main() {
       const attempts = state.attempts[inc.key] || MAX_ATTEMPTS
       const { owner: stuckOwner, priorAction, value: stuckWho } = stuckWhoMustAct(inc.who_must_act)
       const needsRogersHands = stuckOwner === 'Roger'
-      log(`  ${inc.key}: ${attempts} failed attempts — escalating ONCE as auto-fix-stuck (owner ${stuckOwner}), then parking.`)
+      // One timestamp for both the published flag and the local marker, so /signals and
+      // state.json can never disagree about when this item was given up on.
+      const parkedAt = new Date().toISOString()
+      log(`  ${inc.key}: ${attempts} failed attempts — escalating ONCE as auto-fix-stuck (owner ${stuckOwner}), then parking (published as detail.parked=true, retried in ≤${PARKED_RETRY_INTERVAL_MS / 3600_000}h).`)
       if (isScoutDerived(inc)) {
         await markScoutReport(secret, inc.scoutReportId, { state: 'real', state_reason: `auto-fix stuck after ${attempts} attempts: ${priorAction}`.slice(0, 500), worked_at: new Date().toISOString() })
       } else {
         await upsertIncident(secret, {
           p_source: inc.source, p_key: inc.key, p_title: inc.title, p_severity: 'critical', p_status: 'blocked',
-          p_root_cause: `[board-drainer] auto-fix STUCK after ${attempts} attempts — the action below still stands, it just could not be applied automatically. Retry with "Hand to Claude" on /signals.`,
+          p_root_cause: `[board-drainer] auto-fix STUCK after ${attempts} attempts — the action below still stands, it just could not be applied automatically. It is retried automatically within ${PARKED_RETRY_INTERVAL_MS / 3600_000}h, or immediately with "Hand to Claude" on /signals.`,
           p_who_must_act: stuckWho,
-          p_evidence: { by: 'board-drainer', stuck: true, attempts, stuckOwner, needsRogersHands },
+          p_evidence: {
+            by: 'board-drainer', stuck: true, attempts, stuckOwner, needsRogersHands,
+            ...parkedFields({ parked: true, at: parkedAt, attempts }),
+          },
         })
       }
       // Mark parked LAST, so a failed escalation is retried next run instead of being
-      // silently swallowed into the parked set.
-      state.stuck[inc.key] = { at: new Date().toISOString(), attempts }
+      // silently swallowed into the parked set. `source` rides along because clearParkedOnSignal
+      // needs it later, when the row itself is gone from the work-list.
+      state.stuck[inc.key] = { at: parkedAt, attempts, source: inc.source }
       state.attempts[inc.key] = attempts
       saveState(state)
     } catch (e) {
@@ -778,7 +1036,11 @@ async function main() {
   for (const { inc, cls } of toWork) {
     try {
       const attempts = (state.attempts[inc.key] || 0) + 1
-      log(`  dispatching agent [${cls.mode}] for ${inc.source}/${inc.key} (attempt ${attempts})...`)
+      // Captured BEFORE the agent runs. A parked item reaching this loop is the 24-hour retry,
+      // and whether it stays parked afterwards depends on what the agent achieves, not on what
+      // the state file happens to say twelve minutes later.
+      const parkedBefore = state.stuck[inc.key] || null
+      log(`  dispatching agent [${cls.mode}] for ${inc.source}/${inc.key} (attempt ${attempts})${parkedBefore ? ' — SCHEDULED RETRY of a parked item, outside the blast-radius cap' : ''}...`)
       // Counted at DISPATCH, not at success: the alarm asks whether the loop is moving, and a
       // dispatch that fails is still a loop that moved. Persisted, because the run that
       // dispatches nothing is the one whose "when did we last move" has to survive.
@@ -810,7 +1072,7 @@ async function main() {
         saveState(state)
         continue
       }
-      const payload = verdictToUpsert(inc, verdict)
+      const payload = verdictToUpsert(inc, verdict, parkedBefore)
       // Scout-derived items never reach the incidents board (see isScoutDerived above).
       if (!isScoutDerived(inc)) await upsertIncident(secret, payload)
       log(`  ${inc.key}: verdict=${verdict.class} -> board status=${payload.p_status}${payload.p_status === 'blocked' ? ' (escalated)' : ''}`)
@@ -830,8 +1092,18 @@ async function main() {
         log(`    scout report ${String(inc.scoutReportId).slice(0, 8)} -> ${done ? 'fixed, Measured re-check armed for 7 days' : 'left open, reason recorded'}`)
       }
       // clear the attempt counter only when we reached a terminal, non-stuck state
-      if (payload.p_status === 'fixed' || payload.p_status === 'self-healed') delete state.attempts[inc.key]
-      else state.attempts[inc.key] = attempts
+      if (payload.p_status === 'fixed' || payload.p_status === 'self-healed') {
+        delete state.attempts[inc.key]
+        // A scheduled retry that CLOSED the item un-parks it, locally and on the published row
+        // (verdictToUpsert already wrote parked:false into the evidence the mirror merges).
+        if (parkedBefore) { delete state.stuck[inc.key]; log(`    ${inc.key}: un-parked — the scheduled retry closed it.`) }
+      } else {
+        state.attempts[inc.key] = attempts
+        // The retry did not close it, so it goes straight back to parked with its ORIGINAL
+        // timestamp. One more failed try is not progress, and it must not jump the oldest-first
+        // queue ahead of items that have waited longer.
+        if (parkedBefore) log(`    ${inc.key}: STILL PARKED (parked since ${parkedBefore.at}) — the scheduled retry did not close it; next retry in ${PARKED_RETRY_INTERVAL_MS / 3600_000}h.`)
+      }
       saveState(state)
       } catch (e) {
       // Record the attempt so a repeatedly-failing item still reaches MAX_ATTEMPTS and gets
