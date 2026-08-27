@@ -991,6 +991,12 @@ export function handoffPrompt(inc, cls) {
   return lines.join('\n')
 }
 
+// The terminal work_item statuses (Cockpit sql/055/062): once a row is here Roger has SIGNED IT
+// OFF or dropped it. A signal that recurs against one of these must not be superseded onto the dead
+// row — that is the silent-mute this module exists to avoid. Every other status is a live, visible
+// item the signal can safely fold into.
+const CLOSED_WORK_STATUSES = new Set(['done', 'abandoned'])
+
 /**
  * Move one gated incident onto the work board. Every side effect arrives as an injected function,
  * so the decisions here are testable without a database and without a network.
@@ -1008,10 +1014,24 @@ export async function routeToWorkBoard(inc, cls, deps) {
 
   let created = false
   let itemId = existing?.id ?? null
+  if (existing && CLOSED_WORK_STATUSES.has(existing.status)) {
+    // A RECURRENCE AFTER SIGN-OFF is new work, not the old item. Two wrong moves are possible here
+    // and this branch refuses both: re-minting under the same slug would break idempotence and pile
+    // duplicate rows onto a finished item; superseding the signal against that finished item would
+    // MUTE a live problem — the producer set state='open' because the underlying check is red RIGHT
+    // NOW, and there is no open work item anywhere to catch it, so the alarm would vanish from
+    // /signals and the incident feed with nothing left standing. So do NOT supersede: return early
+    // and leave the signal OPEN and loud. That restores the invariant handoffPrompt() promises —
+    // "if the underlying check goes red again it comes straight back". Roger re-handles it from a
+    // live, visible signal rather than from silence.
+    deps.log?.(`    work item "${existing.slug}" is already ${existing.status} — this signal RECURRED after sign-off; leaving it OPEN, not superseding`)
+    return { created: false, slug, title, superseded: false, objections, reason: 'recurred after sign-off — left open' }
+  }
   if (existing) {
     // IDEMPOTENCE, and it is checked against the SLUG rather than the title precisely because the
-    // title moves. A closed item is left closed on purpose: re-minting work Roger already finished
-    // is how a board becomes untrustworthy in the other direction.
+    // title moves. An OPEN item (blocked/next/in_progress/awaiting_signoff) is left as-is and the
+    // signal is superseded onto it — the work is already queued and visible. Only a CLOSED item is
+    // handled above, because superseding onto a finished item is a silent mute.
     deps.log?.(`    already on the work board as "${existing.slug}" (${existing.status}) — not minting a second item`)
   } else {
     const item = await deps.createItem({

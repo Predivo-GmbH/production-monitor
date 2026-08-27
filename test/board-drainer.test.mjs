@@ -924,6 +924,25 @@ ta('IDEMPOTENT: an item Roger already FINISHED is not re-minted', async () => {
   assert.equal(r.created, false)
 })
 
+ta('a RECURRENCE after sign-off is left OPEN, never superseded onto the finished item', async () => {
+  // The silent mute this guards: item signed off to 'done', the underlying check goes red again weeks
+  // later, its producer writes fleet_signals state='open'. Superseding the signal onto the finished
+  // item would drop the alarm off /signals and the incident feed with NO live work item anywhere —
+  // the problem is real and no surface shows it. So the signal is left OPEN and supersede is not called.
+  for (const closed of ['done', 'abandoned']) {
+    const b = fakeBoard()
+    let supersedeCalls = 0
+    b.deps.supersedeSignal = async () => { supersedeCalls++; return true }
+    const inc = rogerInc()
+    b.items.set(workItemSlugFor(inc), { id: `old-${closed}`, slug: workItemSlugFor(inc), status: closed })
+    const r = await routeToWorkBoard(inc, classify(inc), b.deps)
+    assert.equal(b.creates(), 0, `${closed}: the finished item is not re-minted`)
+    assert.equal(r.created, false, `${closed}: nothing minted`)
+    assert.equal(r.superseded, false, `${closed}: the recurrence is left OPEN`)
+    assert.equal(supersedeCalls, 0, `${closed}: supersedeSignal is never called against a signed-off item`)
+  }
+})
+
 ta('the prompt is attached to the item as evidence, once', async () => {
   const b = fakeBoard()
   const inc = rogerInc()
