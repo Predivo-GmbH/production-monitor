@@ -21,7 +21,10 @@ on:
 
 concurrency:
   group: ci-runner-watchdog
-  cancel-in-progress: false
+  # A watchdog only ever needs the newest run. With cancel-in-progress:false a */10 cron is a
+  # backlog generator: once anything wedges, ticks pile up behind it in status=queued (this
+  # stranded three runs for 16.5h and made the watchdog page about itself). Cancel the stale run.
+  cancel-in-progress: true
 
 jobs:
   watch:
