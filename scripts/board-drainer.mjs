@@ -1018,7 +1018,13 @@ export async function routeToWorkBoard(inc, cls, deps) {
       slug,
       title,
       kind: 'task',
-      status: 'next',              // `next` carries no owner (Cockpit sql/061) — nobody is on it yet
+      // This item is here BECAUSE the drainer classified it as needing Roger's hands. It must land
+      // in his lane. Cockpit sql/062 derives the lane from `status`: only 'blocked'/'awaiting_signoff'
+      // reach 'your_turn' (needs_you=true); 'next' is matched one branch earlier and derives lane='next',
+      // needs_you=false — where he never sees it (Dashboard tile, session-start NEEDS ROGER, work_board).
+      // So mint it 'blocked' with blocked_owner 'roger'. Nothing is lost: sql/061 only strips the owner
+      // columns on 'next' rows, and this item is minted with no owner_session/claimed_at either way.
+      status: 'blocked',
       source: 'monitor',
       opened_by: 'board-drainer',
       blocked_owner: 'roger',

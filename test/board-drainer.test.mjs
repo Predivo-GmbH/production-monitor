@@ -958,15 +958,26 @@ ta('a hand-off that cannot be written NEVER supersedes the signal', async () => 
   assert.equal(superseded, false, 'the alarm stays up until the task provably exists')
 })
 
-ta('a work item is born unowned and marked as coming from the monitor', async () => {
+// Mirror of Cockpit sql/062's lane derivation for a minted, UNOWNED hand-off row: needs_you is
+// EXACTLY lane='your_turn', and for a row nobody is on that means status 'blocked'/'awaiting_signoff'
+// owed to Roger. A 'next' row can never be your_turn. This is the contract the drainer must satisfy.
+const needsYou = (row) =>
+  ((row.status === 'blocked' || row.status === 'awaiting_signoff') &&
+    String(row.blocked_owner || 'roger').toLowerCase() === 'roger')
+
+ta('a hand-off is born unowned, from the monitor, and in the lane Roger can see', async () => {
   const b = fakeBoard()
   const inc = rogerInc()
   await routeToWorkBoard(inc, classify(inc), b.deps)
   const item = [...b.items.values()][0]
-  assert.equal(item.status, 'next')
+  // NOT 'next': a 'next' row derives lane='next', needs_you=false, so an item the drainer decided
+  // needs Roger's hands would leave the alarm board and arrive nowhere he looks.
+  assert.equal(item.status, 'blocked')
+  assert.equal(item.blocked_owner, 'roger')
   assert.equal(item.source, 'monitor')
   assert.equal(item.kind, 'task')
-  assert.equal(item.owner_session, undefined, 'nobody is on it yet — `next` rows carry no owner')
+  assert.equal(item.owner_session, undefined, 'nobody is on it yet — it carries no owner')
+  assert.ok(needsYou(item), 'a handed-off item MUST be one work_board.needs_you can see (Cockpit sql/062)')
 })
 
 // ── the queue: a hand-off costs no agent run and no blast-radius budget ───────────────────
