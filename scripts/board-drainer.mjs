@@ -38,6 +38,7 @@ import { createHash } from 'crypto'
 import { join } from 'path'
 import { homedir } from 'os'
 import { pathToFileURL } from 'url'
+import { DEPLOY_DENY_TOOLS, agentToolFlags, DEPLOY_DENY_POLICY_NOTE } from './lib/deploy-deny-tools.mjs'
 
 // ── config ──────────────────────────────────────────────────────────────────────────────
 const BO_REF = 'xoecpzfsskalvjrtcbbl'
@@ -1369,7 +1370,7 @@ HARD RULES (never violate):
 PROD EDGE-FUNCTION DEPLOYS (the ONLY permitted path — guarded, Roger-approved 2026-08-20): if the fix requires deploying a Supabase edge function to PROD, you MUST use the guard, never the supabase CLI directly:
   node scripts/prod-deploy-guard.mjs --project <ref> --function <name> --repo <abs repo path> --probe-url <url> [--probe-expect <substring>] [--probe-header "Name: value"] [--note "<what+why>"]
 The guard enforces: hard-coded allowlist (ReplyFlow monitor-sync-health; BackOffice monitoring-board + health-monitor — anything else is REFUSED), 2 real deploys/day cap, clean+in-sync repo (local HEAD == origin, so it can only ship the committed, pushed, CI-green commit — never a stale checkout), green CI, then a mandatory post-deploy probe with auto-rollback. Export SUPABASE_ACCESS_TOKEN (from that repo's docs/Credentials.txt) before calling it; run --dry-run first if unsure. Closing rule: an incident needing a prod deploy may only be closed status=fixed when the guard exits 0 AND its probe evidence is your receipt. Exit 2 = rolled back -> escalate, do NOT close. Exit 1 = refused/error -> do NOT deploy; if the function is not allowlisted, escalate to Roger instead.
-A DIRECT "supabase functions deploy" (in ANY form — bare, npx, npm exec, pnpm, yarn, bunx) is now BLOCKED by the harness itself: it will be denied, so do not attempt it. The guard is the only path that can reach production, and it refuses every product function (auth, payments, email, lifecycle-tick, connect-platform, process-queue, …). A product function that genuinely needs a prod deploy is therefore NOT yours to ship: fix it, deploy to STAGING, and ESCALATE the production promotion to Roger. Shipping a product function directly from your checkout is exactly the failure that gave one customer the same email twice on 2026-08-25.
+${DEPLOY_DENY_POLICY_NOTE.trim()}
 
 FINAL ACTION (required): use the Write tool to write ${VERDICT_PATH.replace(/\\/g, '/')} as JSON:
 {"class":"A-INFRA|B-PRODUCT-STAGED|C-CLOSED|D-ESCALATE","status":"fixed|self-healed|blocked|investigating","action":"what you did (commit sha / PR url / deploy run / none)","receipt":"the concrete verification that proves it (repro output / live check / green run id) — REQUIRED to set status=fixed/self-healed","who_must_act":"Roger - <one-line> (only if status=blocked, else null)","diagnosis":"1-3 sentences"}`
@@ -1400,45 +1401,13 @@ const WRITE = [
 ]
 
 /**
- * prod-deploy-guard is "the ONLY permitted path" for a prod edge-function deploy
- * (SYSTEM_POLICY), but until 2026-08-28 that was PROSE, not a mechanism: WRITE grants
- * Bash(node:*), Bash(npm:*) and Bash(npx:*), every one of which can run
- * `supabase functions deploy` DIRECTLY and ship whatever is in the on-disk checkout —
- * stale or not — with none of the guard's allowlist / in-sync / green-CI / probe checks.
- * That is the class of failure behind the 2026-08-25 ChannelMover incident
- * (ChannelMover/docs/INCIDENTS.md): an autonomous deploy from a stale tree silently undid
- * a committed fix, and one customer got the same email twice. A fix agent deploying an
- * unrelated fix must never be able to redeploy a product function as a side effect.
- *
- * Deny rules take precedence over the allow list in Claude Code, so these turn the guard
- * into the only path in MECHANISM, not just in prose. This is a hard stop for the
- * straightforward direct-deploy the policy used to merely discourage; it is NOT a jail for
- * an adversarial agent (a hand-rolled `node -e` shelling out could still evade it), which
- * is why the guard's own allowlist — which REFUSES any product function such as
- * lifecycle-tick outright — remains the load-bearing control.
+ * The deny list that keeps this agent off a production edge function now lives in ONE
+ * place, scripts/lib/deploy-deny-tools.mjs, because three sibling dispatchers
+ * (deploy-failure-triage, agent-triage, local-triage-runner) hand out the same WRITE
+ * verbs and need the same block. Re-exported here so the drainer's own test suite keeps
+ * importing it from the script it guards. Read that module for the full why.
  */
-export const DEPLOY_DENY_TOOLS = [
-  'Bash(supabase functions deploy:*)',
-  'Bash(npx supabase functions deploy:*)',
-  'Bash(npx -y supabase functions deploy:*)',
-  'Bash(npx --yes supabase functions deploy:*)',
-  'Bash(npm exec supabase functions deploy:*)',
-  'Bash(npm exec -- supabase functions deploy:*)',
-  'Bash(pnpm supabase functions deploy:*)',
-  'Bash(pnpm dlx supabase functions deploy:*)',
-  'Bash(pnpm exec supabase functions deploy:*)',
-  'Bash(yarn supabase functions deploy:*)',
-  'Bash(yarn dlx supabase functions deploy:*)',
-  'Bash(bunx supabase functions deploy:*)',
-]
-
-/** The tool flags every dispatched agent gets: the allow list, plus the deny list that
- *  makes prod-deploy-guard the only path to a prod edge-function deploy. Exported so a
- *  test can prove the wiring (that --disallowedTools is actually passed), not just the
- *  content of the deny list. */
-export function agentToolFlags(allowedTools) {
-  return ['--allowedTools', allowedTools, '--disallowedTools', DEPLOY_DENY_TOOLS.join(',')]
-}
+export { DEPLOY_DENY_TOOLS, agentToolFlags }
 
 function dispatchAgent(inc, mode) {
   try { if (existsSync(VERDICT_PATH)) rmSync(VERDICT_PATH) } catch { /* noop */ }

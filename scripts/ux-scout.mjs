@@ -33,6 +33,7 @@ import { spawnSync } from 'node:child_process'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { pathToFileURL } from 'node:url'
+import { DEPLOY_DENY_TOOLS } from './lib/deploy-deny-tools.mjs'
 
 // ── config ───────────────────────────────────────────────────────────────────────
 const PROJECTS_ROOT = process.env.UX_SCOUT_PROJECTS_ROOT || 'C:\\Business\\Internal Projects'
@@ -399,7 +400,10 @@ function narrate(product, rows) {
   //
   // No shell. Explicit binary, args array, exactly the pattern board-drainer.mjs already uses.
   const CLAUDE_BIN = process.platform === 'win32' ? 'claude.exe' : 'claude'
-  const res = spawnSync(CLAUDE_BIN, ['-p', prompt], {
+  // This call only narrates findings and asks for no tools, but it is still an autonomous
+  // spawn of the CLI, so it carries the same deny list as every other dispatcher. One
+  // invariant with no exceptions is what deploy-deny-tools.test.mjs can actually enforce.
+  const res = spawnSync(CLAUDE_BIN, ['-p', prompt, '--disallowedTools', DEPLOY_DENY_TOOLS.join(',')], {
     encoding: 'utf-8', timeout: 5 * 60 * 1000,
   })
   if (res.status !== 0 || !res.stdout) {

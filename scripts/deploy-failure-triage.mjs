@@ -38,6 +38,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, rmS
 import { join } from 'path'
 import { getFleet } from '../lib/fleet.mjs'
 import { pingUrl } from './lib/hc-ping.mjs'
+import { agentToolFlags, DEPLOY_DENY_POLICY_NOTE } from './lib/deploy-deny-tools.mjs'
 
 // Fleet: name/repo/deploy-branch from the DB-backed registry (fleet_products) via getFleet(). Filter
 // to deploy-monitored products (branch != null). Falls back to the identical hardcoded superset on any
@@ -245,13 +246,13 @@ function runAgent(c, workdir, dryRun) {
   ]
   const allowedTools = (dryRun ? READ_ONLY : [...READ_ONLY, ...WRITE]).join(',')
   const DRY_NOTE = '\n\n⚠️ DRY RUN: Do NOT branch, commit, push, edit, or open PRs — investigate read-only and write ONLY triage-verdict.json. In "action", describe what you WOULD do, prefixed "[DRY-RUN would] ".'
-  const policy = dryRun ? SYSTEM_POLICY + DRY_NOTE : SYSTEM_POLICY
+  const policy = (dryRun ? SYSTEM_POLICY + DRY_NOTE : SYSTEM_POLICY) + DEPLOY_DENY_POLICY_NOTE
 
   const CLAUDE_BIN = process.platform === 'win32' ? 'claude.exe' : 'claude'
   const args = [
     '-p', buildUserPrompt(c, workdir),
     '--append-system-prompt', policy,
-    '--allowedTools', allowedTools,
+    ...agentToolFlags(allowedTools),
     '--max-turns', String(MAX_TURNS),
     '--model', MODEL,
     '--output-format', 'json',

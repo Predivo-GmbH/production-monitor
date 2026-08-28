@@ -26,6 +26,7 @@
 
 import { readFileSync, writeFileSync, existsSync, rmSync } from 'fs'
 import { execFileSync } from 'child_process'
+import { agentToolFlags, DEPLOY_DENY_POLICY_NOTE } from './lib/deploy-deny-tools.mjs'
 
 const RESULTS_PATH = 'test-results/results.json'
 const AUTOFIX_PATH = 'auto-fix-results.json'
@@ -182,7 +183,7 @@ function main() {
   const allowedTools = (dryRun ? READ_ONLY : [...READ_ONLY, ...WRITE]).join(',')
 
   const DRY_NOTE = '\n\n⚠️ DRY RUN: Do NOT commit, push, edit files, or open PRs — investigate read-only and write ONLY triage-verdict.json. In each verdict\'s "action" field, describe what you WOULD have done, prefixed "[DRY-RUN would] ".'
-  const policy = dryRun ? SYSTEM_POLICY + DRY_NOTE : SYSTEM_POLICY
+  const policy = (dryRun ? SYSTEM_POLICY + DRY_NOTE : SYSTEM_POLICY) + DEPLOY_DENY_POLICY_NOTE
 
   try {
     // Headless Claude Code via execFileSync (args ARRAY, no shell) — passing the multi-line
@@ -192,7 +193,7 @@ function main() {
     const args = [
       '-p', userPrompt,
       '--append-system-prompt', policy,
-      '--allowedTools', allowedTools,
+      ...agentToolFlags(allowedTools),
       '--max-turns', String(MAX_TURNS),
       '--model', MODEL,
       '--output-format', 'json',

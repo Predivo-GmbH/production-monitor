@@ -26,6 +26,7 @@ import { execFileSync, execSync } from 'child_process'
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from 'fs'
 import { join } from 'path'
 import { pingUrl } from './lib/hc-ping.mjs'
+import { agentToolFlags, DEPLOY_DENY_POLICY_NOTE } from './lib/deploy-deny-tools.mjs'
 
 const REPO = process.env.LOCAL_TRIAGE_REPO || 'Arivioo/production-monitor'
 const BRANCH = 'master'
@@ -152,9 +153,9 @@ function triageOneGuard(state, wf, run) {
     'Bash(curl:*)', 'Bash(cat:*)', 'Bash(ls:*)', 'Bash(git log:*)', 'Bash(git show:*)', 'Bash(git diff:*)',
     ...(DRY ? [] : ['Edit', 'Bash(git:*)', 'Bash(node:*)']),
   ].join(',')
-  const policy = DRY
+  const policy = (DRY
     ? GUARD_POLICY + '\n\n⚠️ DRY RUN: investigate read-only; write ONLY guard-triage-verdict.json; describe what you WOULD do as "[DRY-RUN would] ...".'
-    : GUARD_POLICY
+    : GUARD_POLICY) + DEPLOY_DENY_POLICY_NOTE
   const env = { ...process.env, GIT_AUTHOR_NAME: 'Agent Triage', GIT_AUTHOR_EMAIL: 'noreply@predivo.ch', GIT_COMMITTER_NAME: 'Agent Triage', GIT_COMMITTER_EMAIL: 'noreply@predivo.ch' }
   delete env.ANTHROPIC_API_KEY // force the LOCAL subscription CLI, never a metered key
   try {
@@ -162,7 +163,7 @@ function triageOneGuard(state, wf, run) {
     execFileSync(process.platform === 'win32' ? 'claude.exe' : 'claude', [
       '-p', prompt,
       '--append-system-prompt', policy,
-      '--allowedTools', allowedTools,
+      ...agentToolFlags(allowedTools),
       '--max-turns', '40',
       '--model', 'claude-opus-4-8',
       '--output-format', 'json',
