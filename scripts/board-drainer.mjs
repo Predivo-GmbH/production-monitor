@@ -997,6 +997,160 @@ export function handoffPrompt(inc, cls) {
 // item the signal can safely fold into.
 const CLOSED_WORK_STATUSES = new Set(['done', 'abandoned'])
 
+// ── the JOIN step: a signal about a job already in progress lands ON that job ──────────────
+/**
+ * Roger, closing the external-tools work 2026-08-27: "But why wasn't this added to the in
+ * progress task in the first place?" One piece of work had fragmented into three board rows —
+ * the in-progress item a session held, plus two monitor rows the drainer opened about the very
+ * same object ("the currency fix is live on staging", "v_external_tools is readable by the anon
+ * key") — each addressed to Roger, each looking blocked on him, while a session worked it three
+ * feet away. Both signals were CORRECT; the FILING was wrong.
+ *
+ * So before minting a sibling row, the drainer looks for a LIVE in-progress item plainly about
+ * the same object and attaches the signal to THAT as evidence instead. The matcher is
+ * deliberately CONSERVATIVE: an over-eager join glues a real signal onto the wrong job and it
+ * vanishes, which is worse than one extra row. When the match is ambiguous, it opens the row.
+ */
+
+// Segments too common to identify a job: repo roots, product names, and the handful of
+// directory names every repo shares. A path overlap that consists ONLY of these is not a match —
+// "both touch Cockpit/src" says nothing.
+const GENERIC_SEGMENTS = new Set([
+  'internal projects', 'business', 'c:', 'cockpit', 'backoffice', 'replyflow', 'channelmover',
+  'signalscore', 'scoutcopilot', 'predivo', 'valrano', 'boatbuddy', 'distribution-os',
+  'production-monitor', 'pull-engine', 'launchready', 'arivioo', 'scoutcopilot',
+  'src', 'scripts', 'docs', 'lib', 'test', 'tests', 'sql', 'app', 'pages', 'components',
+  'hooks', 'types', 'functions', 'supabase', 'workflows', 'e2e', 'data', 'public', 'dist',
+])
+
+// Words too generic to identify a job by a title match alone.
+const JOIN_STOPWORDS = new Set([
+  'the', 'a', 'an', 'and', 'or', 'of', 'to', 'in', 'on', 'for', 'is', 'are', 'be', 'by', 'with',
+  'from', 'it', 'its', 'this', 'that', 'has', 'have', 'was', 'were', 'not', 'now', 'fix', 'fixes',
+  'fixed', 'page', 'error', 'errors', 'failed', 'failing', 'check', 'checks', 'data', 'code',
+  'live', 'staging', 'production', 'prod', 'update', 'updated', 'add', 'added', 'new', 'old', 'run',
+  'runs', 'job', 'jobs', 'task', 'tasks', 'work', 'board', 'signal', 'signals', 'monitor', 'test',
+  'tests', 'build', 'deploy', 'value', 'values', 'number', 'row', 'rows', 'anyone', 'public', 'key',
+])
+
+function joinSegs(p) {
+  return String(p || '').toLowerCase().split(/[\\/]+/).map((s) => s.trim()).filter(Boolean)
+}
+
+/** The segments of a path that could actually identify it: a filename (has a dot), a snake_case
+ *  identifier (has an underscore), or a specifically-named directory. Repo roots and shared dir
+ *  names are dropped, so a match on one of these means something. */
+function distinctiveSegs(p) {
+  return joinSegs(p).filter((s) => !GENERIC_SEGMENTS.has(s) && (s.includes('.') || s.includes('_') || s.length >= 5))
+}
+
+/** Object tokens named in a signal's text that can be matched against an item's claim_paths:
+ *  file paths, bare filenames, and snake_case identifiers (tables/views/columns). */
+export function signalObjects(inc) {
+  const text = `${inc?.who_must_act || ''} ${inc?.root_cause || ''} ${inc?.title || ''} ${inc?.key || ''}`
+  const out = new Set()
+  for (const m of text.matchAll(/\b[\w.@-]+(?:[\\/][\w.@{}*,-]+)+(?::\d+(?:-\d+)?)?/g)) out.add(m[0])   // a/b/c.tsx, docs/**
+  for (const m of text.matchAll(/\b[\w-]+\.(?:ts|tsx|js|mjs|cjs|json|ya?ml|sql|md|py|sh|html|css|toml)\b/gi)) out.add(m[0])  // deploy.yml
+  for (const m of text.matchAll(/\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/g)) out.add(m[0])                    // v_external_tools
+  return [...out]
+}
+
+/** A signal object vs one claim_path: 1 = names the same FILE (or identical identifier segment),
+ *  2 = shares a distinctive directory/identifier segment, 0 = no distinctive overlap. */
+function pathMatchTier(o, c) {
+  const od = distinctiveSegs(o), cd = new Set(distinctiveSegs(c))
+  const shared = od.filter((s) => cd.has(s))
+  if (!shared.length) return 0
+  return shared.some((s) => s.includes('.') || s.includes('_')) ? 1 : 2
+}
+
+function normTitle(t) {
+  return ` ${String(t || '').toLowerCase().replace(/[_-]+/g, ' ').replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim()} `
+}
+
+/** Distinctive two-word phrases from a signal, for a title match — plus any snake_case object
+ *  rendered to words ("v_external_tools" -> "external tools"). Both words of a phrase must be
+ *  content words, so a single common noun can never carry a match. */
+export function signalPhrases(inc) {
+  const base = `${prose(inc?.title || '')} ${prose(inc?.root_cause || '')} ${prose(inc?.who_must_act || '')}`
+  const words = base.toLowerCase().replace(/[_-]+/g, ' ').replace(/[^a-z0-9 ]+/g, ' ').split(/\s+/).filter(Boolean)
+  const phrases = new Set()
+  for (let i = 0; i < words.length - 1; i++) {
+    const a = words[i], b = words[i + 1]
+    if (a.length < 3 || b.length < 3 || JOIN_STOPWORDS.has(a) || JOIN_STOPWORDS.has(b)) continue
+    phrases.add(`${a} ${b}`)
+  }
+  for (const o of signalObjects(inc)) {
+    if (!o.includes('_')) continue
+    const p = o.replace(/^[a-z]_/, '').replace(/_/g, ' ').replace(/\s+/g, ' ').trim()
+    if (p.split(' ').filter((w) => w.length >= 3 && !JOIN_STOPWORDS.has(w)).length >= 2) phrases.add(p)
+  }
+  return [...phrases]
+}
+
+/** The strongest way one signal matches one item, or null. Tier 1 (names a file/identifier it
+ *  claims) > Tier 2 (shares a distinctive directory) > Tier 3 (a distinctive phrase in its title). */
+export function matchItem(inc, item) {
+  const claims = Array.isArray(item?.claim_paths) ? item.claim_paths : []
+  let secondBest = null
+  for (const o of signalObjects(inc)) {
+    for (const c of claims) {
+      const tier = pathMatchTier(o, c)
+      if (tier === 1) return { tier: 1, evidence: `${o} ↔ ${c}` }
+      if (tier === 2 && !secondBest) secondBest = { tier: 2, evidence: `${o} ↔ ${c}` }
+    }
+  }
+  if (secondBest) return secondBest
+  const title = normTitle(item?.title)
+  for (const p of signalPhrases(inc)) {
+    if (title.includes(` ${p} `)) return { tier: 3, evidence: `“${p}” in title` }
+  }
+  return null
+}
+
+/**
+ * The single live in-progress item this signal should join, or null to open a row.
+ *
+ * `liveItems` is the set of items a session is actively working (the work_board view's
+ * lane='in_progress', i.e. owner + activity inside 45 minutes). Only such items are ever a join
+ * target — attaching to a blocked or queued row would just be a differently-shaped sibling.
+ *
+ * The ambiguity guard is load-bearing: if two live jobs match equally well, gluing to either one
+ * could bury the signal on the wrong job, so it returns {ambiguous:true} and the caller opens the
+ * row exactly as today.
+ */
+export function findJoinTarget(inc, liveItems) {
+  const matches = []
+  for (const item of (liveItems || [])) {
+    if (!item || !item.owner_session || CLOSED_WORK_STATUSES.has(item.status)) continue
+    const m = matchItem(inc, item)
+    if (m) matches.push({ item, tier: m.tier, evidence: m.evidence })
+  }
+  if (!matches.length) return null
+  const bestTier = Math.min(...matches.map((m) => m.tier))
+  const top = matches.filter((m) => m.tier === bestTier)
+  if (top.length !== 1) return { ambiguous: true, tier: bestTier, count: top.length }
+  return top[0]
+}
+
+/** The evidence note a joined signal leaves on the in-progress item — the "the machines found
+ *  something about this" marker the owning session sees without being paged. Deliberately NOT a
+ *  page and NOT a blocked_owner: it is a heads-up on work already owned. */
+export function joinMarker(inc, cls, join) {
+  return [
+    'The fleet monitor found something about the work you are on right now, and attached it here',
+    'instead of opening a separate row addressed to Roger.',
+    '',
+    'WHAT IT FOUND (verbatim — verify it against the live system, it can be days old):',
+    inc?.root_cause || inc?.title || '(no detail recorded)',
+    inc?.who_must_act ? `\nPRESCRIBED ACTION (a lead): ${inc.who_must_act}` : '',
+    '',
+    `Why it landed on this item: ${join?.evidence || 'same subject'}.`,
+    `Provenance: fleet signal ${inc?.source}/${inc?.key}, severity ${inc?.severity || 'unknown'}, first seen ${inc?.opened_at || 'unknown'}.`,
+    'Your call whether it is in scope. If the underlying check goes red again, the signal returns on its own.',
+  ].filter(Boolean).join('\n')
+}
+
 /**
  * Move one gated incident onto the work board. Every side effect arrives as an injected function,
  * so the decisions here are testable without a database and without a network.
@@ -1034,6 +1188,27 @@ export async function routeToWorkBoard(inc, cls, deps) {
     // handled above, because superseding onto a finished item is a silent mute.
     deps.log?.(`    already on the work board as "${existing.slug}" (${existing.status}) — not minting a second item`)
   } else {
+    // No row exists for THIS signal yet. Before minting a sibling on Roger's lane, look for a
+    // LIVE in-progress item a session is already working that is plainly about the same object,
+    // and attach the signal to THAT instead — this is the whole reason this step exists.
+    const liveItems = deps.listLiveItems ? await deps.listLiveItems() : []
+    const join = findJoinTarget(inc, liveItems)
+    if (join && join.item && !join.ambiguous) {
+      deps.log?.(`    joining live in-progress item "${join.item.slug}" (tier ${join.tier}: ${join.evidence}) — attaching as evidence, minting NO row and NOT touching its owner`)
+      if (join.item.id) {
+        await deps.addEvidence(join.item.id, {
+          kind: 'note',
+          title: 'The machines spotted something about this while you were on it',
+          detail: joinMarker(inc, cls, join),
+          verified: false,
+        })
+      }
+      const superseded = await deps.supersedeSignal(inc, join.item.slug)
+      return { created: false, joined: true, slug: join.item.slug, title: join.item.title, tier: join.tier, superseded, objections: [], reason: `joined a live in-progress item (${join.evidence})` }
+    }
+    if (join && join.ambiguous) {
+      deps.log?.(`    ${join.count} live in-progress items match at tier ${join.tier} — too ambiguous to join safely, opening a row instead`)
+    }
     const item = await deps.createItem({
       slug,
       title,
@@ -1097,6 +1272,23 @@ export function workBoardDeps(secret, base = BO_BASE) {
       if (!res.ok) throw new Error(`work_items read HTTP ${res.status}: ${(await res.text()).slice(0, 160)}`)
       const rows = await res.json()
       return rows[0] || null
+    },
+    /**
+     * The items a session is ACTIVELY working — read from the work_board VIEW, whose lane logic
+     * (sql/066) already encodes "in progress right now" as owner_session set AND activity inside
+     * 45 minutes. Reading the view rather than re-deriving that window keeps one definition of
+     * "live" for the whole fleet. A read failure returns [] and is swallowed: a join we could not
+     * check simply falls through to minting a row, which is the safe direction — never the reverse.
+     */
+    async listLiveItems() {
+      try {
+        const res = await fetch(`${base}/rest/v1/work_board?lane=eq.in_progress&select=id,slug,title,status,owner_session,claim_paths`, { headers: H })
+        if (!res.ok) { log(`    could not read live in-progress items (HTTP ${res.status}) — will mint a row rather than risk a wrong join`); return [] }
+        return await res.json()
+      } catch (e) {
+        log(`    could not read live in-progress items (${String(e).slice(0, 120)}) — will mint a row rather than risk a wrong join`)
+        return []
+      }
     },
     async createItem(row) {
       const res = await fetchWithTransportRetry(`${base}/rest/v1/work_items`, {
@@ -1176,7 +1368,8 @@ HARD RULES (never violate):
 
 PROD EDGE-FUNCTION DEPLOYS (the ONLY permitted path — guarded, Roger-approved 2026-08-20): if the fix requires deploying a Supabase edge function to PROD, you MUST use the guard, never the supabase CLI directly:
   node scripts/prod-deploy-guard.mjs --project <ref> --function <name> --repo <abs repo path> --probe-url <url> [--probe-expect <substring>] [--probe-header "Name: value"] [--note "<what+why>"]
-The guard enforces: hard-coded allowlist (ReplyFlow monitor-sync-health; BackOffice monitoring-board + health-monitor — anything else is REFUSED), 2 real deploys/day cap, clean+in-sync repo, green CI, then a mandatory post-deploy probe with auto-rollback. Export SUPABASE_ACCESS_TOKEN (from that repo's docs/Credentials.txt) before calling it; run --dry-run first if unsure. Closing rule: an incident needing a prod deploy may only be closed status=fixed when the guard exits 0 AND its probe evidence is your receipt. Exit 2 = rolled back -> escalate, do NOT close. Exit 1 = refused/error -> do NOT deploy; if the function is not allowlisted, escalate to Roger instead.
+The guard enforces: hard-coded allowlist (ReplyFlow monitor-sync-health; BackOffice monitoring-board + health-monitor — anything else is REFUSED), 2 real deploys/day cap, clean+in-sync repo (local HEAD == origin, so it can only ship the committed, pushed, CI-green commit — never a stale checkout), green CI, then a mandatory post-deploy probe with auto-rollback. Export SUPABASE_ACCESS_TOKEN (from that repo's docs/Credentials.txt) before calling it; run --dry-run first if unsure. Closing rule: an incident needing a prod deploy may only be closed status=fixed when the guard exits 0 AND its probe evidence is your receipt. Exit 2 = rolled back -> escalate, do NOT close. Exit 1 = refused/error -> do NOT deploy; if the function is not allowlisted, escalate to Roger instead.
+A DIRECT "supabase functions deploy" (in ANY form — bare, npx, npm exec, pnpm, yarn, bunx) is now BLOCKED by the harness itself: it will be denied, so do not attempt it. The guard is the only path that can reach production, and it refuses every product function (auth, payments, email, lifecycle-tick, connect-platform, process-queue, …). A product function that genuinely needs a prod deploy is therefore NOT yours to ship: fix it, deploy to STAGING, and ESCALATE the production promotion to Roger. Shipping a product function directly from your checkout is exactly the failure that gave one customer the same email twice on 2026-08-25.
 
 FINAL ACTION (required): use the Write tool to write ${VERDICT_PATH.replace(/\\/g, '/')} as JSON:
 {"class":"A-INFRA|B-PRODUCT-STAGED|C-CLOSED|D-ESCALATE","status":"fixed|self-healed|blocked|investigating","action":"what you did (commit sha / PR url / deploy run / none)","receipt":"the concrete verification that proves it (repro output / live check / green run id) — REQUIRED to set status=fixed/self-healed","who_must_act":"Roger - <one-line> (only if status=blocked, else null)","diagnosis":"1-3 sentences"}`
@@ -1206,6 +1399,47 @@ const WRITE = [
   'Edit', 'Bash(git:*)', 'Bash(gh pr:*)', 'Bash(gh workflow run:*)', 'Bash(node:*)', 'Bash(npm:*)', 'Bash(npx:*)',
 ]
 
+/**
+ * prod-deploy-guard is "the ONLY permitted path" for a prod edge-function deploy
+ * (SYSTEM_POLICY), but until 2026-08-28 that was PROSE, not a mechanism: WRITE grants
+ * Bash(node:*), Bash(npm:*) and Bash(npx:*), every one of which can run
+ * `supabase functions deploy` DIRECTLY and ship whatever is in the on-disk checkout —
+ * stale or not — with none of the guard's allowlist / in-sync / green-CI / probe checks.
+ * That is the class of failure behind the 2026-08-25 ChannelMover incident
+ * (ChannelMover/docs/INCIDENTS.md): an autonomous deploy from a stale tree silently undid
+ * a committed fix, and one customer got the same email twice. A fix agent deploying an
+ * unrelated fix must never be able to redeploy a product function as a side effect.
+ *
+ * Deny rules take precedence over the allow list in Claude Code, so these turn the guard
+ * into the only path in MECHANISM, not just in prose. This is a hard stop for the
+ * straightforward direct-deploy the policy used to merely discourage; it is NOT a jail for
+ * an adversarial agent (a hand-rolled `node -e` shelling out could still evade it), which
+ * is why the guard's own allowlist — which REFUSES any product function such as
+ * lifecycle-tick outright — remains the load-bearing control.
+ */
+export const DEPLOY_DENY_TOOLS = [
+  'Bash(supabase functions deploy:*)',
+  'Bash(npx supabase functions deploy:*)',
+  'Bash(npx -y supabase functions deploy:*)',
+  'Bash(npx --yes supabase functions deploy:*)',
+  'Bash(npm exec supabase functions deploy:*)',
+  'Bash(npm exec -- supabase functions deploy:*)',
+  'Bash(pnpm supabase functions deploy:*)',
+  'Bash(pnpm dlx supabase functions deploy:*)',
+  'Bash(pnpm exec supabase functions deploy:*)',
+  'Bash(yarn supabase functions deploy:*)',
+  'Bash(yarn dlx supabase functions deploy:*)',
+  'Bash(bunx supabase functions deploy:*)',
+]
+
+/** The tool flags every dispatched agent gets: the allow list, plus the deny list that
+ *  makes prod-deploy-guard the only path to a prod edge-function deploy. Exported so a
+ *  test can prove the wiring (that --disallowedTools is actually passed), not just the
+ *  content of the deny list. */
+export function agentToolFlags(allowedTools) {
+  return ['--allowedTools', allowedTools, '--disallowedTools', DEPLOY_DENY_TOOLS.join(',')]
+}
+
 function dispatchAgent(inc, mode) {
   try { if (existsSync(VERDICT_PATH)) rmSync(VERDICT_PATH) } catch { /* noop */ }
   let timedOut = false
@@ -1221,7 +1455,7 @@ function dispatchAgent(inc, mode) {
   const args = [
     '-p', buildUserPrompt(inc),
     '--append-system-prompt', policy,
-    '--allowedTools', allowedTools,
+    ...agentToolFlags(allowedTools),
     '--max-turns', String(MAX_TURNS),
     '--model', MODEL,
     '--output-format', 'json',
@@ -1650,7 +1884,11 @@ async function main() {
         if (isScoutDerived(inc)) { log(`  ${inc.key}: scout-derived — recorded on the report, never handed to the work board`); continue }
         log(`  ${inc.key}: needs a person (${cls.reason}) — routing to the work board.`)
         const r = await routeToWorkBoard(inc, cls, wbDeps)
-        log(`    ${r.created ? 'created' : 'already existed'}: ${r.slug} — signal ${r.superseded ? 'superseded (off the alarm surface)' : 'LEFT OPEN (supersede failed)'}`)
+        if (r.joined) {
+          log(`    joined live in-progress item ${r.slug} (tier ${r.tier}) — no new row, no owner touched; signal ${r.superseded ? 'superseded onto it' : 'LEFT OPEN (supersede failed)'}`)
+        } else {
+          log(`    ${r.created ? 'created' : 'already existed'}: ${r.slug} — signal ${r.superseded ? 'superseded (off the alarm surface)' : 'LEFT OPEN (supersede failed)'}`)
+        }
         if (r.superseded) { delete state.attempts[inc.key]; delete state.stuck[inc.key]; saveState(state) }
         continue
       }
