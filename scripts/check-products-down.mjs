@@ -231,24 +231,47 @@ async function fileSignal(secret, body) {
   return res.json()
 }
 
+/**
+ * AN EMPTY FLEET IS A FAILED READ, not a healthy one. `health-monitor` answers 200 with
+ * `summary.down = 0` in this case and the Cockpit tile refuses to draw a zero from it; this
+ * refuses to draw a green RUN from it, for the same reason. A monitor reporting "0 products down"
+ * because it reached nothing is the worst outcome this script has available to it.
+ *
+ * Exported and separate from `main` so it can be tested. It could not be, and the rule the whole
+ * script is built around was the one thing in it nothing asserted.
+ */
+export function assertFleetReadable(fleet) {
+  if (!Array.isArray(fleet) || fleet.length === 0) {
+    throw new Error('fleet_projects returned no health-monitored products — nothing was checked, so nothing can be reported as fine')
+  }
+  return fleet
+}
+
+/**
+ * What the run says it covered. Since 2026-08-28 every active product carries `in_health = true`
+ * (Roger: "Every product needs to be watched all the time"), so `uncovered` is 0 and the line
+ * says so plainly. It is kept, not deleted: it is the sentence that made the gap visible in the
+ * first place, and if a product is ever added to the registry without being switched on, this is
+ * what says so on every hourly run instead of quietly checking eleven and calling it the fleet.
+ */
+export function coverageLine(checked, active) {
+  const uncovered = active - checked
+  return `products: checking ${checked} of ${active} active products` +
+    (uncovered > 0
+      ? ` — ${uncovered} carry in_health=false and are watched by NOTHING`
+      : ' — every active product is watched')
+}
+
 async function main() {
   const dry = process.argv.includes('--dry')
   const secret = readBoSecret()
 
-  const fleet = await boGet(
+  const fleet = assertFleetReadable(await boGet(
     secret,
     'fleet_projects?in_health=eq.true&active=eq.true&select=name,supabase_ref,prod_url,brand_keyword&order=sort_order',
-  )
-  // AN EMPTY FLEET IS A FAILED READ, not a healthy one. `health-monitor` answers 200 with
-  // summary.down = 0 in this case and the Cockpit tile refuses to draw a zero from it; this
-  // refuses to draw a green run from it, for the same reason.
-  if (!Array.isArray(fleet) || fleet.length === 0) {
-    throw new Error('fleet_projects returned no health-monitored products — nothing was checked, so nothing can be reported as fine')
-  }
+  ))
   const active = await boGet(secret, 'fleet_projects?active=eq.true&select=name')
-  const uncovered = active.length - fleet.length
-  console.log(`products: checking ${fleet.length} of ${active.length} active products` +
-    (uncovered > 0 ? ` — ${uncovered} carry in_health=false and are watched by NOTHING` : ''))
+  console.log(coverageLine(fleet.length, active.length))
 
   const open = await boGet(secret, `fleet_signals?source=eq.${SOURCE}&state=eq.open&key=like.${KEY_PREFIX}:*&select=key,severity`)
   const openKeys = new Map(open.map((r) => [r.key, r]))

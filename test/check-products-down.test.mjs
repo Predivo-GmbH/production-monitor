@@ -11,6 +11,7 @@
 import assert from 'node:assert'
 import {
   reasonsUnreachable, brandMatches, signalFor, confirmUnreachable, CONFIRM_ATTEMPTS,
+  probeAuth, assertFleetReadable, coverageLine,
 } from '../scripts/check-products-down.mjs'
 
 let n = 0
@@ -140,6 +141,83 @@ t('the title says what a customer meets, and names the product', () => {
   assert.match(s.title, /down for customers/)
   assert.match(s.summary, /replyflow\.help/)
   assert.deepEqual(s.detail.reasons, REASONS)
+})
+
+// -- EVERY PRODUCT IS WATCHED ALL THE TIME (2026-08-28, Roger's ruling) ----------------------
+//
+// `fleet_projects` had 12 active products and 7 carried `in_health = true`. All 12 do now, and the
+// five that were added -- arivioo, BoatBuddy, Distribution-OS, Jass-Tour, Predivo -- have NO
+// `supabase_ref`. They are websites. This producer rings Roger's phone, so the cost of reading
+// "there is no backend here" as "the backend is down" is a 03:00 phone call about five products
+// that are working perfectly.
+
+await at('probeAuth does not call anything for a product with no Supabase project', async () => {
+  // THE DEFECT, at its source rather than at the predicate: without the `if (!ref)` guard this
+  // fetches `https://.supabase.co/auth/v1/health` -- a real request, to a real hostname, that
+  // fails -- and returns ok:false. Five of the twelve would be filed as unreachable on the first
+  // run and CRITICAL on the second. Proven by injecting exactly that: with the guard removed this
+  // assertion goes red, and so do the two below it.
+  for (const missing of [null, undefined, '']) {
+    const r = await probeAuth(missing)
+    assert.equal(r.ok, true, `probeAuth(${JSON.stringify(missing)}) must not report a failure`)
+    assert.match(r.detail, /nothing to check/)
+  }
+})
+
+await at('a whole fleet of backend-less websites produces zero outages', async () => {
+  // The end-to-end shape of the ruling: twelve watched, zero down. Not five down.
+  const fleet = [
+    { name: 'arivioo', supabase_ref: null, prod_url: 'https://arivioo.com' },
+    { name: 'Predivo', supabase_ref: null, prod_url: 'https://predivo.ch' },
+    { name: 'BoatBuddy', supabase_ref: null, prod_url: 'https://boatbuddy.predivo.ch' },
+    { name: 'Distribution-OS', supabase_ref: null, prod_url: 'https://distributionos.predivo.ch' },
+    { name: 'Jass-Tour', supabase_ref: null, prod_url: 'https://beize-jass-tour.mueller.ro' },
+  ]
+  for (const p of fleet) {
+    const auth = await probeAuth(p.supabase_ref)
+    // Site and brand are the real checks for these, and both pass here by construction. The point
+    // of the assertion is that the ABSENT backend contributes nothing, either way.
+    assert.deepEqual(reasonsUnreachable({ site: { ok: true }, auth, brand: true }), [], p.name)
+  }
+})
+
+t('a backend-less website is still down when its SITE is dead', () => {
+  // Making the five safe must not make them unwatchable. This is what they were switched on for.
+  const noBackend = { ok: true, detail: 'no Supabase project - nothing to check' }
+  const r = reasonsUnreachable({ site: { ok: false, detail: 'HTTP 503' }, auth: noBackend, brand: true })
+  assert.equal(r.length, 1)
+  assert.match(r[0], /the site itself does not load/)
+})
+
+t('a backend-less website is still down when its domain serves somebody else', () => {
+  // The lapsed-domain case, which is the real risk for a site with nothing behind it: a parking
+  // page, an expired domain and a misdirected deploy all answer HTTP 200.
+  const noBackend = { ok: true, detail: 'no Supabase project - nothing to check' }
+  const r = reasonsUnreachable({ site: { ok: true }, auth: noBackend, brand: false })
+  assert.match(r[0], /not this product/)
+})
+
+// -- unknown is never zero -------------------------------------------------------------------
+
+t('an EMPTY fleet read fails the run - it is never "no products are down"', () => {
+  // The rule this whole script is built around, and until now the one thing in it that nothing
+  // asserted, because it lived un-exported inside main(). Defect: `if (fleet.length)` or no check
+  // at all, at which point a registry read that returned nothing reports a green run over a fleet
+  // it never looked at. `health-monitor` answers 200 with down:0 in exactly this case, so this is
+  // not a hypothetical failure mode.
+  assert.throws(() => assertFleetReadable([]), /nothing was checked/)
+  assert.throws(() => assertFleetReadable(null), /nothing was checked/)
+  assert.throws(() => assertFleetReadable(undefined), /nothing was checked/)
+  assert.throws(() => assertFleetReadable({ error: 'permission denied' }), /nothing was checked/)
+  assert.deepEqual(assertFleetReadable([{ name: 'x' }]), [{ name: 'x' }])
+})
+
+t('the run says how much of the fleet it covered, both ways', () => {
+  // It reads "every active product is watched" now, and it has to be able to say the opposite the
+  // day somebody adds a product to the registry without switching it on.
+  assert.match(coverageLine(12, 12), /checking 12 of 12/)
+  assert.match(coverageLine(12, 12), /every active product is watched/)
+  assert.match(coverageLine(7, 12), /5 carry in_health=false and are watched by NOTHING/)
 })
 
 console.log(`\n${n} assertions passed.`)
