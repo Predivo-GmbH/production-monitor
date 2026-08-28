@@ -5,10 +5,37 @@
  * Run: node test/board-drainer.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
-import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, parkedFields, gateFor, stripCode, actionOf, plainTitle, titleObjections, workItemSlugFor, handoffPrompt, routeToWorkBoard, prose } from '../scripts/board-drainer.mjs'
+import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, parkedFields, gateFor, stripCode, actionOf, plainTitle, titleObjections, workItemSlugFor, handoffPrompt, routeToWorkBoard, prose, DEPLOY_DENY_TOOLS, agentToolFlags, signalObjects, signalPhrases, matchItem, findJoinTarget, joinMarker } from '../scripts/board-drainer.mjs'
 
 let n = 0
 const t = (name, fn) => { fn(); n++; console.log(`  ok - ${name}`) }
+
+// ── the direct-deploy bypass is closed (2026-08-25 ChannelMover incident) ────────
+// A dispatched fix agent must not be able to reach production by running
+// `supabase functions deploy` directly from a stale checkout — the guard is the only path.
+t('DEPLOY_DENY_TOOLS covers every direct edge-function deploy form', () => {
+  for (const form of [
+    'supabase functions deploy',
+    'npx supabase functions deploy',
+    'npm exec supabase functions deploy',
+    'pnpm dlx supabase functions deploy',
+    'yarn supabase functions deploy',
+    'bunx supabase functions deploy',
+  ]) {
+    assert.ok(DEPLOY_DENY_TOOLS.includes(`Bash(${form}:*)`), `deny list must cover: ${form}`)
+  }
+})
+t('agentToolFlags actually WIRES the deny list into the dispatch (--disallowedTools)', () => {
+  const flags = agentToolFlags('Read,Edit,Bash(node:*)')
+  const i = flags.indexOf('--disallowedTools')
+  assert.ok(i >= 0, 'every dispatched agent must carry --disallowedTools')
+  const deny = flags[i + 1]
+  assert.ok(deny.includes('Bash(npx supabase functions deploy:*)'), 'npx deploy must be denied')
+  assert.ok(deny.includes('Bash(supabase functions deploy:*)'), 'bare deploy must be denied')
+  // the allow list still passes through untouched
+  const a = flags.indexOf('--allowedTools')
+  assert.ok(a >= 0 && flags[a + 1] === 'Read,Edit,Bash(node:*)', 'allow list must be preserved')
+})
 
 // ── classify (every incident is dispatched; mode = fix | verify) ────────────────
 t('owner=Roger -> VERIFY-only (read-only: close-if-green or escalate)', () => {
@@ -882,15 +909,18 @@ t('the prompt names a working directory when the repo is knowable, and stays sil
 const fakeBoard = () => {
   const items = new Map()
   const evidence = []
+  const superseded = []
+  const live = []   // set live.push(anInProgressItem) to make a join target available
   let creates = 0
   return {
-    items, evidence, creates: () => creates, superseded: [],
+    items, evidence, creates: () => creates, superseded, live,
     deps: {
       log() {},
       async findItem(slug) { return items.get(slug) || null },
       async createItem(row) { creates++; const it = { id: `id-${creates}`, ...row }; items.set(row.slug, it); return it },
       async addEvidence(itemId, ev) { evidence.push({ itemId, ...ev }) },
-      async supersedeSignal() { return true },
+      async listLiveItems() { return live },
+      async supersedeSignal(inc, slug) { superseded.push({ inc, slug }); return true },
     },
   }
 }
@@ -1058,6 +1088,145 @@ t('QUEUE: BOARD_DRAINER_HANDOFF=0 puts the old behaviour back, unchanged', () =>
   const off = selectWorkQueue({ routed, state: { attempts: {}, stuck: {} }, now: Date.now(), handoff: false })
   assert.equal(off.toEscalate.filter((e) => e.why === 'handoff').length, 0)
   assert.equal(off.toWork.length, 1, 'with the switch off it is dispatched read-only, exactly as before')
+})
+
+// ── the JOIN step: a signal about a job already in progress lands ON that job ──────────────
+// Roger, closing the external-tools work: "But why wasn't this added to the in progress task in
+// the first place?" One job had fragmented into the in-progress item plus two monitor rows about
+// the same object, each landing on him as blocked. These prove the drainer now attaches instead.
+
+// A faithful stand-in for the live external-tools item a session held while the two signals fired.
+const liveExternalTools = () => ({
+  id: 'live-1',
+  slug: 'list-every-external-tool-we-use-and-why',
+  title: 'The External Tools page and its self-updating register',
+  status: 'in_progress',
+  owner_session: 'work-now-xyz',
+  claim_paths: [
+    'Internal Projects/Cockpit/src/pages/ExternalTools.tsx',
+    'Internal Projects/Cockpit/src/hooks/useExternalTools.ts',
+    'Internal Projects/Cockpit/sql',
+  ],
+})
+
+// The two REAL signals that fragmented the job (verbatim subjects from the closeout).
+const securitySignal = () => ({
+  source: 'silent-failure', key: 'BackOffice:v-external-tools-anon-readable',
+  title: 'v external tools is readable by anyone with the public anon key',
+  severity: 'critical', status: 'open', opened_at: '2026-08-27T09:00:00Z',
+  who_must_act: 'Claude - put security_invoker on the view so it obeys the caller\'s row-level security.',
+  root_cause: 'v_external_tools is readable by anyone with the public anon key — a view runs with its owner\'s rights and bypasses RLS on the table underneath.',
+})
+const currencySignal = () => ({
+  source: 'commit-review', key: 'Cockpit:external-tools-currency',
+  title: 'The external-tools cost currency fix is live and verified on staging',
+  severity: 'warning', status: 'open', opened_at: '2026-08-27T11:00:00Z',
+  who_must_act: 'Roger - confirm the external tools money column reads correctly on production.',
+  root_cause: 'The external tools cost currency now derives from the bill, not a blanket USD.',
+})
+
+t('signalObjects pulls files, paths and snake_case identifiers out of a signal', () => {
+  const objs = signalObjects({ who_must_act: 'fix src/hooks/useExternalTools.ts', root_cause: 'v_external_tools bypasses RLS on api_entries', title: 'deploy.yml is red' })
+  assert.ok(objs.includes('src/hooks/useExternalTools.ts'))
+  assert.ok(objs.includes('v_external_tools'))
+  assert.ok(objs.includes('api_entries'))
+  assert.ok(objs.includes('deploy.yml'))
+})
+
+t('matchItem TIER 1: a signal that names a file the item CLAIMS', () => {
+  const m = matchItem({ who_must_act: 'Claude - fix the total in src/hooks/useExternalTools.ts' }, liveExternalTools())
+  assert.equal(m?.tier, 1)
+})
+t('matchItem TIER 2: a shared distinctive DIRECTORY, no shared file', () => {
+  const item = { title: 'x', claim_paths: ['ReplyFlow/supabase/functions/reply-scheduler'] }
+  const m = matchItem({ who_must_act: 'Claude - the reply-scheduler/index.ts loop never exits' }, item)
+  assert.equal(m?.tier, 2)
+})
+t('matchItem TIER 3: a distinctive PHRASE in the title (the real security signal)', () => {
+  const m = matchItem(securitySignal(), liveExternalTools())
+  assert.equal(m?.tier, 3, 'v_external_tools renders to "external tools", which is in the item title')
+})
+t('matchItem: a GENERIC-only overlap (both touch Cockpit/src) is NOT a match', () => {
+  const item = { title: 'Some unrelated dashboard work', claim_paths: ['Internal Projects/Cockpit/src/index.css'] }
+  const m = matchItem({ who_must_act: 'Claude - fix Internal Projects/Cockpit/src/pages/Other.tsx' }, item)
+  assert.equal(m, null, 'sharing only repo/src/pages says nothing — a wrong glue hides the signal')
+})
+
+t('findJoinTarget: AMBIGUOUS when two live jobs match equally — open the row, do not guess', () => {
+  const a = { ...liveExternalTools(), id: 'a', slug: 'a' }
+  const b = { ...liveExternalTools(), id: 'b', slug: 'b' }
+  const j = findJoinTarget(securitySignal(), [a, b])
+  assert.equal(j?.ambiguous, true)
+  assert.equal(j.count, 2)
+})
+t('findJoinTarget: an item nobody is on (no owner_session) is never a target', () => {
+  const unowned = { ...liveExternalTools(), owner_session: null }
+  assert.equal(findJoinTarget(securitySignal(), [unowned]), null)
+})
+
+ta('JOIN (real signal at a real in-progress item): the security signal ATTACHES, mints no row, touches no owner', async () => {
+  const board = fakeBoard()
+  board.live.push(liveExternalTools())
+  const inc = securitySignal()
+  const r = await routeToWorkBoard(inc, classify(inc), board.deps)
+  assert.equal(r.joined, true, 'it joins the live item')
+  assert.equal(r.slug, 'list-every-external-tool-we-use-and-why', 'onto the session\'s item, by its slug')
+  assert.equal(board.creates(), 0, 'NO sibling row is minted')
+  assert.equal(board.items.size, 0)
+  const marker = board.evidence.find((e) => e.itemId === 'live-1')
+  assert.ok(marker, 'the marker is attached to the LIVE item so the owning session sees it')
+  assert.match(marker.title, /machines spotted something/i)
+  assert.ok(marker.detail.includes('v_external_tools'), 'and it carries the verbatim finding')
+  assert.deepEqual(board.superseded, [{ inc, slug: 'list-every-external-tool-we-use-and-why' }], 'the signal is superseded onto the item, off the alarm surface')
+})
+
+ta('JOIN via TITLE (tier 3): the currency signal folds into the same live item', async () => {
+  const board = fakeBoard()
+  board.live.push(liveExternalTools())
+  const inc = currencySignal()
+  const r = await routeToWorkBoard(inc, classify(inc), board.deps)
+  assert.equal(r.joined, true)
+  assert.equal(board.creates(), 0)
+})
+
+ta('a signal that matches NOTHING still opens its own row, exactly as before', async () => {
+  const board = fakeBoard()
+  board.live.push(liveExternalTools())
+  const inc = rogerInc()   // recurring_costs — unrelated to the external-tools item
+  const r = await routeToWorkBoard(inc, classify(inc), board.deps)
+  assert.equal(r.joined, undefined, 'not joined')
+  assert.equal(board.creates(), 1, 'a fresh row is minted')
+  const item = [...board.items.values()][0]
+  assert.equal(item.blocked_owner, 'roger', 'and it lands in Roger\'s lane, unchanged')
+})
+
+ta('an AMBIGUOUS match opens the row rather than gluing to the wrong job', async () => {
+  const board = fakeBoard()
+  board.live.push({ ...liveExternalTools(), id: 'a', slug: 'a' })
+  board.live.push({ ...liveExternalTools(), id: 'b', slug: 'b' })
+  const inc = securitySignal()
+  const r = await routeToWorkBoard(inc, classify(inc), board.deps)
+  assert.equal(r.joined, undefined)
+  assert.equal(board.creates(), 1, 'when two jobs match equally, mint a row — never guess which one')
+})
+
+ta('a JOINED signal never sets blocked_owner: the working session owns it, not Roger', async () => {
+  const board = fakeBoard()
+  board.live.push(liveExternalTools())
+  const inc = securitySignal()
+  await routeToWorkBoard(inc, classify(inc), board.deps)
+  // nothing was minted, so no row carries blocked_owner; and the marker is a note, not a page.
+  assert.equal(board.creates(), 0)
+  const marker = board.evidence.find((e) => e.itemId === 'live-1')
+  assert.equal(marker.kind, 'note')
+})
+
+t('joinMarker states the finding and is explicitly NOT a page for Roger', () => {
+  const inc = securitySignal()
+  const m = joinMarker(inc, classify(inc), { evidence: '“external tools” in title', tier: 3 })
+  assert.ok(m.includes('v_external_tools'), 'the finding is verbatim')
+  assert.ok(/instead of opening a separate row/i.test(m), 'it says why it landed here, not as a new row')
+  assert.ok(/your call whether it is in scope/i.test(m), 'the owning session decides scope; it is not blocked on Roger')
 })
 
 await Promise.all(pending)

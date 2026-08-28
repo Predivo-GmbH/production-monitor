@@ -53,6 +53,28 @@ An escalated incident is written back with `status=blocked` + `who_must_act="Rog
 appears on the board as `Action: Roger` and the hourly Needs-Roger Closer keeps it unread in his inbox
 until fixed — unchanged from today. The drainer only ever REMOVES the Claude-owned items from that pile.
 
+### Routing to the work board, and JOINING a job already in progress
+A signal that needs a *person* (a decision, a bank statement, Roger's OAuth hands) is not an alarm, it
+is a task, so `routeToWorkBoard()` moves it to the cockpit work board (`work_items`) and supersedes the
+signal off `/signals` (B3 part 3). **Before it mints a row, it looks for a LIVE in-progress item a
+session is already working that is plainly about the same object, and attaches the signal to THAT as an
+evidence note instead** — added 2026-08-28 after Roger asked, closing the external-tools work, "why
+wasn't this added to the in-progress task in the first place?" One job had fragmented into the
+in-progress item plus two monitor rows about the same object, each landing on him as blocked.
+
+- **How the match is decided (`findJoinTarget` / `matchItem`, decreasing confidence):** (1) the signal
+  names a file/identifier that appears in a live item's `claim_paths`; (2) it shares a distinctive
+  directory with them; (3) a distinctive phrase from it appears in the live item's title. Repo roots and
+  common dir names never count on their own.
+- **Conservative on purpose.** An over-eager join hides a real signal on the wrong job, which is worse
+  than an extra row — so if two live jobs match equally well, or the live-items read fails, it opens the
+  row exactly as before.
+- **A joined signal never sets `blocked_owner: roger`.** The session on the job owns it; the marker is a
+  heads-up ("The machines spotted something about this while you were on it"), not a page. If the
+  underlying check goes red again the signal returns on its own.
+- "live in-progress" = the `work_board` view's `lane='in_progress'` (owner set + activity inside 45 min,
+  Cockpit `sql/066`) — one definition of "live" for the whole fleet.
+
 ## First-live supervision (Stage 6, before trusting it unattended)
 1. Register the task (`setup-board-drainer-task.ps1`), leave `BOARD_DRAINER_LIVE` UNSET for one cycle →
    confirm dry-run classifications in `drainer.log` look right against a real non-empty board.
