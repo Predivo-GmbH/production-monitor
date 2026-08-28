@@ -1,0 +1,59 @@
+name: Tests
+
+# WHY THIS EXISTS (2026-08-28). This repo held eight unit-test files, 233 assertions between them,
+# and NOTHING RAN ANY OF THEM. There was no `npm test`, no test job, no runner: every one of them
+# only ever executed when a person happened to type `node test/…` on their own machine.
+#
+# That was tolerable while these scripts only wrote to a board. It stopped being tolerable the
+# moment `check-products-down.mjs` was merged to master, because merging it ARMS A PAGER — and
+# almost every assertion in its suite exists to stop that pager ringing when it should not:
+#
+#   * "one bad probe is not an outage"          — the 2026-08-24 boot storm the probe caused itself
+#   * "the FIRST sighting cannot ring"          — a phone call for one bad hour
+#   * "an EMPTY fleet read fails the run"       — a green run over a fleet nothing looked at
+#   * "probeAuth does not call anything for a product with no Supabase project"
+#                                               — five websites reported as five outages
+#
+# A restraint nothing checks is a restraint one careless edit removes in silence. This repo has a
+# name for that already: R-CI-02, a gate born disabled is not a gate.
+#
+# CHEAP ON PURPOSE. Every suite is pure: no secrets, no network, no services, no install step —
+# they were all run offline before this workflow was written, and all eight passed. One
+# `actions/checkout` plus one `setup-node` per push, on the free GitHub-hosted runner rather than
+# our own, since a test job that needs the CI laptop awake is a test job that does not run.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      # Globbed, not listed. A hardcoded list is how a new suite ends up in the repo and never in
+      # the gate — the same shape of miss as the feed inventory that lost the "products down" tile.
+      # `set -e` plus the explicit exit code means one red suite fails the job.
+      - name: Run every unit suite
+        run: |
+          set -e
+          failed=0
+          for f in test/*.test.mjs; do
+            echo "::group::$f"
+            if node "$f"; then echo "PASS $f"; else echo "::error file=$f::$f FAILED"; failed=1; fi
+            echo "::endgroup::"
+          done
+          exit $failed
