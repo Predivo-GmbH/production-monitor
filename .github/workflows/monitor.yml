@@ -274,6 +274,32 @@ jobs:
           HEALTHCHECKS_API_KEYS: ${{ secrets.HEALTHCHECKS_API_KEYS }}
           BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
 
+      # Sentry must reach the BOARD, not an inbox. The step above gave scheduled jobs a direct
+      # wire into /signals in August; Sentry never had one. Its only route to Roger ran through
+      # Gmail and an hourly assistant reading it, which loses a signal three ways: a project with
+      # no alert rule never mails, the inbox tidy-up can file the mail first (a decision once sat
+      # unseen for seven days that way), and a different assistant naming it every hour makes the
+      # entries inconsistent by construction. Production carried 25 `source=sentry` rows under SIX
+      # different key conventions on 2026-08-27, so dedup could not work and did not.
+      #
+      # THE BAR IS ENVIRONMENT, and only environment: an unresolved issue is filed when it has
+      # been seen somewhere live. Volume, recency, affected users and project were each measured
+      # against the same 13 live issues first and each dropped genuine production errors; the
+      # reasoning is in the script's header with the numbers. Staging errors are deliberately not
+      # filed - staging exists to break, and an alarm from it teaches you to ignore alarms.
+      #
+      # It cannot ring anything. Every row is filed needs_human:false (an application error is
+      # code, so a machine owns it) and `sentry` has no signal_page_policy row, so upsert_signal
+      # records `policy-off` and no page is ever scheduled. A chronic error is a board item.
+      #
+      # A failed read fails the STEP rather than reporting an empty fleet: if Sentry cannot be
+      # reached, "no errors" is a lie and the tile on /signals must say unknown.
+      - name: An application error must land on the board, not in an inbox
+        run: node scripts/check-sentry-issues.mjs
+        env:
+          SENTRY_API_TOKEN: ${{ secrets.SENTRY_API_TOKEN }}
+          BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
+
       # Two guards, doing two different jobs, both required:
       #   1. This step is scoped to `ci_watchdog_alive.outcome == 'failure'` so it fires ONLY for a
       #      silent watchdog, never on some unrelated earlier monitor failure.
