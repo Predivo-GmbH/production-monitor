@@ -1,8 +1,38 @@
 name: Production Monitor
 
+# CADENCE, MEASURED 2026-08-29 — read this before "fixing" the cron minute again.
+#
+# The 2026-08-28 audit reported this check running roughly three-hourly and proposed moving it
+# off "the congested slot it shares". Both halves were tested against run history and BOTH ARE
+# FALSE. Keeping the finding here because the next session will otherwise re-derive the wrong
+# fix from the same symptom.
+#
+#   1. NOTHING SHARES :37. No workflow in any fleet repo schedules minute 37. The slot was
+#      already moved off :00 in an earlier pass; that part of the job was already done.
+#
+#   2. THE MINUTE IS NOT THE CAUSE. Three hourly workflows at three different minutes, in two
+#      different repos, one public and one private, degraded IDENTICALLY over the same window
+#      (2026-08-27 ~01:00 to 2026-08-28 ~21:30 UTC) and recovered together:
+#
+#        production-monitor        cron 37 * * * *   13 gaps, mean 210 min, max 268 min
+#        mailer-config-check       cron 47 * * * *   13 gaps, mean 209 min, max 262 min
+#        BackOffice sync-remediate cron 30 * * * *   13 gaps, mean 210 min, max 271 min
+#
+#      Same three, healthy before and after: mean 61 min / 58 min. A cause that hits three
+#      different minutes equally is not about the minute. GitHub drops scheduled ticks under
+#      platform backlog and no cron value avoids that.
+#
+#   3. OUR OWN 08:00 BURST IS ALSO NOT THE CAUSE. Nine fleet workflows share `0 8 * * *`, so
+#      the 08:37 tick was the suspect. Measured delay past the nominal tick, healthy windows
+#      only: 08:37 mean 13.2 min — one of the BEST hours. The worst are 18:00-21:00 UTC
+#      (mean 24-34 min, max 54 min), which is GitHub's global evening peak, not ours.
+#
+# WHAT WAS DONE INSTEAD: the dead-man's switch was shortened from six hours to three (see the
+# Heartbeat step at the bottom of this file), so the next slip is SEEN. Detection was the real
+# gap — across the whole 44-hour degradation the old 6-hour tolerance never once tripped.
 on:
   schedule:
-    - cron: '37 * * * *'  # Hourly at :37 — off-peak; top-of-hour (:00) is GitHub's most-contended slot and gets dropped/delayed, tripping the healthchecks.io heartbeat
+    - cron: '37 * * * *'  # Hourly at :37. Do not move it without new measurements — see the block above.
   workflow_dispatch:         # Manual trigger
     inputs:
       force_resolved_email:
@@ -14,7 +44,18 @@ on:
 
 concurrency:
   group: production-monitor
-  cancel-in-progress: true
+  # A push to master must never cancel the hourly product check. It did, three times in the
+  # four days to 2026-08-29 — runs 32823814431, 32844151137 and 33004593691 were each killed
+  # 1-2 minutes after starting by a push run that entered the same group. Each cancelled run
+  # is an hour with no fleet check AND no heartbeat ping, because the Heartbeat step below is
+  # `if: success()` and a cancelled job is not a success.
+  #
+  # Consequence-free here only because the push run happened to do the same work each time.
+  # That is luck, not design: a push that lands while the scheduled run is mid-flight and then
+  # fails leaves the hour uncovered and the heartbeat silent, which is the exact shape this
+  # file exists to make impossible. Superseding a push run with a newer push run is still
+  # right and is kept.
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 jobs:
   monitor:
@@ -387,9 +428,27 @@ jobs:
 
       # Dead-man's-switch: ping healthchecks.io on every successful run. If this monitor
       # ever stops firing (GitHub disables the cron on repo inactivity, runner never starts),
-      # the ping stops arriving and healthchecks.io emails hello@predivo.ch after the grace
-      # period. This is what would have caught the 66-day-red ScoutCopilot CI: a monitor with
-      # no heartbeat fails silent.
+      # the ping stops arriving and healthchecks.io emails after the grace period. This is what
+      # would have caught the 66-day-red ScoutCopilot CI: a monitor with no heartbeat fails
+      # silent.
+      #
+      # TOLERANCE: period 3600s + grace 7200s = THREE HOURS of silence, set 2026-08-29.
+      # It was six hours (grace 18000) and that is why it never once complained while the
+      # check ran three-hourly for 44 hours. Chosen from the real ping-to-ping history of
+      # check 3cdddf35 rather than from this cron line:
+      #
+      #   worst healthy gap                    79 min   (2026-08-29 01:05)
+      #   worst healthy gap + ONE missed run  ~139 min  -> must NOT fire; fleet policy is that
+      #                                                   a single failed run never alarms
+      #   TWO missed runs                     ~199 min  -> must fire
+      #   the 27-28 Aug degradation      159..268 min   -> old 360-min tolerance: never fired
+      #                                                   new 180-min tolerance: fires
+      #
+      # 180 min sits between "one missed run" and "two missed runs" with 41 min of headroom
+      # over the worst tolerable case. Note the ping is `if: success()`, so three consecutive
+      # RED runs also trip it — that is wanted: a monitor red for three hours is its own
+      # incident, and the 2026-08-26 run of twelve consecutive failures over eleven hours
+      # produced no heartbeat complaint at all under the old setting.
       - name: Heartbeat (healthchecks.io dead-man's-switch)
         if: success()
         run: curl -fsS -m 10 --retry 3 "${{ secrets.HC_PING_MONITOR_HOURLY }}" || true
