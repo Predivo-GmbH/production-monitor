@@ -208,6 +208,43 @@ jobs:
           # Test user
           TEST_EMAIL: healthcheck-test@predivo.ch
 
+      # Supabase machine health + build currency. Added 2026-08-29 after Supabase, not us,
+      # was the first to notice that ScoutCopilot's machine was burning 7.74 MB/s of disk
+      # while idle. Cause was the platform build it sat on (17.6.1.084): 74.1 KB read per
+      # page fault before the free upgrade to 17.6.1.166, 32.3 KB after, total disk traffic
+      # down to 0.67/7.74 = 8.7%. Neither the load nor the stale build was measured by
+      # anything we owned. Both are now. Runs even if the suite above failed, because a
+      # machine burning disk is exactly the state that also breaks other checks.
+      - name: Supabase machine health (disk load per project)
+        if: always()
+        run: node scripts/check-supabase-machine-health.mjs
+        env:
+          SCOUTCOPILOT_SUPABASE_URL: ${{ secrets.SCOUTCOPILOT_SUPABASE_URL }}
+          SCOUTCOPILOT_SERVICE_ROLE_KEY: ${{ secrets.SCOUTCOPILOT_SERVICE_ROLE_KEY }}
+          REPLYFLOW_SUPABASE_URL: ${{ secrets.REPLYFLOW_SUPABASE_URL }}
+          REPLYFLOW_SERVICE_ROLE_KEY: ${{ secrets.REPLYFLOW_SERVICE_ROLE_KEY }}
+          SIGNALSCORE_SUPABASE_URL: ${{ secrets.SIGNALSCORE_SUPABASE_URL }}
+          SIGNALSCORE_SERVICE_ROLE_KEY: ${{ secrets.SIGNALSCORE_SERVICE_ROLE_KEY }}
+          BACKOFFICE_SUPABASE_URL: ${{ secrets.BACKOFFICE_SUPABASE_URL }}
+          BACKOFFICE_SERVICE_ROLE_KEY: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
+          DISTRIBUTIONOS_SUPABASE_URL: ${{ secrets.DISTRIBUTIONOS_SUPABASE_URL }}
+          DISTRIBUTIONOS_SERVICE_ROLE_KEY: ${{ secrets.DISTRIBUTIONOS_SERVICE_ROLE_KEY }}
+          LAUNCHREADY_SUPABASE_URL: ${{ secrets.LAUNCHREADY_SUPABASE_URL }}
+          LAUNCHREADY_SERVICE_ROLE_KEY: ${{ secrets.LAUNCHREADY_SERVICE_ROLE_KEY }}
+          VALRANO_SUPABASE_URL: ${{ secrets.VALRANO_SUPABASE_URL }}
+          VALRANO_SERVICE_ROLE_KEY: ${{ secrets.VALRANO_SERVICE_ROLE_KEY }}
+          BOATBUDDY_SUPABASE_URL: ${{ secrets.BOATBUDDY_SUPABASE_URL }}
+          BOATBUDDY_SERVICE_ROLE_KEY: ${{ secrets.BOATBUDDY_SERVICE_ROLE_KEY }}
+
+      - name: Supabase build currency (how far behind each project is)
+        if: always()
+        run: node scripts/check-supabase-build-currency.mjs
+        env:
+          SUPABASE_TOKEN_SCOUTCOPILOT: ${{ secrets.SUPABASE_TOKEN_SCOUTCOPILOT }}
+          SUPABASE_TOKEN_MUELLER: ${{ secrets.SUPABASE_TOKEN_MUELLER }}
+          SIGNALSCORE_SUPABASE_ACCESS_TOKEN: ${{ secrets.SIGNALSCORE_SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
       # Out-of-band canaries: dead/rotated secrets and vendor retirements never
       # enter git, so only a live-credential probe can catch them (the class
       # behind ChannelMover's 5-day outage — investigation report §8). A canary

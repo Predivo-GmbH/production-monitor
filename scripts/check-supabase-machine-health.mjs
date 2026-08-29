@@ -1,0 +1,94 @@
+/**
+ * Supabase machine health — the check that should have existed before 2026-08-29.
+ *
+ * WHY: Supabase emailed Roger at 05:07 that ScoutCopilot was running out of Disk IO
+ * budget. Nothing of ours had noticed, for months. The cause turned out to be the
+ * platform build the project was running on: on supabase-postgres-17.6.1.084 the machine
+ * read ~74 KB from disk per page fault, ~96 times a second, around the clock. Measured
+ * before and after the free upgrade to 17.6.1.166:
+ *     before  96 faults/s · 7.11 MB/s read · 7.74 MB/s total · 74.1 KB per fault
+ *     after   20 faults/s · 0.66 MB/s read · 0.67 MB/s total · 32.3 KB per fault
+ * i.e. 0.67/7.74 = 8.7% of the previous disk traffic.
+ *
+ * Two failures made that possible and this check closes both:
+ *   1. nothing measured our machines' disk load, so only the vendor could tell us;
+ *   2. nothing noticed a project sitting on a stale platform build.
+ *
+ * Discovery is generic: any <PREFIX>_SUPABASE_URL with a matching key is checked, so a
+ * new product is covered without anyone editing this file.
+ */
+
+const WARN_MB_S = 2.0   // sustained OS-disk traffic; the quiet fleet sits at 0.06-0.5
+const FAIL_MB_S = 4.0   // ScoutCopilot was 7.74 when Supabase complained
+const SAMPLE_GAP_MS = 30_000
+
+const metricValue = (text, name) => {
+  const m = text.match(new RegExp('^' + name + '\{[^}]*\}\s+([0-9.e+-]+)', 'm'))
+  return m ? Number(m[1]) : null
+}
+
+async function sample(ref, key) {
+  const res = await fetch(`https://${ref}.supabase.co/customer/v1/privileged/metrics`, {
+    headers: { Authorization: 'Basic ' + Buffer.from('service_role:' + key).toString('base64') },
+  })
+  if (!res.ok) return null
+  const t = await res.text()
+  return {
+    at: Date.now(),
+    majfault: metricValue(t, 'node_vmstat_pgmajfault'),
+    read: metricValue(t, 'node_disk_read_bytes_total'),
+    written: metricValue(t, 'node_disk_written_bytes_total'),
+    ramMB: Math.round((metricValue(t, 'node_memory_MemTotal_bytes') || 0) / 1e6),
+  }
+}
+
+function refFromUrl(url) {
+  const m = String(url).match(/https:\/\/([a-z0-9]{20})\.supabase\.co/)
+  return m ? m[1] : null
+}
+
+export async function checkMachines(env = process.env) {
+  const prefixes = Object.keys(env).filter((k) => k.endsWith('_SUPABASE_URL')).map((k) => k.slice(0, -'_SUPABASE_URL'.length))
+  const targets = prefixes
+    .map((p) => ({
+      product: p,
+      ref: refFromUrl(env[`${p}_SUPABASE_URL`]),
+      key: env[`${p}_SECRET_KEY`] || env[`${p}_SERVICE_ROLE_KEY`],
+    }))
+    .filter((t) => t.ref && t.key)
+
+  const first = await Promise.all(targets.map((t) => sample(t.ref, t.key).catch(() => null)))
+  await new Promise((r) => setTimeout(r, SAMPLE_GAP_MS))
+  const second = await Promise.all(targets.map((t) => sample(t.ref, t.key).catch(() => null)))
+
+  const findings = []
+  targets.forEach((t, i) => {
+    const a = first[i], b = second[i]
+    // A machine we cannot read is reported, not silently skipped: a check that goes quiet
+    // when it loses access reads as "all clear", which is the failure mode this file exists for.
+    if (!a || !b || a.read == null || b.read == null) {
+      findings.push({ product: t.product, level: 'unreadable', detail: 'metrics endpoint returned no usable sample' })
+      return
+    }
+    const dt = (b.at - a.at) / 1000
+    const mbs = ((b.read - a.read) + (b.written - a.written)) / dt / 1e6
+    const faults = (b.majfault - a.majfault) / dt
+    const kbPerFault = faults > 0 ? ((b.read - a.read) / dt) / faults / 1024 : 0
+    const level = mbs >= FAIL_MB_S ? 'fail' : mbs >= WARN_MB_S ? 'warn' : 'ok'
+    findings.push({
+      product: t.product, level, ramMB: a.ramMB,
+      mbs: +mbs.toFixed(2), faultsPerSec: Math.round(faults), kbPerFault: +kbPerFault.toFixed(1),
+      detail: `${mbs.toFixed(2)} MB/s sustained disk, ${Math.round(faults)} faults/s at ${kbPerFault.toFixed(1)} KB each`,
+    })
+  })
+  return findings
+}
+
+if (process.argv[1] && process.argv[1].endsWith('check-supabase-machine-health.mjs')) {
+  const findings = await checkMachines()
+  for (const f of findings) console.log(`${f.level.toUpperCase().padEnd(10)} ${f.product.padEnd(18)} ${f.detail}`)
+  const bad = findings.filter((f) => f.level === 'fail')
+  const warn = findings.filter((f) => f.level === 'warn')
+  console.log(`\n${findings.length} machines checked · ${bad.length} over ${FAIL_MB_S} MB/s · ${warn.length} over ${WARN_MB_S} MB/s`)
+  if (bad.length) { console.error('::error::a Supabase machine is burning disk IO — this is what the 2026-08-29 vendor email was'); process.exit(1) }
+}
