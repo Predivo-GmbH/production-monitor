@@ -25,10 +25,12 @@
  *   - Target-repo writes are PRs on an `agent/deploy-fix-*` branch only. The deploy branch is never
  *     touched, so an in-flight human/session push is never overwritten.
  *
- * ── PAID-KEY GATE (mirrors agent-triage.mjs) ────────────────────────────────────────────────
- * Runs when DEPLOY_TRIAGE_ENABLED=1 AND (DEPLOY_TRIAGE_LOCAL=1 subscription CLI OR ANTHROPIC_API_KEY).
- * The local runner sets ENABLED+LOCAL so it costs no API credits. Kill-switch: DEPLOY_TRIAGE_DISABLED=1.
- * Dry run: DEPLOY_TRIAGE_DRY_RUN=1 (investigate read-only, write only the verdict, open no PR).
+ * ── SUBSCRIPTION GATE (mirrors agent-triage.mjs) ─────────────────────────────────────────────
+ * Runs when DEPLOY_TRIAGE_ENABLED=1 AND DEPLOY_TRIAGE_LOCAL=1 (a subscription-logged-in `claude`).
+ * There is NO paid/API-key path: the child env strips ANTHROPIC_API_KEY below, so a key-only run
+ * cannot authenticate — the gate requires LOCAL and refuses otherwise. The scheduled local task
+ * (setup-deploy-triage-task.ps1) sets ENABLED+LOCAL so it costs no API credits. Kill-switch:
+ * DEPLOY_TRIAGE_DISABLED=1. Dry run: DEPLOY_TRIAGE_DRY_RUN=1 (read-only, write only the verdict).
  *
  * Requires on the host: git, gh (authenticated with a fleet PAT: repo + pull-request write), node,
  * and — in LOCAL mode — `claude` logged in to the subscription.
@@ -320,9 +322,9 @@ async function main() {
 
   const enabled = process.env.DEPLOY_TRIAGE_ENABLED === '1'
   const local = process.env.DEPLOY_TRIAGE_LOCAL === '1'
-  const hasKey = !!process.env.ANTHROPIC_API_KEY
-  if (!enabled || (!hasKey && !local)) {
-    log(`⏭️  deploy-failure-triage SKIPPED: DEPLOY_TRIAGE_ENABLED=${process.env.DEPLOY_TRIAGE_ENABLED || 'unset'}, ANTHROPIC_API_KEY ${hasKey ? 'set' : 'unset'}, DEPLOY_TRIAGE_LOCAL=${local ? '1' : 'unset'}. Runs when ENABLED=1 AND (LOCAL=1 subscription CLI OR a paid API key).`)
+  if (!enabled || !local) {
+    const hasKey = !!process.env.ANTHROPIC_API_KEY
+    log(`⏭️  deploy-failure-triage SKIPPED: DEPLOY_TRIAGE_ENABLED=${process.env.DEPLOY_TRIAGE_ENABLED || 'unset'}, DEPLOY_TRIAGE_LOCAL=${local ? '1' : 'unset'}, ANTHROPIC_API_KEY ${hasKey ? 'set (ignored — stripped from the child; not a credential for this tier)' : 'unset'}. Runs ONLY when ENABLED=1 AND LOCAL=1 (subscription CLI); there is no paid/API-key path.`)
     return
   }
 
@@ -332,7 +334,7 @@ async function main() {
   const state = loadState()
   if (!state.handled) state.handled = {}
 
-  log(`deploy-failure-triage: polling ${PROJECTS.length} deploy pipelines${detectOnly ? ' [DETECT-ONLY]' : dryRun ? ' [DRY RUN]' : ''}${local ? ' (LOCAL/subscription)' : ' (API)'}...`)
+  log(`deploy-failure-triage: polling ${PROJECTS.length} deploy pipelines${detectOnly ? ' [DETECT-ONLY]' : dryRun ? ' [DRY RUN]' : ''} (LOCAL/subscription)...`)
   // DETECT-ONLY: run the fleet poll + classification and print what WOULD be diagnosed, without
   // cloning or invoking the agent. Safe ops/validation probe (no writes, no state, no cost).
   const candidates = findCandidates(detectOnly ? { handled: {} } : state)

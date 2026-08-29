@@ -290,23 +290,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.DASHBOARD_PAT }}
 
-      # Agent-triage (Phase 2, Tier B): for failures the fast patterns + auto-heal could NOT
-      # resolve, a headless Claude agent diagnoses each and either self-heals a drifted monitor
-      # spec (commit to THIS repo), opens a PR on the target repo for a real regression, or
-      # escalates with a written root-cause. PAID-KEY GATE: dormant (self-skips, exit 0) until
-      # Roger sets var AGENT_TRIAGE_ENABLED=1 + secret AGENT_TRIAGE_API_KEY — so the CLI install
-      # is itself gated to avoid any cost while off.
-      - name: Agent triage (Tier B — diagnose + remediate novel failures)
-        if: failure()
-        run: |
-          if [ "${AGENT_TRIAGE_ENABLED}" = "1" ] && [ -n "${ANTHROPIC_API_KEY}" ]; then
-            npm install -g @anthropic-ai/claude-code >/dev/null 2>&1 || echo "claude CLI install failed"
-          fi
-          node scripts/agent-triage.mjs || true
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.AGENT_TRIAGE_API_KEY }}
-          AGENT_TRIAGE_ENABLED: ${{ vars.AGENT_TRIAGE_ENABLED }}
-          GH_TOKEN: ${{ secrets.DASHBOARD_PAT }}
+      # Agent-triage (Phase 2, Tier B) is NOT run here anymore. The tier drives a headless Claude
+      # CLI authed via Roger's SUBSCRIPTION and its child env strips ANTHROPIC_API_KEY, so a
+      # GitHub-hosted runner (no subscription login) can never authenticate — running it here only
+      # ever produced a swallowed error under a green run. It now runs SUBSCRIPTION-ONLY on the
+      # always-on desktop via scripts/local-triage-runner.mjs, which polls THIS monitor's
+      # unresolved failures and triages them locally (ENABLED=1 + LOCAL=1, no metered key).
 
       # LAYER 2 of the CI runner alarm: who watches the watchdog.
       #

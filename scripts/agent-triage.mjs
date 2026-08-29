@@ -16,12 +16,17 @@
  * The agent's verdict is written to triage-results.json and folded into the alert email, so
  * Roger gets "diagnosis + what it did," not a red row.
  *
- * ── PAID-KEY GATE ──────────────────────────────────────────────────────────────────────
- * This tier calls the paid Anthropic API. Per Roger's standing rule it stays DORMANT until he
- * explicitly enables it: it self-skips (loudly, exit 0) unless BOTH
+ * ── SUBSCRIPTION GATE ──────────────────────────────────────────────────────────────────
+ * This tier drives the headless Claude CLI authed via Roger's SUBSCRIPTION — never a metered key
+ * (the child env strips ANTHROPIC_API_KEY/AUTH_TOKEN/BASE_URL below, so a stray key can never bill
+ * him per run). There is therefore NO paid/API-key path: a run that has only ANTHROPIC_API_KEY
+ * (e.g. a GitHub-hosted runner with no subscription login) cannot authenticate. Per Roger's
+ * standing rule it stays DORMANT until he explicitly enables it: it self-skips (loudly, exit 0)
+ * unless BOTH
  *   - repo variable  AGENT_TRIAGE_ENABLED = 1   (the on-switch / kill-switch)
- *   - secret         AGENT_TRIAGE_API_KEY set   (a dedicated key, spend-capped by Roger)
- * are present. Building it wired-but-off mirrors the run-canaries.mjs Anthropic-canary gate.
+ *   - env            AGENT_TRIAGE_LOCAL   = 1   (a subscription-logged-in `claude` on the host)
+ * are present. The production invoker is scripts/local-triage-runner.mjs (sets ENABLED+LOCAL on the
+ * always-on desktop). Building it wired-but-off mirrors the run-canaries.mjs Anthropic-canary gate.
  */
 
 import { readFileSync, writeFileSync, existsSync, rmSync } from 'fs'
@@ -148,16 +153,18 @@ function buildUserPrompt(escalations) {
 function main() {
   const enabled = process.env.AGENT_TRIAGE_ENABLED === '1'
   // LOCAL mode = invoke the local Claude Code CLI authed via Roger's SUBSCRIPTION (no API key,
-  // no metered cost). This is the PREFERRED path — the desktop is always on. The paid API is a
-  // fallback used only when the local runner isn't available (see scripts/local-triage-runner.mjs).
+  // no metered cost). This is now the ONLY path: the child env strips ANTHROPIC_API_KEY below, so a
+  // run that has only a key (e.g. a GitHub-hosted runner with no subscription login) cannot
+  // authenticate. The gate therefore REQUIRES LOCAL and refuses a key-only run loudly, rather than
+  // starting one that would die silently. Production invoker: scripts/local-triage-runner.mjs.
   const local = process.env.AGENT_TRIAGE_LOCAL === '1'
-  const hasKey = !!process.env.ANTHROPIC_API_KEY
-  if (!enabled || (!hasKey && !local)) {
-    console.log(`⏭️  agent-triage SKIPPED: AGENT_TRIAGE_ENABLED=${process.env.AGENT_TRIAGE_ENABLED || 'unset'}, ANTHROPIC_API_KEY ${hasKey ? 'set' : 'unset'}, AGENT_TRIAGE_LOCAL=${local ? '1' : 'unset'}.`)
-    console.log('   Runs when ENABLED=1 AND (LOCAL=1 subscription CLI OR a paid API key) is present.')
+  if (!enabled || !local) {
+    const hasKey = !!process.env.ANTHROPIC_API_KEY
+    console.log(`⏭️  agent-triage SKIPPED: AGENT_TRIAGE_ENABLED=${process.env.AGENT_TRIAGE_ENABLED || 'unset'}, AGENT_TRIAGE_LOCAL=${local ? '1' : 'unset'}, ANTHROPIC_API_KEY ${hasKey ? 'set (ignored — stripped from the child; not a credential for this tier)' : 'unset'}.`)
+    console.log('   Runs ONLY when ENABLED=1 AND LOCAL=1 (a subscription-logged-in `claude` on the host). There is no paid/API-key path.')
     process.exit(0)
   }
-  console.log(local ? 'agent-triage: LOCAL mode — subscription CLI, no API cost.' : 'agent-triage: cloud/API mode (paid).')
+  console.log('agent-triage: LOCAL mode — subscription CLI, no API cost.')
 
   const dryRun = process.env.AGENT_TRIAGE_DRY_RUN === '1'
   const escalations = loadEscalations()
