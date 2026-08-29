@@ -52,21 +52,36 @@ function refFromUrl(url) {
   return m ? m[1] : null
 }
 
-export async function checkMachines(env = process.env) {
+// Discover every product from *_SUPABASE_URL and resolve its project ref + key. A product whose
+// key or ref resolves FALSY is KEPT here with a `reason`, never filtered out: a rotated/deleted
+// GitHub secret, a renamed secret that expands to '' (monitor.yml wires <PREFIX>_SERVICE_ROLE_KEY
+// by name), or a malformed/custom-domain URL that refFromUrl() can't parse must still be REPORTED
+// as unreadable. Filtering it out before any finding exists is exactly how one product goes dark
+// while the run prints "N-1 machines checked" and exits 0 green — the "goes quiet on access loss
+// reads as all clear" failure this file exists to prevent. Exported so the discovery→report path
+// is unit-tested without the network or the 30s sample gap.
+export function discover(env = process.env) {
   const prefixes = Object.keys(env).filter((k) => k.endsWith('_SUPABASE_URL')).map((k) => k.slice(0, -'_SUPABASE_URL'.length))
-  const targets = prefixes
-    .map((p) => ({
-      product: p,
-      ref: refFromUrl(env[`${p}_SUPABASE_URL`]),
-      key: env[`${p}_SECRET_KEY`] || env[`${p}_SERVICE_ROLE_KEY`],
-    }))
-    .filter((t) => t.ref && t.key)
+  return prefixes.map((p) => {
+    const ref = refFromUrl(env[`${p}_SUPABASE_URL`])
+    const key = env[`${p}_SECRET_KEY`] || env[`${p}_SERVICE_ROLE_KEY`]
+    const reason = !key ? 'no key configured' : !ref ? 'no usable project ref in the URL' : null
+    return { product: p, ref, key, reason }
+  })
+}
+
+export async function checkMachines(env = process.env) {
+  const findings = []
+  const targets = []
+  for (const t of discover(env)) {
+    if (t.reason) findings.push({ product: t.product, level: 'unreadable', detail: t.reason })
+    else targets.push(t)
+  }
 
   const first = await Promise.all(targets.map((t) => sample(t.ref, t.key).catch(() => null)))
   await new Promise((r) => setTimeout(r, SAMPLE_GAP_MS))
   const second = await Promise.all(targets.map((t) => sample(t.ref, t.key).catch(() => null)))
 
-  const findings = []
   targets.forEach((t, i) => {
     const a = first[i], b = second[i]
     // A machine we cannot read is reported, not silently skipped: a check that goes quiet

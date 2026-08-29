@@ -13,7 +13,7 @@
  * Run: node test/check-supabase-machine-health.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
-import { metricValue, exitDecision } from '../scripts/check-supabase-machine-health.mjs'
+import { metricValue, exitDecision, discover } from '../scripts/check-supabase-machine-health.mjs'
 
 let passed = 0
 let failed = 0
@@ -102,6 +102,55 @@ check('a machine burning disk (fail) -> exit 1 and named', () => {
   const d = exitDecision([{ product: 'ReplyFlow', level: 'ok' }, { product: 'ScoutCopilot', level: 'fail' }])
   assert.equal(d.code, 1)
   assert.match(d.message, /ScoutCopilot/)
+})
+
+// --- discover(): a configured product with a missing key/ref must be REPORTED, not dropped ---
+// The bug this pins (commit 3c90757 residual): checkMachines() filtered targets with
+// `.filter(t => t.ref && t.key)` BEFORE any finding was created, so a product whose key secret
+// was rotated/deleted/renamed-to-'' (or a URL refFromUrl() can't parse) produced NO finding at
+// all — not 'unreadable'. The run printed "N-1 machines checked" and exited 0 green while that
+// product's disk-IO watchdog was dark. discover() now keeps it with a `reason` so checkMachines()
+// reports it and exitDecision()'s unreadable branch makes the run non-zero and names it.
+
+check('a discovered product with an EMPTY key is reported, not dropped (the residual bug)', () => {
+  const d = discover({ SCOUTCOPILOT_SUPABASE_URL: 'https://abcdefghijklmnopqrst.supabase.co', SCOUTCOPILOT_SERVICE_ROLE_KEY: '' })
+  assert.equal(d.length, 1, 'the product must still be discovered, not filtered out')
+  assert.equal(d[0].product, 'SCOUTCOPILOT')
+  assert.equal(d[0].reason, 'no key configured', 'an empty key must carry an unreadable reason')
+})
+
+check('a discovered product with a MISSING (absent) key is reported', () => {
+  const d = discover({ SCOUTCOPILOT_SUPABASE_URL: 'https://abcdefghijklmnopqrst.supabase.co' })
+  assert.equal(d.length, 1)
+  assert.equal(d[0].reason, 'no key configured')
+})
+
+check('a malformed / custom-domain URL (no parseable ref) is reported, not dropped', () => {
+  const d = discover({ SCOUTCOPILOT_SUPABASE_URL: 'https://db.scoutcopilot.com', SCOUTCOPILOT_SERVICE_ROLE_KEY: 'sb_secret_xyz' })
+  assert.equal(d.length, 1)
+  assert.equal(d[0].ref, null)
+  assert.equal(d[0].reason, 'no usable project ref in the URL')
+})
+
+check('a fully-configured product has no reason (it goes on to be sampled)', () => {
+  const d = discover({ SCOUTCOPILOT_SUPABASE_URL: 'https://abcdefghijklmnopqrst.supabase.co', SCOUTCOPILOT_SERVICE_ROLE_KEY: 'sb_secret_xyz' })
+  assert.equal(d[0].reason, null)
+  assert.equal(d[0].ref, 'abcdefghijklmnopqrst')
+})
+
+check('SECRET_KEY is accepted as well as SERVICE_ROLE_KEY', () => {
+  const d = discover({ SCOUTCOPILOT_SUPABASE_URL: 'https://abcdefghijklmnopqrst.supabase.co', SCOUTCOPILOT_SECRET_KEY: 'sb_secret_xyz' })
+  assert.equal(d[0].reason, null)
+})
+
+check('end-to-end: a keyless product maps to an unreadable finding that exitDecision fails on', () => {
+  // mimics what checkMachines() does with discover()'s reasoned rows
+  const findings = discover({ SCOUTCOPILOT_SUPABASE_URL: 'https://abcdefghijklmnopqrst.supabase.co', SCOUTCOPILOT_SERVICE_ROLE_KEY: '' })
+    .filter((t) => t.reason)
+    .map((t) => ({ product: t.product, level: 'unreadable', detail: t.reason }))
+  const dec = exitDecision(findings)
+  assert.equal(dec.code, 1, 'a keyless configured product must make the run non-zero')
+  assert.match(dec.message, /SCOUTCOPILOT/, 'and it must be named in the alert')
 })
 
 console.log(`\n${passed} passed, ${failed} failed.`)
