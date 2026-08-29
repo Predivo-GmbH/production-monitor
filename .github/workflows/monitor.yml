@@ -50,12 +50,22 @@ concurrency:
   # is an hour with no fleet check AND no heartbeat ping, because the Heartbeat step below is
   # `if: success()` and a cancelled job is not a success.
   #
-  # Consequence-free here only because the push run happened to do the same work each time.
+  # Consequence-free so far only because the push run happened to repeat the work each time.
   # That is luck, not design: a push that lands while the scheduled run is mid-flight and then
   # fails leaves the hour uncovered and the heartbeat silent, which is the exact shape this
-  # file exists to make impossible. Superseding a push run with a newer push run is still
-  # right and is kept.
-  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+  # file exists to make impossible. The window is wide — a run takes up to 20 minutes, so
+  # roughly one push in three lands inside it.
+  #
+  # `cancel-in-progress: false` IS THE FIX, and the obvious-looking alternative is not.
+  # `${{ github.event_name != 'schedule' }}` was tried first and is WRONG, proven within two
+  # minutes by run 33250652722: the flag is read from the run that ARRIVES, not the one already
+  # running, so a push still cancelled the scheduled run — it only stopped a schedule cancelling
+  # a push, which nobody wanted. Do not reintroduce it.
+  #
+  # false does not queue pushes up forever either: GitHub keeps at most one pending run per
+  # group and a newer pending run cancels the older pending one, so a push storm still
+  # collapses to its newest commit. It just waits for the hourly check instead of killing it.
+  cancel-in-progress: false
 
 jobs:
   monitor:
