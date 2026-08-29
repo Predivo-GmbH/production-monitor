@@ -22,9 +22,14 @@ const WARN_MB_S = 2.0   // sustained OS-disk traffic; the quiet fleet sits at 0.
 const FAIL_MB_S = 4.0   // ScoutCopilot was 7.74 when Supabase complained
 const SAMPLE_GAP_MS = 30_000
 
-const metricValue = (text, name) => {
-  const m = text.match(new RegExp('^' + name + '\{[^}]*\}\s+([0-9.e+-]+)', 'm'))
-  return m ? Number(m[1]) : null
+// The label block is OPTIONAL: node_vmstat_pgmajfault and node_memory_MemTotal_bytes are
+// exposed WITHOUT labels, while node_disk_*_bytes_total carry a {device="..."} block. The
+// braces and \s MUST be regex-escaped — a single-quoted JS literal '\{' is just '{' and '\s'
+// is a bare 's', which silently compiles to a pattern that matches nothing (the 2026-08-29
+// bug where every machine read as 'unreadable' and the check went green forever).
+export const metricValue = (text, name) => {
+  const m = text.match(new RegExp('^' + name + '(\\{[^}]*\\})?\\s+([0-9.e+-]+)', 'm'))
+  return m ? Number(m[2]) : null
 }
 
 async function sample(ref, key) {
@@ -89,6 +94,17 @@ if (process.argv[1] && process.argv[1].endsWith('check-supabase-machine-health.m
   for (const f of findings) console.log(`${f.level.toUpperCase().padEnd(10)} ${f.product.padEnd(18)} ${f.detail}`)
   const bad = findings.filter((f) => f.level === 'fail')
   const warn = findings.filter((f) => f.level === 'warn')
-  console.log(`\n${findings.length} machines checked · ${bad.length} over ${FAIL_MB_S} MB/s · ${warn.length} over ${WARN_MB_S} MB/s`)
-  if (bad.length) { console.error('::error::a Supabase machine is burning disk IO — this is what the 2026-08-29 vendor email was'); process.exit(1) }
+  const unreadable = findings.filter((f) => f.level === 'unreadable')
+  console.log(`\n${findings.length} machines checked · ${bad.length} over ${FAIL_MB_S} MB/s · ${warn.length} over ${WARN_MB_S} MB/s · ${unreadable.length} unreadable`)
+  // A check that learned NOTHING must not read as all-clear — that is the exact failure mode
+  // the comment at checkMachines() exists to prevent. So both a machine burning disk AND a
+  // fleet that came back entirely unreadable (total access loss, or the metrics format drifted)
+  // are non-zero. process.exitCode (not process.exit) so a pending fetch cannot crash the exit.
+  if (bad.length) {
+    console.error('::error::a Supabase machine is burning disk IO — this is what the 2026-08-29 vendor email was')
+    process.exitCode = 1
+  } else if (findings.length && unreadable.length === findings.length) {
+    console.error('::error::every Supabase machine was unreadable — the check learned nothing (broken key/endpoint), not "all clear"')
+    process.exitCode = 1
+  }
 }
