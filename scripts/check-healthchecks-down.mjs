@@ -23,6 +23,21 @@
  * pinged even once — is reported in the log as a warning but does not page: it is a wiring
  * mistake, not an outage, and it would fire forever until somebody fixed it.
  *
+ * ELEVEN DARK JOBS ARE ONE FAULT, NOT ELEVEN (2026-08-29). `healthchecks` was armed to page on
+ * 2026-08-29 (BackOffice migration 155), after the audit found it had never had a page policy at
+ * all and so could not reach Roger by any route. Arming it as it stood would have been a
+ * different failure: twice in three days the WHOLE local fleet stopped at once, because a code
+ * freshness gate refused to start any Claude wrapper, and every job behind that gate went dark
+ * inside its own grace window. Eleven pages for one blocked fleet is an alarm that gets muted,
+ * and Roger's measure is that more than about two alerts a week means they are miscalibrated.
+ *
+ * So at ROLLUP_THRESHOLD or above this files ONE critical rollup, naming the count and, where it
+ * can, the gate that caused it, and demotes the individual findings to warning/needs_human=false,
+ * which upsert_signal records as 'not-eligible'. Every job is still on the board carrying its
+ * full detail; exactly one of them may ring. Below the threshold nothing changes: one dead job is
+ * one fault and pages on its own. The per-source batch cap in signal_page_policy stays as the
+ * backstop for a producer that forgets to roll up.
+ *
  * Contract:  node scripts/check-healthchecks-down.mjs [--dry]
  *   env: HEALTHCHECKS_API_KEYS  comma-separated READ-ONLY keys, `hcr_...` (CI). Falls back to
  *                               every account in ~/.claude/scripts/hc-config.json when running
@@ -41,6 +56,35 @@ const HC_CONFIG = join(homedir(), '.claude', 'scripts', 'hc-config.json')
 const HC_API = 'https://healthchecks.io/api/v3/checks/'
 const NON_BROWSER_UA = 'healthchecks-down-producer/1.0'
 const SOURCE = 'healthchecks'
+
+/** The one key the rollup owns. Fixed, so it dedups and self-resolves like any other signal. */
+export const ROLLUP_KEY = 'many-jobs-dark'
+
+/**
+ * Three. Two jobs dying in the same hour is plausibly two unrelated faults and he should hear
+ * about both; three is a pattern, and every real occurrence so far has been the whole fleet
+ * stopping at once. Set deliberately low rather than at the observed eleven: the point is to
+ * catch the pattern early, and a rollup of three still names all three in its summary.
+ */
+export const ROLLUP_THRESHOLD = 3
+
+/**
+ * Checks whose death does not mean "this job stopped" but "nothing may start".
+ *
+ * These are the fleet's two gates, and both have taken everything down without a word:
+ *   code-sync-laptop  the laptop that runs the 22 automations checks that its code matches what
+ *                     the work PC shipped. Past its stale budget _claude-preflight.cmd exits 75
+ *                     and every wrapper skips, deliberately WITHOUT pinging its own /fail. One
+ *                     red check by design, which is right, and is exactly why that one red check
+ *                     has to be able to reach him.
+ *   claude-platform   the shared auth and quota preflight. Same contract, same blast radius.
+ *
+ * When one of these is among the dead, the rollup stops counting symptoms and names the cause.
+ */
+export const GATE_CHECKS = {
+  'code-sync-laptop': 'the automation laptop is running code that does not match what was shipped, so every scheduled job is refusing to start',
+  'claude-platform': 'the shared Claude sign-in is not usable, so every scheduled job is refusing to start',
+}
 
 function readBoSecret() {
   if (process.env.BOARD_SUPABASE_SECRET) return process.env.BOARD_SUPABASE_SECRET.trim()
@@ -112,6 +156,50 @@ export function signalFor(check, now = Date.now()) {
   }
 }
 
+/**
+ * The whole flood decision, pure and testable: given what is dark, what gets filed and what may
+ * ring. Returns the exact bodies main() posts, in the order it posts them.
+ *
+ * @returns {{rollup: object|null, members: object[]}}
+ */
+export function planSignals(down, now = Date.now()) {
+  if (down.length < ROLLUP_THRESHOLD) {
+    // One or two dead jobs are one or two faults. Unchanged behaviour: each may page on its own.
+    return { rollup: null, members: down.map((c) => signalFor(c, now)) }
+  }
+
+  const names = down.map((c) => c.slug || c.name)
+  const gate = names.find((n) => GATE_CHECKS[n])
+
+  // Plain words, consequence first. He should not have to know what a healthchecks slug is to
+  // understand that nothing has run since yesterday.
+  const title = gate
+    ? `Nothing is running: ${down.length} scheduled jobs are dark`
+    : `${down.length} scheduled jobs have stopped running`
+  const summary = (gate
+    ? `${GATE_CHECKS[gate]}. That is one fault, not ${down.length}, so this is the only alert for it. `
+    : `They stopped inside the same window, so this is most likely one cause and not ${down.length}. `)
+    + `Dark right now: ${names.join(', ')}.`
+
+  return {
+    rollup: {
+      source: SOURCE,
+      key: ROLLUP_KEY,
+      kind: 'incident',
+      severity: 'critical',
+      state: 'open',
+      needs_human: true,
+      title,
+      summary,
+      detail: { count: down.length, jobs: names, gate: gate ?? null },
+      link: 'https://cockpit.predivo.ch/signals',
+    },
+    // Still filed, still on the board, still carrying every detail, but not eligible to ring.
+    // `warning` plus needs_human:false is the pair upsert_signal records as 'not-eligible'.
+    members: down.map((c) => ({ ...signalFor(c, now), severity: 'warning', needs_human: false })),
+  }
+}
+
 async function fetchChecks({ label, key }) {
   const res = await fetch(HC_API, { headers: { 'X-Api-Key': key, 'User-Agent': NON_BROWSER_UA } })
   if (!res.ok) throw new Error(`healthchecks account "${label}" -> HTTP ${res.status}`)
@@ -148,18 +236,40 @@ async function main() {
   for (const c of down) console.log(`  DOWN  ${c.name} (${c.account}) last ping ${c.last_ping ?? 'never'}`)
   for (const c of neverPinged) console.log(`  ::warning::configured but never pinged: ${c.name} (${c.account}) — wired, not proven`)
 
-  if (dry) { console.log('--dry: nothing written.'); return 0 }
+  if (dry) {
+    const plan = planSignals(down)
+    console.log(plan.rollup
+      ? `--dry: would file ONE rollup ("${plan.rollup.title}") plus ${plan.members.length} board-only entries. Nothing written.`
+      : `--dry: would file ${plan.members.length} individual signal(s), each able to page. Nothing written.`)
+    return 0
+  }
 
   const secret = readBoSecret()
-  const open = await boGet(secret, `fleet_signals?source=eq.${SOURCE}&state=eq.open&select=key`)
+  // 'superseded' is read alongside 'open' on purpose. board-drainer moves a signal that needs a
+  // person onto the work board and stamps it superseded, and a check that recovers while it sits
+  // there must still be resolved. Reading only 'open' left those rows behind, so the next outage
+  // re-opened a row that had never been closed and the history read as one unbroken incident.
+  const open = await boGet(secret, `fleet_signals?source=eq.${SOURCE}&state=in.(open,superseded)&select=key`)
   const openKeys = new Set(open.map((r) => r.key))
   const downKeys = new Set(down.map((c) => c.slug || c.name))
 
-  for (const c of down) await fileSignal(secret, signalFor(c))
+  const { rollup, members } = planSignals(down)
+
+  // The rollup goes FIRST. It is the one that may ring, and if this process dies half way through,
+  // the alert Roger actually needs is the one already sent.
+  if (rollup) {
+    const res = await fileSignal(secret, rollup)
+    console.log(`  ROLLUP: ${down.length} jobs dark, filed as one alert - ${res.will_page ? `page due ${res.page_due_at}` : `not paging (${res.suppressed})`}`)
+  }
+  for (const m of members) await fileSignal(secret, m)
 
   // Recovered: resolve only what is actually open, so the cockpit's "self-resolved" count stays
   // a fact about the fleet rather than an artefact of this script running every hour.
   for (const key of openKeys) {
+    // The rollup is not a check and can never appear in downKeys. Letting this loop see it would
+    // resolve it in the same run that filed it: the alarm cancelling itself a millisecond after it
+    // was raised. It is settled below, against the threshold that created it.
+    if (key === ROLLUP_KEY) continue
     if (downKeys.has(key)) continue
     await fileSignal(secret, {
       source: SOURCE, key, kind: 'incident', severity: 'info', state: 'resolved',
@@ -168,6 +278,21 @@ async function main() {
       link: 'https://cockpit.predivo.ch/signals',
     })
     console.log(`  recovered: ${key} — signal resolved.`)
+  }
+
+  // The fleet came back below the threshold: clear the rollup. Resolving cancels any page still
+  // inside its self-heal window, so a blockage that clears itself in fifteen minutes never rings.
+  // That is the delay doing its job, applied to the rollup exactly as it is to anything else.
+  if (!rollup && openKeys.has(ROLLUP_KEY)) {
+    await fileSignal(secret, {
+      source: SOURCE, key: ROLLUP_KEY, kind: 'incident', severity: 'info', state: 'resolved',
+      title: 'The scheduled jobs are running again',
+      summary: down.length
+        ? `Down to ${down.length} dark job(s), each now reported on its own.`
+        : 'Everything that was dark is checking in again.',
+      link: 'https://cockpit.predivo.ch/signals',
+    })
+    console.log('  rollup cleared: back below the threshold.')
   }
 
   if (down.length) console.error(`::error::${down.length} scheduled job(s) have stopped running. Filed on /signals.`)

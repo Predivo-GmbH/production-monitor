@@ -5,7 +5,9 @@
  */
 import assert from 'node:assert'
 import { fileURLToPath } from 'node:url'
-import { classifyChecks, signalFor, readHcKeys } from '../scripts/check-healthchecks-down.mjs'
+import {
+  classifyChecks, signalFor, readHcKeys, planSignals, ROLLUP_KEY, ROLLUP_THRESHOLD,
+} from '../scripts/check-healthchecks-down.mjs'
 
 let n = 0
 const t = (name, fn) => { fn(); n++; console.log(`  ok - ${name}`) }
@@ -89,6 +91,74 @@ t('the read-only key is taken when an account has one, and the write key only wh
   const byLabel = Object.fromEntries(keys.map((k) => [k.label, k.key]))
   assert.equal(byLabel.primary, 'fixture-primary-readonly')
   assert.equal(byLabel.ci, 'fixture-ci')
+})
+
+// ── one blocked fleet is one alert ─────────────────────────────────────────────
+// THE DEFECT THESE PIN. `healthchecks` was armed to page on 2026-08-29. On both days the fleet
+// actually failed, ELEVEN jobs were dark at once because one gate refused to let anything start.
+// Filing eleven pageable signals for that is an alarm that gets muted, and a muted alarm is
+// strictly worse than the silence it replaced.
+
+const dead = (name) => ({ name, slug: name, status: 'down', last_ping: ago(600) })
+
+t('two dead jobs are two faults — each still pages on its own', () => {
+  const { rollup, members } = planSignals([dead('a'), dead('b')], NOW)
+  assert.equal(rollup, null)
+  assert.equal(members.length, 2)
+  assert.ok(members.every((m) => m.severity === 'critical' && m.needs_human === true))
+})
+
+t(`${ROLLUP_THRESHOLD} or more is ONE alert, and only that one may ring`, () => {
+  const { rollup, members } = planSignals([dead('a'), dead('b'), dead('c')], NOW)
+  assert.equal(rollup.key, ROLLUP_KEY)
+  assert.equal(rollup.severity, 'critical')
+  assert.equal(rollup.needs_human, true)
+  assert.equal(members.length, 3)
+  // warning + needs_human:false is the pair upsert_signal records as 'not-eligible'.
+  assert.ok(members.every((m) => m.severity === 'warning' && m.needs_human === false))
+})
+
+t('eleven dark jobs produce exactly one pageable signal, not eleven', () => {
+  const names = ['inbox-triage', 'gsc-daily-check', 'brain-processor', 'needs-roger-closer',
+    'kb-learning-phase0', 'gemini-balance-scrape', 'inbox-daily-summary', 'ci-cost-guard',
+    'knowledge-apply-loop', 'production-autofix-hourly', 'commit-review']
+  const { rollup, members } = planSignals(names.map(dead), NOW)
+  const pageable = [rollup, ...members].filter((s) => s && s.severity === 'critical' && s.needs_human)
+  assert.equal(pageable.length, 1)
+  assert.equal(members.length, 11)
+})
+
+t('every dark job is still named in the one alert — a rollup must not hide the list', () => {
+  const { rollup } = planSignals([dead('a'), dead('b'), dead('c')], NOW)
+  for (const name of ['a', 'b', 'c']) assert.match(rollup.summary, new RegExp(name))
+  assert.deepEqual(rollup.detail.jobs, ['a', 'b', 'c'])
+})
+
+t('when a GATE is among the dead, the alert names the cause instead of counting symptoms', () => {
+  const { rollup } = planSignals([dead('code-sync-laptop'), dead('inbox-triage'), dead('brain-processor')], NOW)
+  assert.equal(rollup.detail.gate, 'code-sync-laptop')
+  assert.match(rollup.title, /Nothing is running/)
+  assert.match(rollup.summary, /does not match what was shipped/)
+  // The consequence must be readable without knowing what a slug is.
+  assert.doesNotMatch(rollup.title, /healthchecks|slug|hc-ping/)
+})
+
+t('no gate among the dead: it says "probably one cause" rather than inventing one', () => {
+  const { rollup } = planSignals([dead('a'), dead('b'), dead('c')], NOW)
+  assert.equal(rollup.detail.gate, null)
+  assert.match(rollup.summary, /most likely one cause/)
+})
+
+t('the rollup key is fixed, so a fleet that stays blocked dedups instead of re-filing', () => {
+  const a = planSignals([dead('a'), dead('b'), dead('c')], NOW).rollup
+  const b = planSignals([dead('a'), dead('b'), dead('c'), dead('d')], NOW).rollup
+  assert.equal(a.key, b.key)
+})
+
+t('nothing dark: nothing filed, and no rollup to clear against', () => {
+  const { rollup, members } = planSignals([], NOW)
+  assert.equal(rollup, null)
+  assert.equal(members.length, 0)
 })
 
 console.log(`\n${n} tests passed.`)
