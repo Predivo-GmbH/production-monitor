@@ -300,6 +300,23 @@ jobs:
           SENTRY_API_TOKEN: ${{ secrets.SENTRY_API_TOKEN }}
           BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
 
+      # The GitHub REST allowance is one shared 5,000/hour pool for the whole account, and until
+      # 2026-08-27 nothing watched it — check-ci-budget watches the Actions BILL, not the request
+      # quota. That afternoon the pool drained to 0 twice and started refusing our own deploys
+      # (a Cockpit prod promotion could not be dispatched; `gh run watch` died with HTTP 403), and
+      # the first anyone knew was the refused deploy. This reads .resources.core once an hour (the
+      # /rate_limit endpoint is FREE — it does not consume the allowance) and files a signal when
+      # the pool is spent or on track to be, so a runaway consumer surfaces within the hour.
+      # Uses DASHBOARD_PAT on purpose: we must measure the USER pool (id 251853205) that runs dry,
+      # not the per-repo github.token pool. Source `github-api-budget` has no page policy, so the
+      # first signal lands on /signals for Roger to decide, and never rings his phone unasked.
+      - name: The shared GitHub API allowance must not run dry unseen
+        if: always()
+        run: node scripts/check-github-api-budget.mjs
+        env:
+          GH_TOKEN: ${{ secrets.DASHBOARD_PAT }}
+          BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
+
       # Two guards, doing two different jobs, both required:
       #   1. This step is scoped to `ci_watchdog_alive.outcome == 'failure'` so it fires ONLY for a
       #      silent watchdog, never on some unrelated earlier monitor failure.
