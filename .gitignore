@@ -5,6 +5,7 @@ blob-report/
 .env
 .env.local
 auto-fix-results.json
+canary-results.json
 heartbeat-findings.json
 ci-runner-findings.json
 mailer-findings.json

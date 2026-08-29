@@ -12,9 +12,12 @@
  * passed the pipeline because nothing exercised the LIVE credential.
  */
 
+import { writeFileSync } from 'fs'
+
 const failures = []
 const ok = (msg) => console.log(`  OK  ${msg}`)
 const fail = (msg) => { failures.push(msg); console.error(`  FAIL ${msg}`) }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 // Non-browser UA — Supabase rejects sb_secret_ keys from browser user-agents.
 const UA = 'production-monitor-canary'
@@ -46,11 +49,18 @@ for (const [name, urlEnv, keyEnv] of PRODUCTS) {
   const key = process.env[keyEnv]
   await probe(`service-key: ${name}`, async () => {
     if (!url || !key) { fail(`service-key: ${name} — env ${!url ? urlEnv : keyEnv} not set`); return }
-    const res = await fetch(`${url}/rest/v1/`, {
+    const hit = () => fetch(`${url}/rest/v1/`, {
       headers: { apikey: key, Authorization: `Bearer ${key}`, 'User-Agent': UA },
     })
+    let res = await hit()
+    // A 5xx is Supabase's REST layer being unavailable, NOT an auth problem — a dead/rotated
+    // key answers 401/403, never 503. These blips are transient, so retry once before we
+    // believe it (a lone 503 mailed as "dead/rotated key?" was the 2026-08-29 false lead).
+    if (res.status >= 500) { await sleep(2000); res = await hit() }
     if (res.status === 200) ok(`${name} service key valid (REST 200)`)
-    else fail(`service-key: ${name} — REST root returned ${res.status} (dead/rotated key?)`)
+    else if (res.status >= 500) fail(`service-key: ${name} — REST root returned ${res.status} (Supabase REST unavailable, not a key problem — retried once)`)
+    else if (res.status === 401 || res.status === 403) fail(`service-key: ${name} — REST root returned ${res.status} (dead/rotated key?)`)
+    else fail(`service-key: ${name} — REST root returned ${res.status} (unexpected)`)
   })
 }
 
@@ -95,6 +105,20 @@ await probe('stripe: secret key', async () => {
 })
 
 // ---------------------------------------------------------------------------
+// Record the failures so send-alert.mjs can name the failing check + its error. A canary
+// failure is a STEP failure, not a Playwright test, so it is invisible in results.json;
+// without this file the alert falls through to a content-free "no per-test detail" line.
+// Each message is "check — detail"; split on the first " — " to fill the alert columns.
+const structured = failures.map((line) => {
+  const idx = line.indexOf(' — ')
+  return {
+    project: 'Out-of-band canary',
+    check: idx > -1 ? line.slice(0, idx) : 'canary',
+    error: idx > -1 ? line.slice(idx + 3) : line,
+  }
+})
+writeFileSync('canary-results.json', JSON.stringify({ generated_at: new Date().toISOString(), failures: structured }, null, 2))
+
 console.log('')
 if (failures.length) {
   console.error(`CANARIES FAILED (${failures.length}):`)

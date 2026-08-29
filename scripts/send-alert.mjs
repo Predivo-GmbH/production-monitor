@@ -1,4 +1,5 @@
 import { createMailTransport } from './lib/smtp.mjs'
+import { extractFailures, canaryRows, deriveFailures } from './lib/parse-failures.mjs'
 import { readFileSync, existsSync } from 'fs'
 import { execSync } from 'child_process'
 
@@ -9,51 +10,16 @@ if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS || !ALERT_EMAIL) {
   process.exit(1)
 }
 
-/** Strip ANSI escape codes from error messages */
-function stripAnsi(str) {
-  return str.replace(/\x1b\[[0-9;]*m/g, '')
-}
-
-/** Recursively extract failed specs from nested suite structure.
- *  Playwright nests: file-suite (title=filename) > describe-suite (title=describe name) > specs.
- *  We prefer the deepest suite title that isn't a filename (contains " — "). */
-function extractFailures(suite, parentName) {
-  const failures = []
-  // Use this suite's title if it looks like a describe name, otherwise fall back to parent
-  const isDescribe = suite.title && !suite.title.endsWith('.spec.ts')
-  const name = isDescribe ? suite.title.replace(/ — Production Monitor$/, '') : (parentName || suite.title || 'Unknown')
-
-  for (const spec of suite.specs ?? []) {
-    for (const test of spec.tests ?? []) {
-      if (test.status === 'unexpected') {
-        // Pull the error from the last result that actually failed (an
-        // 'unexpected' test's final result holds the real error).
-        const failedResult = [...(test.results ?? [])].reverse()
-          .find((r) => r.errors?.length || r.error) || test.results?.[test.results.length - 1]
-        const errorMsg = failedResult?.errors?.[0]?.message
-          || failedResult?.error?.message
-          || 'Unknown error'
-        const location = failedResult?.errors?.[0]?.location
-        const cleanError = stripAnsi(errorMsg).split('\n')[0].slice(0, 300)
-        const fileRef = location
-          ? `${location.file?.split('/').pop()}:${location.line}`
-          : ''
-
-        failures.push({
-          project: name,
-          test: spec.title || 'Unknown test',
-          error: cleanError,
-          file: fileRef,
-        })
-      }
-    }
-  }
-
-  for (const child of suite.suites ?? []) {
-    failures.push(...extractFailures(child, name))
-  }
-
-  return failures
+// An out-of-band canary/step failure (a dead secret, a vendor 5xx) is NOT a Playwright
+// test, so the report below carries zero failed specs. run-canaries.mjs records those
+// named failures here so the alert can surface the actual check + error instead of a
+// content-free "no per-test detail" line (the 2026-08-29 incident).
+let canaryFailures = []
+const canaryPath = 'canary-results.json'
+if (existsSync(canaryPath)) {
+  try {
+    canaryFailures = JSON.parse(readFileSync(canaryPath, 'utf-8')).failures ?? []
+  } catch { /* ignore — a broken canary file must not silence the test failures */ }
 }
 
 // Parse Playwright JSON results
@@ -62,40 +28,16 @@ const resultsPath = 'test-results/results.json'
 if (existsSync(resultsPath)) {
   try {
     const results = JSON.parse(readFileSync(resultsPath, 'utf-8'))
-    for (const suite of results.suites ?? []) {
-      failures.push(...extractFailures(suite, null))
-    }
-    // No per-test failures extracted but the run still failed → surface whatever detail
-    // Playwright DID record instead of a content-free "Unknown" alert. This happens on a
-    // global setup/teardown failure, a worker crash, or a config error — the real info lives
-    // in the report's top-level `errors` and `stats`, not in any spec.
-    if (failures.length === 0) {
-      const topErrors = (results.errors ?? [])
-        .map((e) => stripAnsi(e?.message || String(e)).split('\n')[0].slice(0, 300))
-        .filter(Boolean)
-      if (topErrors.length) {
-        failures = topErrors.map((msg) => ({
-          project: 'Run-level error',
-          test: 'global setup/teardown / worker',
-          error: msg,
-          file: '',
-        }))
-      } else {
-        const s = results.stats || {}
-        const statsLine = Object.keys(s).length
-          ? `${s.expected ?? '?'} passed, ${s.unexpected ?? '?'} failed, ${s.flaky ?? '?'} flaky, ${s.skipped ?? '?'} skipped`
-          : 'report had no suites and no top-level errors'
-        failures = [{
-          project: 'Run failed — no per-test detail',
-          test: 'see run logs',
-          error: `The run failed but produced no parseable per-test failures (${statsLine}). Likely a crash/timeout in setup or a worker died. Open the run logs.`,
-          file: '',
-        }]
-      }
-    }
+    // deriveFailures prefers per-test failures, then a NAMED canary/step failure, then
+    // Playwright's top-level errors, then the last-resort generic line.
+    failures = deriveFailures(results, canaryFailures)
   } catch (e) {
     failures = [{ project: 'Parser', test: 'results.json', error: `Failed to parse: ${e.message}` }]
   }
+} else if (canaryFailures.length > 0) {
+  // No Playwright report, but a canary still named a real failure — surface it by name
+  // rather than the generic "no report produced" crash line.
+  failures = canaryRows(canaryFailures)
 } else {
   // No report at all → the run died before Playwright wrote results (infra / timeout / crash).
   failures = [{
