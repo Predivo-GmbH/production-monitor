@@ -89,6 +89,28 @@ export async function checkMachines(env = process.env) {
   return findings
 }
 
+// A check that learned NOTHING must not read as all-clear — that is the exact failure mode the
+// comment at checkMachines() exists to prevent. So a machine burning disk, ANY machine that came
+// back unreadable (a single rotated/revoked key or a drifted metrics format blinds the watchdog
+// for THAT product — it does not have to be the whole fleet), and a run that discovered no
+// machines at all are each non-zero. Exported (not inlined) so this exit policy is unit-tested,
+// not merely the metric parser: the 2026-08-29 residual gap was that only an ALL-unreadable fleet
+// went red, so one product silently going dark read as green.
+export function exitDecision(findings) {
+  const bad = findings.filter((f) => f.level === 'fail')
+  const unreadable = findings.filter((f) => f.level === 'unreadable')
+  if (bad.length) {
+    return { code: 1, message: `::error::a Supabase machine is burning disk IO — this is what the 2026-08-29 vendor email was: ${bad.map((f) => f.product).join(', ')}` }
+  }
+  if (unreadable.length) {
+    return { code: 1, message: `::error::a Supabase machine was unreadable — the watchdog is blind for it (broken/rotated key or drifted metrics), not "all clear": ${unreadable.map((f) => f.product).join(', ')}` }
+  }
+  if (!findings.length) {
+    return { code: 1, message: '::error::no Supabase machines were discovered — every *_SUPABASE_URL/key pair was missing, so nothing was checked; this is not "all clear"' }
+  }
+  return { code: 0, message: null }
+}
+
 if (process.argv[1] && process.argv[1].endsWith('check-supabase-machine-health.mjs')) {
   const findings = await checkMachines()
   for (const f of findings) console.log(`${f.level.toUpperCase().padEnd(10)} ${f.product.padEnd(18)} ${f.detail}`)
@@ -96,15 +118,8 @@ if (process.argv[1] && process.argv[1].endsWith('check-supabase-machine-health.m
   const warn = findings.filter((f) => f.level === 'warn')
   const unreadable = findings.filter((f) => f.level === 'unreadable')
   console.log(`\n${findings.length} machines checked · ${bad.length} over ${FAIL_MB_S} MB/s · ${warn.length} over ${WARN_MB_S} MB/s · ${unreadable.length} unreadable`)
-  // A check that learned NOTHING must not read as all-clear — that is the exact failure mode
-  // the comment at checkMachines() exists to prevent. So both a machine burning disk AND a
-  // fleet that came back entirely unreadable (total access loss, or the metrics format drifted)
-  // are non-zero. process.exitCode (not process.exit) so a pending fetch cannot crash the exit.
-  if (bad.length) {
-    console.error('::error::a Supabase machine is burning disk IO — this is what the 2026-08-29 vendor email was')
-    process.exitCode = 1
-  } else if (findings.length && unreadable.length === findings.length) {
-    console.error('::error::every Supabase machine was unreadable — the check learned nothing (broken key/endpoint), not "all clear"')
-    process.exitCode = 1
-  }
+  // process.exitCode (not process.exit) so a pending fetch cannot crash the exit.
+  const decision = exitDecision(findings)
+  if (decision.message) console.error(decision.message)
+  process.exitCode = decision.code
 }

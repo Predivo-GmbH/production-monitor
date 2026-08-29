@@ -13,7 +13,7 @@
  * Run: node test/check-supabase-machine-health.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
-import { metricValue } from '../scripts/check-supabase-machine-health.mjs'
+import { metricValue, exitDecision } from '../scripts/check-supabase-machine-health.mjs'
 
 let passed = 0
 let failed = 0
@@ -68,6 +68,40 @@ check('anchors to line start: a prefix collision does not mis-read', () => {
 
 check('reads scientific-notation values (Prometheus emits 4.14e+09 too)', () => {
   assert.equal(metricValue('node_memory_MemTotal_bytes 4.14e+09\n', 'node_memory_MemTotal_bytes'), 4.14e+09)
+})
+
+// --- exitDecision: the exit policy, not just the parser (2026-08-29 residual gap) ---
+// The bug this pins: only an ALL-unreadable fleet went red, so ONE product losing its key
+// (sample() -> null -> level 'unreadable') read as green and its disk-IO watchdog went dark
+// with nobody told. And a run that discovered zero machines printed "0 machines checked" green.
+
+check('ONE-of-six unreadable is non-zero and names the product (the residual bug)', () => {
+  const findings = [
+    { product: 'ReplyFlow', level: 'ok' }, { product: 'BackOffice', level: 'ok' },
+    { product: 'Valrano', level: 'ok' }, { product: 'ChannelMover', level: 'ok' },
+    { product: 'SignalScore', level: 'ok' }, { product: 'ScoutCopilot', level: 'unreadable' },
+  ]
+  const d = exitDecision(findings)
+  assert.equal(d.code, 1, 'one unreadable machine must fail loudly, not read as all-clear')
+  assert.match(d.message, /ScoutCopilot/, 'the unreadable product must be named in the alert')
+})
+
+check('ZERO machines discovered is non-zero (no *_SUPABASE_URL/key found)', () => {
+  const d = exitDecision([])
+  assert.equal(d.code, 1, 'a run that checked nothing must not read as "all clear"')
+  assert.match(d.message, /no Supabase machines/, 'the empty-fleet case must say why it failed')
+})
+
+check('all machines ok -> exit 0 (the only green)', () => {
+  const d = exitDecision([{ product: 'ReplyFlow', level: 'ok' }, { product: 'BackOffice', level: 'warn' }])
+  assert.equal(d.code, 0)
+  assert.equal(d.message, null)
+})
+
+check('a machine burning disk (fail) -> exit 1 and named', () => {
+  const d = exitDecision([{ product: 'ReplyFlow', level: 'ok' }, { product: 'ScoutCopilot', level: 'fail' }])
+  assert.equal(d.code, 1)
+  assert.match(d.message, /ScoutCopilot/)
 })
 
 console.log(`\n${passed} passed, ${failed} failed.`)
