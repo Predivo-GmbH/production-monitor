@@ -9,26 +9,51 @@
 // failure to READ Postmark into a customer-facing outage on the board. Reserve "cannot send email"
 // for a proven send/config failure; render an unaudited-only run as exactly that - unaudited.
 // Pulled out of send-mailer-alert.mjs so this decision is unit-testable without sending a mail.
+//
+// THE SAME BUG, ONE LEVEL UP (2026-08-29 board). The guard can also fail to read a project AT ALL
+// - a Management-API HTTP 401/403 on the secrets read, or a checkout/clone it could not open. Those
+// findings carry `what` = 'the project could not be read' / 'the mailer source could not be read',
+// which is NOT the literal 'unaudited' string, so the old classifier swept them into the PROVEN
+// bucket and paged "N products cannot send email ... Customers ... get nothing" off a credential
+// fault. The 11:50:47Z alert did exactly this: four rows, one reason for all of them ("the project
+// could not be read - Supabase Management API: HTTP 401"), yet the alert itself was DELIVERED by
+// the very BackOffice mailer it declared dead. A guard that lost its access knows nothing about the
+// mailer; it must page UNKNOWN ("the guard lost its access"), never a customer-facing outage.
+// Crying outage on a credential fault is how a real outage stops being believed.
 
 const UNAUDITED = 'unaudited'
+
+// The guard was BLIND, not the mailer proven broken: it could not reach the project (a 401/403 on
+// the Management API) or read the source at all (a failed checkout/clone). These are the `what`
+// strings check-mailer-config.mjs emits for that, and they must be classified as UNKNOWN, never as
+// a proven "cannot send email".
+const GUARD_BLIND = new Set([
+  'the project could not be read',
+  'the mailer source could not be read',
+])
+
+const isBlind = (f) => GUARD_BLIND.has(f.what)
+const isUnaudited = (f) => f.what === UNAUDITED
+const isProven = (f) => !isUnaudited(f) && !isBlind(f)
 
 /**
  * @param {{product:string, env:string, what:string, detail:string}[]} failures
  * @returns {{colour:string, subject:string, title:string, lede:string}}
  */
 export function classifyMailerAlert(failures) {
-  const proven = failures.filter((f) => f.what !== UNAUDITED)
-  const unaudited = failures.filter((f) => f.what === UNAUDITED)
-  const provenProducts = [...new Set(proven.map((f) => f.product))]
-  const unauditedProducts = [...new Set(unaudited.map((f) => f.product))]
+  const provenProducts = [...new Set(failures.filter(isProven).map((f) => f.product))]
+  const unauditedProducts = [...new Set(failures.filter(isUnaudited).map((f) => f.product))]
+  const blindProducts = [...new Set(failures.filter(isBlind).map((f) => f.product))]
 
-  // At least one PROVEN failure -> a real outage. Name the proven products in the subject and
-  // keep the customer-facing lede; note any unaudited ones in the headline so they are not lost.
+  // 1. At least one PROVEN failure -> a real outage. Name the proven products in the subject and
+  // keep the customer-facing lede; note any unproven ones (unaudited or guard-blind) in the
+  // headline so they are not lost.
   if (provenProducts.length) {
     const plural = provenProducts.length > 1 ? 's' : ''
-    const extra = unauditedProducts.length
-      ? ` (plus ${unauditedProducts.length} unaudited)`
-      : ''
+    const parts = []
+    if (unauditedProducts.length) parts.push(`${unauditedProducts.length} unaudited`)
+    if (blindProducts.length) parts.push(`${blindProducts.length} the guard could not read`)
+    const extra = parts.length ? ` (plus ${parts.join(', ')})` : ''
     return {
       colour: '#dc2626',
       subject: `[MAILERS] ${provenProducts.join(', ')} cannot send email`,
@@ -37,8 +62,22 @@ export function classifyMailerAlert(failures) {
     }
   }
 
-  // Only unaudited findings: the send history could not be READ, which is not the same as a proven
-  // send failure. This is amber, not red, and must never say "cannot send email" or "get nothing".
+  // 2. No proven failure, but the guard LOST ITS ACCESS to one or more projects: it knows nothing
+  // about whether those mailers can send. This is UNKNOWN, not an outage. It must never say "cannot
+  // send email" or "get nothing"; it pages Roger to fix the guard's access, not the product.
+  if (blindProducts.length) {
+    const plural = blindProducts.length > 1 ? 's' : ''
+    const extra = unauditedProducts.length ? ` (plus ${unauditedProducts.length} unaudited)` : ''
+    return {
+      colour: '#d97706',
+      subject: `[MAILERS] the guard lost access to ${blindProducts.join(', ')} - email status UNKNOWN`,
+      title: `${blindProducts.length} product${plural}: the guard lost its access - email status UNKNOWN${extra}`,
+      lede: `This is NOT a "cannot send email" notice. The guard could not read ${plural ? 'these projects' : 'this project'} this run (a Supabase Management API HTTP 401/403, or a checkout it could not open), so whether ${plural ? 'they can' : 'it can'} send is UNKNOWN - not proven to have failed. This is a credential/access fault in the GUARD, not a product outage: refresh the guard's access (the expired/rotated token) and re-run.`,
+    }
+  }
+
+  // 3. Only unaudited findings: the send history could not be READ, which is not the same as a
+  // proven send failure. This is amber, not red, and must never say "cannot send email".
   const plural = unauditedProducts.length > 1 ? 's' : ''
   return {
     colour: '#d97706',
