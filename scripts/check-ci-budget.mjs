@@ -173,6 +173,13 @@ let billedMinutes = 0
 let freeMinutes = 0
 let selfHostedMinutes = 0   // private-repo work that runs on our own laptop, so GitHub bills none of it
 
+// WHERE THE MONEY GOES, per workflow. The guard used to report one fleet-wide total and nothing
+// else, so every red run began with the same manual investigation: re-crawl 3600 runs by hand to
+// find which workflow actually grew. The total tells you THAT you are over budget; it never tells
+// you what to cut, which is the only decision the alert exists to prompt. Printed on every run,
+// pass or fail, so a line that is climbing is visible BEFORE it breaches rather than after.
+const wfBilled = new Map() // key(repo, workflow) -> {billed, selfHosted, jobs}
+
 // PASS 1: list the runs. Cheap - one call per 100 runs.
 const pending = [] // {repo, run}
 for (const repo of repos) {
@@ -224,6 +231,14 @@ const consumeJobs = async () => {
       if (billed) billedMinutes += min
       else if (repo.private) selfHostedMinutes += min
       else freeMinutes += min
+      if (repo.private) {
+        const wk = key(repo.name, run.name)
+        const e = wfBilled.get(wk) || { billed: 0, selfHosted: 0, jobs: 0 }
+        if (billed) e.billed += min
+        else e.selfHosted += min
+        e.jobs++
+        wfBilled.set(wk, e)
+      }
       const k = key(repo.name, run.name, job.name)
       if (!seen.has(k)) seen.set(k, [])
       seen.get(k).push({ min, billed })
@@ -325,6 +340,25 @@ console.log(`free minutes      : ${freeMinutes} (public repos)   ${selfHostedMin
 console.log(
   `projected 30 days : ${billedMinutes} x 30 / ${WINDOW_DAYS} = ${projected} min = $${(projected * RATE).toFixed(2)}   budget ${cfg.monthly_minute_budget} min = $${(cfg.monthly_minute_budget * RATE).toFixed(2)}`,
 )
+
+// Ranked by BILLED minutes only - the self-hosted column is shown beside it because "this
+// workflow is huge but costs nothing" and "this workflow is huge and we pay for it" look
+// identical in a minutes total, and only the second one is a thing to act on.
+const ranked = [...wfBilled.entries()]
+  .map(([k, v]) => ({ ...v, name: unkey(k).join(' / ') }))
+  .filter((w) => w.billed > 0)
+  .sort((a, b) => b.billed - a.billed)
+if (ranked.length) {
+  console.log(`top billed workflows (of ${ranked.length} that cost anything):`)
+  for (const w of ranked.slice(0, 15)) {
+    const share = billedMinutes ? Math.round((w.billed / billedMinutes) * 100) : 0
+    const perMonth = ((w.billed * 30) / WINDOW_DAYS) * RATE
+    console.log(
+      `  ${String(w.billed).padStart(5)} min  ${String(share).padStart(2)}%  $${perMonth.toFixed(2).padStart(7)}/mo  ${w.name}` +
+        (w.selfHosted ? `   (+${w.selfHosted} min free on our own runners)` : ''),
+    )
+  }
+}
 console.log('')
 
 if (!failures.length) {
