@@ -6,6 +6,7 @@
 // alert - nobody is watching the GitHub UI. Without this, the fleet could sit on rented runners
 // for days, quietly costing money, and the first sign would be the bill.
 import { createMailTransport } from './lib/smtp.mjs'
+import { classifyWatchdogFailure } from './lib/classify-watchdog-failure.mjs'
 import { readFileSync, existsSync } from 'node:fs'
 
 const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, ALERT_EMAIL, GITHUB_RUN_URL } = process.env
@@ -92,13 +93,22 @@ if (report.watchdog_silent) {
 
 // Case 2: the watchdog itself is blind. Loud, distinct, non-zero.
 if (brokenReason) {
-  // The "renew the token" advice is only right when the failure is actually auth-shaped. A dropped
-  // socket, a timeout, a crash, or a batch of failed API calls is NOT an expired PAT, and telling
-  // Roger to renew the token every time trains him to distrust the one case where it IS the token.
-  // So gate that paragraph behind the reason actually looking like an auth failure (401/403, missing
-  // or broken/descoped token, permission/scope); otherwise point at the run logs for the real cause.
-  const authShaped = /\b(401|403)\b|token|scope|unauthor|forbidden|permission|administration/i.test(brokenReason)
-  const likelyCauseHtml = authShaped
+  // The "renew the token" advice is only right when the failure is actually auth-shaped. A rate
+  // limit, a dropped socket, a timeout, a crash, or a batch of failed API calls is NOT an expired
+  // PAT, and telling Roger to renew the token every time trains him to distrust the one case where
+  // it IS the token. So classify the reason (ratelimit | auth | other) and speak to what actually
+  // failed. A rate limit is the most important to call out: a 403 rate-limit looks exactly like a
+  // 403 auth failure, and this alarm blamed the token for it three times before this.
+  const kind = classifyWatchdogFailure(brokenReason)
+  const likelyCauseHtml = kind === 'ratelimit'
+    ? `<p style="margin-top:16px;font-size:13px;color:#374151">
+        <strong>Most likely cause:</strong> the shared GitHub API hourly allowance was exhausted -
+        this is a <strong>rate limit, not a token problem</strong>. <strong>Do NOT rotate the
+        DASHBOARD_PAT:</strong> an invalid token could not have reached the API at all. Something
+        upstream emptied the hour (see the CI Cost Guard / github-api-budget). The check goes green
+        on its own once the allowance resets.
+      </p>`
+    : kind === 'auth'
     ? `<p style="margin-top:16px;font-size:13px;color:#374151">
         <strong>Most likely cause:</strong> the DASHBOARD_PAT expired or lost its <code>administration</code>
         scope - the most likely auth failure of this watchdog. Renew/rescope the token and the check

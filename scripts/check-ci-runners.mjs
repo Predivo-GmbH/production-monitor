@@ -65,6 +65,16 @@ const H = {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 let apiErrors = 0
+// Set when a 403/429 is a genuine API RATE LIMIT (the shared hourly allowance emptied), NOT an
+// auth failure. Distinguishing these is the whole point: an expired/descoped token and an exhausted
+// rate limit both surface as 403, and reporting the first advice for the second told Roger to rotate
+// a token that was working. GitHub sends x-ratelimit-remaining:0 only for the former.
+let rateLimited = false
+let rateLimitReset = null
+
+function rateLimitReason() {
+  return `GitHub API rate limit exhausted${rateLimitReset ? ` (core resets at ${rateLimitReset})` : ''} - this is a RATE LIMIT, not an auth failure. The token is valid; an invalid token could not reach the API at all. The shared hourly API allowance was emptied upstream (see the CI Cost Guard / github-api-budget), so this run cannot certify the fleet until the allowance resets. Do NOT rotate the DASHBOARD_PAT.`
+}
 
 async function gh(path, init = {}) {
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -75,7 +85,18 @@ async function gh(path, init = {}) {
       await sleep(1500)
       continue
     }
-    if (r.status === 403 || r.status === 429) { await sleep(5000); continue }
+    if (r.status === 403 || r.status === 429) {
+      // A rate-limit 403 is NOT the token's fault, and retrying inside this run cannot fix it -
+      // the reset is minutes to an hour away. Record it and stop, so we report the real cause
+      // instead of falling through to a bail message that (wrongly) blames the credential.
+      if (r.headers.get('x-ratelimit-remaining') === '0') {
+        rateLimited = true
+        const reset = Number(r.headers.get('x-ratelimit-reset'))
+        if (reset) rateLimitReset = new Date(reset * 1000).toISOString()
+        return { rateLimited: true }
+      }
+      await sleep(5000); continue
+    }
     if (r.status === 404) return { notFound: true }
     if (r.status === 204) return { ok: true }
     if (!r.ok) {
@@ -97,6 +118,9 @@ for (let page = 1; page <= 5; page++) {
   repos.push(...j.filter((r) => r.private && !r.archived).map((r) => r.name))
   if (j.length < 100) break
 }
+// A rate limit empties the repo list too, but for a reason that has nothing to do with the token.
+// Check it FIRST so we never blame the credential for an exhausted allowance.
+if (rateLimited) bail(rateLimitReason())
 if (!repos.length) {
   bail('listed no private repositories. Broken token or broken harness - not a healthy fleet.')
 }
@@ -146,6 +170,9 @@ for (const repo of repos) {
   }
 }
 
+// A rate limit mid-loop leaves runners/runs unread and would otherwise trip the "token cannot see
+// runners" bail below - the same misattribution, one layer down. Report the rate limit instead.
+if (rateLimited) bail(rateLimitReason())
 if (!migrated) {
   bail('no repository has a self-hosted runner registered. Either the migration was undone, or this token cannot see runners. Not treating that as healthy.')
 }
