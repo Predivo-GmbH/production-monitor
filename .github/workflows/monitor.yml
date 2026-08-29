@@ -296,6 +296,7 @@ jobs:
       # may alert you", with the two buttons that settle it. A new pager that pages before
       # anyone chose it is the default-nobody-chose failure this whole system exists to remove.
       - name: The fleet auto-fixer is still fixing things
+        if: always()  # independent sensor — must run even if the monitor step above failed. check-drainer-progress.mjs exits 0 on a filed alarm (only a failed read reds the job), so this cannot double-red one event.
         run: node scripts/check-drainer-progress.mjs
         env:
           BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
@@ -310,6 +311,7 @@ jobs:
       # live in a second one). A monitor that read only one would report "nothing is down"
       # while the other burned, and an unreadable key fails the step rather than reporting zero.
       - name: A scheduled job that went dark must say so
+        if: always()  # independent sensor — must run even if the monitor step above failed. check-healthchecks-down.mjs exits 0 on a filed alarm (only a failed read reds the job), so this cannot double-red one event.
         run: node scripts/check-healthchecks-down.mjs
         env:
           HEALTHCHECKS_API_KEYS: ${{ secrets.HEALTHCHECKS_API_KEYS }}
@@ -384,6 +386,7 @@ jobs:
       # It fails the step rather than reporting zero when `fleet_projects` comes back empty: a
       # registry read that returned nothing is not a fleet with nothing wrong.
       - name: A product a customer cannot use must say so
+        if: always()  # THE FIX: a product being down is exactly what fails the monitor step above, and default if:success() then SKIPS this sensor — the alarm was armed to never fire. Matches the canary at :154. check-products-down.mjs exits 0 on a filed alarm (only a failed read reds the job), so this cannot double-red one event.
         run: node scripts/check-products-down.mjs
         env:
           BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
