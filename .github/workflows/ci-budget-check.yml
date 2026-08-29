@@ -11,7 +11,19 @@ name: CI Cost Guard
 on:
   schedule:
     - cron: '10 7 * * 1' # Mondays 07:10 UTC, after the other fleet guards
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      window_days:
+        # A red run raises exactly one question the fixed 7-day window cannot answer: is this
+        # money we are STILL spending, or the tail of something already fixed? On 2026-08-29 the
+        # guard read $149.63/month, and most of it turned out to be pre-migration runs from
+        # 08-23/24 decaying out of the window - the fleet had already moved onto the self-hosted
+        # runners and the bill had stopped. Answering that took a hand-written crawl because the
+        # window was only settable by editing this file. Now it is an input: re-run over 3 days
+        # to see the CURRENT burn rate before cutting anything that is already fixed.
+        description: 'Days to measure (default 7). Use a short window to see the current burn rate.'
+        required: false
+        default: '7'
 
 jobs:
   budget:
@@ -26,7 +38,7 @@ jobs:
         run: node scripts/check-ci-budget.mjs
         env:
           GH_TOKEN: ${{ secrets.DASHBOARD_PAT }}
-          CI_BUDGET_WINDOW_DAYS: 7
+          CI_BUDGET_WINDOW_DAYS: ${{ inputs.window_days || 7 }}
 
       - name: Heartbeat
         if: always()
