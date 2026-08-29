@@ -74,6 +74,12 @@ export function canaryRows(canaryFailures = []) {
  * Given the parsed Playwright results.json object and the canary failures
  * (from canary-results.json), return the failure rows the alert should render.
  *
+ * When there ARE failed specs, the canary rows are APPENDED, not dropped: a
+ * rotated/dead service key breaks the live-site specs AND trips the canary in
+ * the same run, so returning only the specs would bury the named credential
+ * line (e.g. "service-key: ScoutCopilot - 401 dead/rotated key?") that is the
+ * whole reason the canaries exist. Concatenating keeps both in the alert.
+ *
  * Order of preference when there are NO failed specs:
  *   1. a NAMED out-of-band canary/step failure (the 2026-08-29 incident class),
  *   2. Playwright's own top-level errors (global setup/teardown / worker crash),
@@ -82,7 +88,9 @@ export function canaryRows(canaryFailures = []) {
 export function deriveFailures(results, canaryFailures = []) {
   const failures = []
   for (const suite of results.suites ?? []) failures.push(...extractFailures(suite, null))
-  if (failures.length > 0) return failures
+  // Append (never replace) named canary failures so a dead-key line still reaches
+  // the alert when a spec also failed. With no canaries, canaryRows([]) is [].
+  if (failures.length > 0) return [...failures, ...canaryRows(canaryFailures)]
 
   // No per-test failures but the run still failed. Prefer a named canary/step
   // failure over a content-free "no per-test detail" — the whole point of the fix.

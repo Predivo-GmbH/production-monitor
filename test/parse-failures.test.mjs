@@ -37,11 +37,15 @@ const canaryFailure = [
   { project: 'Out-of-band canary', check: 'service-key: Distribution-OS', error: 'REST root returned 503 (Supabase REST unavailable, not a key problem — retried once)' },
 ]
 
-check('a real per-test failure is returned as-is (canary does not override it)', () => {
+check('a per-test failure AND a canary failure BOTH surface (rotated key: the dead-credential line must not be dropped)', () => {
+  // A rotated/dead key breaks the live-site spec AND trips the canary in the same run.
+  // Returning only the spec would bury the named credential line — the class the canaries exist for.
   const rows = deriveFailures(reportWithFailure, canaryFailure)
-  assert.equal(rows.length, 1)
+  assert.equal(rows.length, 2)
   assert.equal(rows[0].project, 'ReplyFlow')
   assert.match(rows[0].error, /got 500/)
+  assert.ok(rows.some((r) => /service-key: Distribution-OS/.test(r.test)),
+    'the out-of-band canary must still reach the alert, not be replaced by the spec failure')
 })
 
 check('THE INCIDENT: zero failed specs + a canary failure surfaces the NAMED check, never the generic line', () => {
