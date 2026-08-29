@@ -34,7 +34,7 @@ jobs:
       - name: Check staging-prod drift (schema, constraints, cron, placeholders)
         run: node scripts/check-drift.mjs
         env:
-          SUPABASE_TOKEN_REPLYFLOW: ${{ secrets.SUPABASE_TOKEN_REPLYFLOW }}
+          SUPABASE_TOKEN_REPLYFLOW: ${{ secrets.REPLYFLOW_SUPABASE_ACCESS_TOKEN }}
           SUPABASE_TOKEN_CHANNELMOVER: ${{ secrets.SUPABASE_TOKEN_CHANNELMOVER }}
           SUPABASE_TOKEN_MUELLER: ${{ secrets.SUPABASE_TOKEN_MUELLER }}
 

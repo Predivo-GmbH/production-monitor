@@ -34,12 +34,12 @@ jobs:
       - name: Check fleet pg_cron heartbeats
         run: node scripts/check-cron-heartbeats.mjs
         env:
-          SUPABASE_TOKEN_REPLYFLOW: ${{ secrets.SUPABASE_TOKEN_REPLYFLOW }}
-          SUPABASE_TOKEN_BACKOFFICE: ${{ secrets.SUPABASE_TOKEN_BACKOFFICE }}
+          SUPABASE_TOKEN_REPLYFLOW: ${{ secrets.REPLYFLOW_SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_TOKEN_BACKOFFICE: ${{ secrets.BACKOFFICE_SUPABASE_ACCESS_TOKEN }}
           SUPABASE_TOKEN_MUELLER: ${{ secrets.SUPABASE_TOKEN_MUELLER }}
           SUPABASE_TOKEN_CHANNELMOVER: ${{ secrets.SUPABASE_TOKEN_CHANNELMOVER }}
           SUPABASE_TOKEN_ARIVIOO: ${{ secrets.SUPABASE_TOKEN_ARIVIOO }}
-          SUPABASE_TOKEN_VALRANO: ${{ secrets.SUPABASE_TOKEN_VALRANO }}
+          SUPABASE_TOKEN_VALRANO: ${{ secrets.VALRANO_SUPABASE_ACCESS_TOKEN }}
 
       - name: Send heartbeat alert on failure
         if: failure()

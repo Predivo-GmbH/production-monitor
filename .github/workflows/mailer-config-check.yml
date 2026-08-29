@@ -51,13 +51,13 @@ jobs:
           MAILER_SRC_ROOT: ${{ runner.temp }}/no-local-checkouts
           POSTMARK_ACCOUNT_TOKEN: ${{ secrets.POSTMARK_ACCOUNT_TOKEN }}
           SUPABASE_TOKEN_ARIVIOO: ${{ secrets.SUPABASE_TOKEN_ARIVIOO }}
-          SUPABASE_TOKEN_BACKOFFICE: ${{ secrets.SUPABASE_TOKEN_BACKOFFICE }}
+          SUPABASE_TOKEN_BACKOFFICE: ${{ secrets.BACKOFFICE_SUPABASE_ACCESS_TOKEN }}
           SUPABASE_TOKEN_CHANNELMOVER: ${{ secrets.SUPABASE_TOKEN_CHANNELMOVER }}
           SUPABASE_TOKEN_DISTRIBUTIONOS: ${{ secrets.SUPABASE_TOKEN_DISTRIBUTIONOS }}
           SUPABASE_TOKEN_MUELLER: ${{ secrets.SUPABASE_TOKEN_MUELLER }}
-          SUPABASE_TOKEN_REPLYFLOW: ${{ secrets.SUPABASE_TOKEN_REPLYFLOW }}
+          SUPABASE_TOKEN_REPLYFLOW: ${{ secrets.REPLYFLOW_SUPABASE_ACCESS_TOKEN }}
           SUPABASE_TOKEN_SCOUTCOPILOT: ${{ secrets.SUPABASE_TOKEN_SCOUTCOPILOT }}
-          SUPABASE_TOKEN_VALRANO: ${{ secrets.SUPABASE_TOKEN_VALRANO }}
+          SUPABASE_TOKEN_VALRANO: ${{ secrets.VALRANO_SUPABASE_ACCESS_TOKEN }}
 
       # A red run in the GitHub UI is NOT an alert - nobody is watching the GitHub UI. A row in a
       # database is not an alert either; that is precisely what let the August outage run for
