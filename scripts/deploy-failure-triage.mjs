@@ -257,11 +257,15 @@ function runAgent(c, workdir, dryRun) {
     '--model', MODEL,
     '--output-format', 'json',
   ]
-  // In LOCAL mode force the SUBSCRIPTION path (flat plan, $0 metered) by dropping any API key from
-  // the child env — matches local-triage-runner.mjs. Without this, a stray ANTHROPIC_API_KEY on the
-  // desktop would silently route to the PAID API and bill per run (this agent is not cheap).
+  // ALWAYS the subscription CLI, never a metered key. This used to drop the key only when
+  // DEPLOY_TRIAGE_LOCAL=1, which means every other mode billed per run — and the comment already
+  // knew the risk ("would silently route to the PAID API and bill per run") while the code only
+  // covered one branch. Roger's standing rule, 2026-08-29: the API key is only for work a customer
+  // triggers inside a product. Triage has no customer in the loop, so the condition is gone.
   const agentEnv = { ...process.env, GIT_AUTHOR_NAME: 'Agent Triage', GIT_AUTHOR_EMAIL: 'noreply@predivo.ch', GIT_COMMITTER_NAME: 'Agent Triage', GIT_COMMITTER_EMAIL: 'noreply@predivo.ch' }
-  if (process.env.DEPLOY_TRIAGE_LOCAL === '1') delete agentEnv.ANTHROPIC_API_KEY
+  delete agentEnv.ANTHROPIC_API_KEY
+  delete agentEnv.ANTHROPIC_AUTH_TOKEN
+  delete agentEnv.ANTHROPIC_BASE_URL
   try {
     execFileSync(CLAUDE_BIN, args, {
       cwd: workdir,

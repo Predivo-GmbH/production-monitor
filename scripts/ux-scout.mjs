@@ -405,6 +405,16 @@ function narrate(product, rows) {
   // invariant with no exceptions is what deploy-deny-tools.test.mjs can actually enforce.
   const res = spawnSync(CLAUDE_BIN, ['-p', prompt, '--disallowedTools', DEPLOY_DENY_TOOLS.join(',')], {
     encoding: 'utf-8', timeout: 5 * 60 * 1000,
+    // ALWAYS the subscription CLI, never a metered key. Roger's standing rule, 2026-08-29: the
+    // API key is only for work a customer triggers inside a product. This spawn inherited the
+    // whole environment, so a stray key would have billed him for narration nobody bought.
+    env: (() => {
+      const e = { ...process.env }
+      delete e.ANTHROPIC_API_KEY
+      delete e.ANTHROPIC_AUTH_TOKEN
+      delete e.ANTHROPIC_BASE_URL
+      return e
+    })(),
   })
   if (res.status !== 0 || !res.stdout) {
     log(`  narration unavailable (${res.error?.message || `exit ${res.status}`}); reporting without it`)

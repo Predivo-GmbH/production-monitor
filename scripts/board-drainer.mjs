@@ -1434,7 +1434,16 @@ function dispatchAgent(inc, mode) {
       stdio: ['ignore', 'inherit', 'inherit'],
       timeout: AGENT_TIMEOUT_MS,
       maxBuffer: 64 * 1024 * 1024,
-      env: { ...process.env, GIT_AUTHOR_NAME: 'Board Drainer', GIT_AUTHOR_EMAIL: 'noreply@predivo.ch', GIT_COMMITTER_NAME: 'Board Drainer', GIT_COMMITTER_EMAIL: 'noreply@predivo.ch' },
+      // ALWAYS the subscription CLI, never a metered key. Roger's standing rule, 2026-08-29:
+      // the API key is only for work a customer triggers inside a product. This drainer can run
+      // for hours unattended, so a stray key here is the most expensive one in the fleet.
+      env: (() => {
+        const e = { ...process.env, GIT_AUTHOR_NAME: 'Board Drainer', GIT_AUTHOR_EMAIL: 'noreply@predivo.ch', GIT_COMMITTER_NAME: 'Board Drainer', GIT_COMMITTER_EMAIL: 'noreply@predivo.ch' }
+        delete e.ANTHROPIC_API_KEY
+        delete e.ANTHROPIC_AUTH_TOKEN
+        delete e.ANTHROPIC_BASE_URL
+        return e
+      })(),
     })
   } catch (e) {
     log(`  agent errored/timed out: ${(e.message || '').split('\n')[0]}`)
