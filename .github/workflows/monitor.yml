@@ -65,6 +65,16 @@ concurrency:
   # false does not queue pushes up forever either: GitHub keeps at most one pending run per
   # group and a newer pending run cancels the older pending one, so a push storm still
   # collapses to its newest commit. It just waits for the hourly check instead of killing it.
+  #
+  # RESIDUAL RISK, ACCEPTED KNOWINGLY. That same "newest pending wins" rule can still drop a
+  # scheduled tick: push run in progress, scheduled tick arrives and goes pending, second push
+  # arrives and evicts the pending scheduled run. The obvious cure is a separate group per
+  # event (`production-monitor-${{ github.event_name }}`), and it is REJECTED: it lets a
+  # scheduled and a push run execute at the same time, and both begin by DELETING every message
+  # in the shared OTP test mailbox before the e2e signup tests read their codes out of it. Two
+  # concurrent runs would eat each other's verification mails and report live products as
+  # broken. A rare dropped tick that the (now three-hour) heartbeat can see beats a
+  # manufactured product alarm nobody can distinguish from a real one.
   cancel-in-progress: false
 
 jobs:
