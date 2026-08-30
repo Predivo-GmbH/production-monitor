@@ -14,7 +14,8 @@
  */
 import assert from 'node:assert'
 import fs2 from 'node:fs'
-import { metricValue, exitDecision, discover } from '../scripts/check-supabase-machine-health.mjs'
+import { spawnSync } from 'node:child_process'
+import { metricValue, exitDecision, discover, blindSignal } from '../scripts/check-supabase-machine-health.mjs'
 
 let passed = 0
 let failed = 0
@@ -166,5 +167,44 @@ check('identical counters between samples must NOT read as 0.00 MB/s OK', () => 
   const guardBeforeMath = src.indexOf('counters did not move') < src.indexOf('const dt = (b.at - a.at)')
   assert.ok(guardBeforeMath, 'the no-movement guard must run BEFORE the rate is computed')
 })
-console.log(`\n${passed} passed, ${failed} failed.`)
-process.exitCode = failed ? 1 : 0
+
+// --- 2026-08-30: the blind path reached nobody, and the tested exit policy had been unwired ---
+// Both regressions come from 986d205, which moved the "we found something" path onto the
+// signals board and left the "we could not look" path behind. See blindSignal()'s comment.
+
+check('blindSignal returns null when every machine was readable', () => {
+  assert.equal(blindSignal([{ product: 'ReplyFlow', level: 'ok' }, { product: 'Valrano', level: 'fail' }]), null,
+    'a readable fleet must not file a blindness row')
+})
+
+check('blindSignal names every blind machine and asks for a human', () => {
+  const row = blindSignal([
+    { product: 'ReplyFlow', level: 'ok' },
+    { product: 'ChannelMover', level: 'unreadable', detail: 'no key configured' },
+    { product: 'YTMigration', level: 'unreadable', detail: 'metrics endpoint returned no usable sample' },
+  ])
+  assert.equal(row.needs_human, true, 'a switched-off watchdog needs a person')
+  assert.equal(row.severity, 'critical')
+  assert.equal(row.key, 'supabase-disk-blind', 'the key must be stable so repeat sightings update one row')
+  assert.match(row.summary, /ChannelMover/)
+  assert.match(row.summary, /YTMigration/, 'every blind machine must be named, not just the first')
+  assert.match(row.summary, /no key configured/, 'the reason must travel with the row')
+})
+
+// This one deliberately runs the REAL CLI in a subprocess. A function-level test is exactly
+// what let the bug through: exitDecision() was green-tested all along while the CLI had
+// stopped calling it, so the wiring — not the policy — is what needs pinning here.
+check('CLI: discovering ZERO machines exits non-zero (the unwired exitDecision guard)', () => {
+  const clean = {}
+  for (const [k, v] of Object.entries(process.env)) {
+    if (!k.endsWith('_SUPABASE_URL') && !k.endsWith('_SERVICE_ROLE_KEY') && !k.endsWith('_SECRET_KEY')) clean[k] = v
+  }
+  const r = spawnSync(process.execPath, ['scripts/check-supabase-machine-health.mjs'],
+    { env: clean, encoding: 'utf-8', timeout: 60_000 })
+  assert.notEqual(r.status, 0, 'a run that checked nothing at all must never read as all-clear')
+  assert.match(String(r.stderr), /no Supabase machines were discovered/,
+    'and it must say WHY it failed, not just exit 1')
+})
+
+console.log(`\n${passed} passed, ${failed} failed`)
+process.exit(failed ? 1 : 0)

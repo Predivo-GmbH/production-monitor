@@ -84,7 +84,10 @@ export async function checkMachines(env = process.env) {
   }
 
   const first = await Promise.all(targets.map((t) => sample(t.ref, t.key).catch(() => null)))
-  await new Promise((r) => setTimeout(r, SAMPLE_GAP_MS))
+  // Only wait out the metrics refresh when there is actually a second sample to take. With zero
+  // targets the gap bought nothing and cost 3 minutes, which also made the no-machines-discovered
+  // guard untestable in practice.
+  if (targets.length) await new Promise((r) => setTimeout(r, SAMPLE_GAP_MS))
   const second = await Promise.all(targets.map((t) => sample(t.ref, t.key).catch(() => null)))
 
   targets.forEach((t, i) => {
@@ -137,6 +140,32 @@ export function exitDecision(findings) {
   return { code: 0, message: null }
 }
 
+/**
+ * The board row for a watchdog that has gone BLIND, as opposed to one that found something.
+ *
+ * 986d205 routed the "we found something" path onto the signals board, because a bare exit(1)
+ * only reds the run and send-alert.mjs reads Playwright's results.json — so the email lists
+ * ZERO failures while the fact appears nowhere a person looks. The `unreadable` path was left
+ * on the old bare-exit route, so the one state that means "this watchdog is switched off for
+ * that product" was also the one state nobody could see. Pure, so it is tested without network.
+ *
+ * This does NOT make blindness green: the caller still exits non-zero afterwards, per the
+ * house rule in fleet-signal.mjs that only a failed READ exits non-zero.
+ */
+export function blindSignal(findings) {
+  const blind = findings.filter((f) => f.level === 'unreadable')
+  if (!blind.length) return null
+  return signal({
+    key: 'supabase-disk-blind',
+    product: 'fleet',
+    severity: 'critical',
+    needsHuman: true,
+    title: `The Supabase disk watchdog is blind for ${blind.length} machine(s)`,
+    summary: `No disk reading could be taken for: ${blind.map((f) => `${f.product} (${f.detail})`).join(', ')}. For these machines nothing is watching disk IO at all, which is the state the fleet was in on 2026-08-29 when only Supabase's own billing email revealed ScoutCopilot burning 7.74 MB/s. A machine going quiet is not a machine behaving.`,
+    detail: { blind: blind.map((f) => ({ product: f.product, detail: f.detail })) },
+  })
+}
+
 if (process.argv[1] && process.argv[1].endsWith('check-supabase-machine-health.mjs')) {
   const findings = await checkMachines()
   for (const f of findings) console.log(`${String(f.level).toUpperCase().padEnd(11)} ${String(f.product).padEnd(20)} ${f.detail}`)
@@ -167,7 +196,35 @@ if (process.argv[1] && process.argv[1].endsWith('check-supabase-machine-health.m
       console.log(`filed to the cockpit signals board: ${f.product}`)
     }
   }
-  // A machine we could not read is not a clean bill of health, and unlike an over-threshold
-  // finding there is nothing to file about it, so this one does red the run.
-  if (blind.length) { console.error(`::error::${blind.length} Supabase machine(s) could not be read — that is not an all-clear`); process.exit(1) }
+  // A machine we could not read is not a clean bill of health, so this one does red the run.
+  // It also files, which the original version did not: "the watchdog is off for this product"
+  // IS a fileable fact, and leaving it on the bare-exit route meant it reached nobody.
+  // Filing never converts it to green, and a board outage while filing must not swallow it.
+  if (blind.length) {
+    const row = blindSignal(findings)
+    if (process.argv.includes('--dry')) {
+      console.log(`[dry] would file: ${row.key} / ${row.severity} / ${row.title}`)
+    } else {
+      try {
+        await fileSignal(boardSecret(), row)
+        console.log(`filed to the cockpit signals board: ${row.key}`)
+      } catch (e) {
+        console.error(`::error::could not file the blind finding to the board: ${e.message}`)
+      }
+    }
+    console.error(`::error::${blind.length} Supabase machine(s) could not be read — that is not an all-clear: ${blind.map((f) => f.product).join(', ')}`)
+    process.exit(1)
+  }
+
+  // exitDecision() owns the "this run learned NOTHING" case and is unit-tested, but 986d205
+  // rewrote this block to compute loud/blind inline and stopped calling it — so the guard it
+  // exists for silently left the product while its test kept passing. If every *_SUPABASE_URL
+  // secret were renamed or dropped, discover() returns [], findings is empty, loud and blind
+  // are both 0, and the run printed "0 machines checked" and exited GREEN: the exact
+  // false all-clear this file was written to prevent. Re-wired to the tested policy.
+  if (!findings.length) {
+    const d = exitDecision(findings)
+    console.error(d.message)
+    process.exit(d.code)
+  }
 }
