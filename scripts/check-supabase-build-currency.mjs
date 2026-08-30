@@ -11,6 +11,8 @@
  * its token as a secret and nothing else.
  */
 
+import { boardSecret, fileSignal, signal } from "./lib/fleet-signal.mjs"
+
 const TOKEN_KEYS = (env) => Object.keys(env).filter((k) => /^SUPABASE_TOKEN_|_SUPABASE_ACCESS_TOKEN$|^SUPABASE_ACCESS_TOKEN$/.test(k))
 
 export async function checkBuildCurrency(env = process.env) {
@@ -46,10 +48,29 @@ export async function checkBuildCurrency(env = process.env) {
 
 if (process.argv[1] && process.argv[1].endsWith('check-supabase-build-currency.mjs')) {
   const findings = await checkBuildCurrency()
-  for (const f of findings) console.log(`${f.level.toUpperCase().padEnd(11)} ${String(f.product).slice(0, 32).padEnd(34)} ${f.detail}`)
+  for (const f of findings) console.log(`${String(f.level).toUpperCase().padEnd(11)} ${String(f.product).slice(0, 32).padEnd(34)} ${f.detail}`)
   const behind = findings.filter((f) => f.level === 'warn' || f.level === 'blocked')
-  console.log(`\n${findings.length} projects checked · ${behind.length} behind the current build`)
-  // Behind-but-eligible is a warning, not a failure: the upgrade needs a maintenance window,
-  // so this must not turn the whole monitor red every hour until someone runs it.
-  if (findings.some((f) => f.level === 'blocked')) process.exit(1)
+  const blind = findings.filter((f) => f.level === 'unreadable')
+  console.log(`${findings.length} projects checked, ${behind.length} behind the current build, ${blind.length} unreadable`)
+
+  // One board row for the whole sweep, not one per project: 19 of 21 were behind on
+  // 2026-08-29 and nineteen separate rows would bury the board rather than inform it.
+  // Filed as a warning with needs_human false, because an upgrade takes a product briefly
+  // offline and is a decision, not something that should ring a phone at 03:00.
+  if (behind.length) {
+    const names = behind.map((f) => f.product).join(', ')
+    await fileSignal(boardSecret(), signal({
+      key: 'supabase-build-currency',
+      product: 'fleet',
+      severity: 'warning',
+      needsHuman: false,
+      title: `${behind.length} Supabase project(s) are running an out-of-date platform version`,
+      summary: `Behind the current Supabase build: ${names}. Supabase never updates these on its own, so every project drifts until someone upgrades it. On 2026-08-29 an out-of-date build (17.6.1.084) was the cause of ScoutCopilot's Disk IO alarm: the machine read 74.1 KB from disk per page fault against 32.3 KB after the free upgrade, and total disk traffic fell to 0.67/7.74 = 8.7 percent of what it was. The upgrade is free and takes about ten minutes per project, but it does take the product offline while it runs, so it is a decision rather than something to automate.`,
+      detail: { behind: behind.map((f) => ({ product: f.product, detail: f.detail })) },
+    }))
+    console.log('filed to the cockpit signals board: supabase-build-currency')
+  }
+  // Behind-but-eligible is now on the board, so it must not also red the run every hour.
+  // A project that cannot be READ, or is behind and NOT eligible to upgrade, needs a human.
+  if (blind.length || findings.some((f) => f.level === 'blocked')) process.exit(1)
 }

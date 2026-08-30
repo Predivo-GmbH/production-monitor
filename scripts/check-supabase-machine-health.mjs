@@ -18,8 +18,10 @@
  * new product is covered without anyone editing this file.
  */
 
-const WARN_MB_S = 2.0   // sustained OS-disk traffic; the quiet fleet sits at 0.06-0.5
-const FAIL_MB_S = 4.0   // ScoutCopilot was 7.74 when Supabase complained
+import { boardSecret, fileSignal, signal } from "./lib/fleet-signal.mjs"
+
+const WARN_MB_S = Number(process.env.DISK_WARN_MB_S || 2.0)   // sustained OS-disk traffic; the quiet fleet sits at 0.06-0.5
+const FAIL_MB_S = Number(process.env.DISK_FAIL_MB_S || 4.0)   // ScoutCopilot was 7.74 when Supabase complained
 const SAMPLE_GAP_MS = 180_000  // Supabase refreshes these counters on its own scrape interval.
                                // At 30s BOTH samples read identical values and every machine
                                // scored a perfect 0.00 MB/s, i.e. a false all-clear across the
@@ -137,13 +139,35 @@ export function exitDecision(findings) {
 
 if (process.argv[1] && process.argv[1].endsWith('check-supabase-machine-health.mjs')) {
   const findings = await checkMachines()
-  for (const f of findings) console.log(`${f.level.toUpperCase().padEnd(10)} ${f.product.padEnd(18)} ${f.detail}`)
-  const bad = findings.filter((f) => f.level === 'fail')
-  const warn = findings.filter((f) => f.level === 'warn')
-  const unreadable = findings.filter((f) => f.level === 'unreadable')
-  console.log(`\n${findings.length} machines checked · ${bad.length} over ${FAIL_MB_S} MB/s · ${warn.length} over ${WARN_MB_S} MB/s · ${unreadable.length} unreadable`)
-  // process.exitCode (not process.exit) so a pending fetch cannot crash the exit.
-  const decision = exitDecision(findings)
-  if (decision.message) console.error(decision.message)
-  process.exitCode = decision.code
+  for (const f of findings) console.log(`${String(f.level).toUpperCase().padEnd(11)} ${String(f.product).padEnd(20)} ${f.detail}`)
+  const loud = findings.filter((f) => f.level === 'fail' || f.level === 'warn')
+  const blind = findings.filter((f) => f.level === 'unreadable')
+  console.log(`${findings.length} machines checked, ${loud.length} over the line, ${blind.length} unreadable`)
+
+  // The finding goes on the board Roger actually opens, not only into a red workflow run.
+  // send-alert.mjs reads Playwright's results.json, so a bare exit(1) here would have sent an
+  // alert email listing ZERO failures while the real fact appeared nowhere a person looks.
+  // Same contract as every neighbouring sensor in monitor.yml: a filed alarm exits 0, and only
+  // a failed READ exits non-zero, so one event is never double-reported.
+  if (loud.length) {
+    const dry = process.argv.includes("--dry")
+    const secret = dry ? null : boardSecret()
+    for (const f of loud) {
+      const row = signal({
+        key: `supabase-disk:${f.product}`,
+        product: f.product,
+        severity: f.level === 'fail' ? 'critical' : 'warning',
+        needsHuman: f.level === 'fail',
+        title: `${f.product} is wearing out its disk allowance`,
+        summary: `${f.product} is moving ${f.mbs} MB/s of disk continuously (${f.detail}). The quiet fleet sits between 0.06 and 1.67 MB/s. ScoutCopilot was at 7.74 MB/s when Supabase emailed a Disk IO warning on 2026-08-29; that time the cause was an out-of-date Supabase platform build and the free upgrade fixed it.`,
+        detail: f,
+      })
+      if (dry) { console.log("[dry] would file: " + row.key + " / " + row.severity + " / " + row.title); continue }
+      await fileSignal(secret, row)
+      console.log(`filed to the cockpit signals board: ${f.product}`)
+    }
+  }
+  // A machine we could not read is not a clean bill of health, and unlike an over-threshold
+  // finding there is nothing to file about it, so this one does red the run.
+  if (blind.length) { console.error(`::error::${blind.length} Supabase machine(s) could not be read — that is not an all-clear`); process.exit(1) }
 }

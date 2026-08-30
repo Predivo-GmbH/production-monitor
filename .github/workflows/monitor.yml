@@ -219,6 +219,7 @@ jobs:
         if: always()
         run: node scripts/check-supabase-machine-health.mjs
         env:
+          BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
           SCOUTCOPILOT_SUPABASE_URL: ${{ secrets.SCOUTCOPILOT_SUPABASE_URL }}
           SCOUTCOPILOT_SERVICE_ROLE_KEY: ${{ secrets.SCOUTCOPILOT_SERVICE_ROLE_KEY }}
           REPLYFLOW_SUPABASE_URL: ${{ secrets.REPLYFLOW_SUPABASE_URL }}
@@ -248,6 +249,7 @@ jobs:
         if: always()
         run: node scripts/check-supabase-build-currency.mjs
         env:
+          BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
           SUPABASE_TOKEN_API: ${{ secrets.SUPABASE_TOKEN_API }}
           SUPABASE_TOKEN_ARIVIOO: ${{ secrets.SUPABASE_TOKEN_ARIVIOO }}
           SUPABASE_TOKEN_BACKOFFICE: ${{ secrets.SUPABASE_TOKEN_BACKOFFICE }}
