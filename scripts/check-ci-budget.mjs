@@ -55,7 +55,7 @@
  * check had never received a single ping.
  */
 import fs from 'node:fs'
-import { giveUpKind } from './lib/ci-budget-giveup.mjs'
+import { makeGh } from './lib/gh-budget-fetch.mjs'
 
 const OWNER = process.env.CI_BUDGET_OWNER || 'Predivo-GmbH'
 const TOKEN = process.env.GH_TOKEN || process.env.GITHUB_TOKEN
@@ -75,72 +75,11 @@ const H = {
   'X-GitHub-Api-Version': '2022-11-28',
   'User-Agent': 'ci-budget-guard',
 }
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
-let apiErrors = 0        // calls that failed for a reason the guard cannot explain
-let rateLimitGiveUps = 0 // calls abandoned because the API hour was empty, which is NOT the same thing
-let quotaResetAt = 0     // when the exhausted hour refills, so the alert can say "re-run after"
-
-// GitHub answers 403 to TWO completely different things: an emptied rate-limit hour, and "this
-// token may not read this repo". Treating them alike cost this guard both ways - a permission
-// failure was slept on for six 180s rounds (18 wasted minutes per call) and then reported as a
-// generic API error, while a genuinely emptied hour was reported as "12 API calls failed", which
-// reads as a broken checker and sent the last investigation looking at the code instead of the
-// quota. Same distinction the CI Runner Watchdog gained in b5aadbf, for the same reason.
-// A 403 is a rate limit ONLY on positive evidence: 429, a Retry-After, or remaining == 0.
-const isRateLimited = (r) =>
-  r.status === 429 ||
-  r.headers.get('retry-after') !== null ||
-  (r.status === 403 && r.headers.get('x-ratelimit-remaining') === '0')
-
-async function gh(url) {
-  // Per-CALL evidence of a rate limit, so the give-up attribution below cannot be tainted by some
-  // OTHER call earlier in the sweep. quotaResetAt (the refill time) stays run-wide; only WHY this
-  // particular call gave up is local to this call.
-  let sawRateLimit = false
-  for (let attempt = 0; attempt < 6; attempt++) {
-    let r
-    try {
-      r = await fetch(url, { headers: H })
-    } catch {
-      await sleep(2000)
-      continue
-    }
-    if (r.status === 403 || r.status === 429) {
-      if (!isRateLimited(r)) {
-        // Not a quota problem: sleeping cannot fix it and retrying only burns wall clock.
-        apiErrors++
-        console.error(`  forbidden (not rate limited): ${url}`)
-        return null
-      }
-      const retryAfter = Number(r.headers.get('retry-after') || 0) * 1000
-      const reset = Number(r.headers.get('x-ratelimit-reset') || 0) * 1000
-      sawRateLimit = true
-      if (reset > quotaResetAt) quotaResetAt = reset
-      const need = retryAfter || (reset ? reset - Date.now() + 3000 : 0)
-      // The cap stays: the job's own timeout-minutes is 60, so sleeping out a full hour would be
-      // killed mid-sleep and report nothing at all. Give up instead, and say WHY below.
-      const wait = Math.min(Math.max(5000, need), 180000)
-      console.error(`  rate limited, waiting ${Math.round(wait / 1000)}s`)
-      await sleep(wait)
-      continue
-    }
-    if (r.status === 404) return null
-    if (!r.ok) {
-      if (r.status >= 500) {
-        await sleep(2000)
-        continue
-      }
-      apiErrors++
-      return null
-    }
-    return r.json()
-  }
-  // Ran out of attempts. Attribute it to whichever cause THIS call actually observed - not to a
-  // run-global that any earlier rate-limited call would have set (see lib/ci-budget-giveup.mjs).
-  if (giveUpKind(sawRateLimit) === 'ratelimit') rateLimitGiveUps++
-  else apiErrors++
-  return null
-}
+// The retry-and-attribution loop lives in lib/gh-budget-fetch.mjs so a test can drive the exact
+// give-up attribution with a stubbed fetch (see test/ci-budget-giveup.test.mjs). stats carries the
+// three run-wide counters the loop mutates; the rest of this file reads them after the sweep.
+const stats = { apiErrors: 0, rateLimitGiveUps: 0, quotaResetAt: 0 }
+const gh = makeGh({ headers: H, stats })
 
 // FULL timestamp, not .slice(0,10). A date-only `created>=` boundary includes the whole of that
 // calendar day, so a "2 day" window actually spanned 3 days and the `x 30 / WINDOW_DAYS`
@@ -322,18 +261,18 @@ if (totalRuns < MIN_RUNS_EXPECTED) {
     `HARNESS: only ${totalRuns} runs found in ${WINDOW_DAYS} days (expected at least ${MIN_RUNS_EXPECTED}). Treating this as a broken checker, not a quiet fleet.`,
   )
 }
-if (apiErrors > 0) {
+if (stats.apiErrors > 0) {
   failures.push(
-    `HARNESS: ${apiErrors} API calls failed, so the figures below are incomplete and this run cannot certify anything.`,
+    `HARNESS: ${stats.apiErrors} API calls failed, so the figures below are incomplete and this run cannot certify anything.`,
   )
 }
 // Separate line, separate wording: an empty API hour is a scheduling problem with a known
 // remedy (wait for the refill), not evidence that the fleet or the checker is broken. Saying
 // "N API calls failed" for this sent the 2026-08-29 investigation into the code for nothing.
-if (rateLimitGiveUps > 0) {
-  const when = quotaResetAt ? new Date(quotaResetAt).toISOString().replace(/\.\d+Z$/, 'Z') : 'unknown'
+if (stats.rateLimitGiveUps > 0) {
+  const when = stats.quotaResetAt ? new Date(stats.quotaResetAt).toISOString().replace(/\.\d+Z$/, 'Z') : 'unknown'
   failures.push(
-    `HARNESS: the GitHub API hour ran out and ${rateLimitGiveUps} calls were abandoned, so the figures below are incomplete and this run cannot certify anything. This is a quota problem, not a broken fleet: a full sweep needs roughly 2400 calls against a 5000/hour limit, so back-to-back manual re-runs exhaust it. Quota refills at ${when}; re-run after that.`,
+    `HARNESS: the GitHub API hour ran out and ${stats.rateLimitGiveUps} calls were abandoned, so the figures below are incomplete and this run cannot certify anything. This is a quota problem, not a broken fleet: a full sweep needs roughly 2400 calls against a 5000/hour limit, so back-to-back manual re-runs exhaust it. Quota refills at ${when}; re-run after that.`,
   )
 }
 
