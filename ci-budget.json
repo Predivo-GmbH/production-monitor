@@ -202,6 +202,16 @@
           "ceiling_min_per_run": 52,
           "runs_in_window": 7
         }
+      },
+      "Alert-channel fire drill": {
+        "drill": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 6,
+          "billed_runs_in_window": 0,
+          "_note": "runs only on self-hosted runners in this window, so this ceiling is not a cost ceiling"
+        }
       }
     },
     "BoatBuddy": {
@@ -404,6 +414,15 @@
           "ceiling_min_per_run": 4,
           "runs_in_window": 3
         }
+      },
+      "Edge Functions Check": {
+        "typecheck": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 14,
+          "billed_runs_in_window": 3
+        }
       }
     },
     "claude-memory": {
@@ -542,6 +561,26 @@
           "ceiling_min_per_run": 3,
           "runs_in_window": 1
         }
+      },
+      "Security Review": {
+        "security-review": {
+          "median": 3,
+          "p90": 6,
+          "ceiling_min_per_run": 12,
+          "runs_in_window": 8,
+          "billed_runs_in_window": 0,
+          "_note": "runs only on self-hosted runners in this window, so this ceiling is not a cost ceiling"
+        }
+      },
+      "Code Review": {
+        "code-review": {
+          "median": 3,
+          "p90": 8,
+          "ceiling_min_per_run": 16,
+          "runs_in_window": 7,
+          "billed_runs_in_window": 0,
+          "_note": "runs only on self-hosted runners in this window, so this ceiling is not a cost ceiling"
+        }
       }
     },
     "distribution-os": {
@@ -603,6 +642,16 @@
           "p90": 1,
           "ceiling_min_per_run": 3,
           "runs_in_window": 7
+        }
+      },
+      "PROVE gate-security (temporary)": {
+        "gate-security": {
+          "median": 1,
+          "p90": 1,
+          "ceiling_min_per_run": 3,
+          "runs_in_window": 1,
+          "billed_runs_in_window": 0,
+          "_note": "runs only on self-hosted runners in this window, so this ceiling is not a cost ceiling"
         }
       }
     },
@@ -741,6 +790,36 @@
           "p90": 2,
           "ceiling_min_per_run": 4,
           "runs_in_window": 7
+        }
+      },
+      "Security Review": {
+        "security-review": {
+          "median": 3,
+          "p90": 5,
+          "ceiling_min_per_run": 10,
+          "runs_in_window": 12,
+          "billed_runs_in_window": 0,
+          "_note": "runs only on self-hosted runners in this window, so this ceiling is not a cost ceiling"
+        }
+      },
+      "Code Review": {
+        "code-review": {
+          "median": 1,
+          "p90": 4,
+          "ceiling_min_per_run": 8,
+          "runs_in_window": 13,
+          "billed_runs_in_window": 0,
+          "_note": "runs only on self-hosted runners in this window, so this ceiling is not a cost ceiling"
+        }
+      },
+      "Design Review": {
+        "design-review": {
+          "median": 3,
+          "p90": 3,
+          "ceiling_min_per_run": 6,
+          "runs_in_window": 3,
+          "billed_runs_in_window": 0,
+          "_note": "runs only on self-hosted runners in this window, so this ceiling is not a cost ceiling"
         }
       }
     },
@@ -926,6 +1005,16 @@
           "ceiling_min_per_run": 3,
           "runs_in_window": 1
         }
+      },
+      "TEMP gate proof (no deploy)": {
+        "gate-proof": {
+          "median": 1,
+          "p90": 6,
+          "ceiling_min_per_run": 12,
+          "runs_in_window": 3,
+          "billed_runs_in_window": 0,
+          "_note": "runs only on self-hosted runners in this window, so this ceiling is not a cost ceiling"
+        }
       }
     },
     "ScoutCopilot": {
@@ -973,6 +1062,26 @@
           "p90": 3,
           "ceiling_min_per_run": 6,
           "runs_in_window": 15
+        }
+      },
+      "Security Review": {
+        "security-review": {
+          "median": 3,
+          "p90": 4,
+          "ceiling_min_per_run": 8,
+          "runs_in_window": 8,
+          "billed_runs_in_window": 0,
+          "_note": "runs only on self-hosted runners in this window, so this ceiling is not a cost ceiling"
+        }
+      },
+      "Code Review": {
+        "code-review": {
+          "median": 4,
+          "p90": 5,
+          "ceiling_min_per_run": 10,
+          "runs_in_window": 8,
+          "billed_runs_in_window": 0,
+          "_note": "runs only on self-hosted runners in this window, so this ceiling is not a cost ceiling"
         }
       }
     },
@@ -1065,6 +1174,26 @@
           "p90": 5,
           "ceiling_min_per_run": 10,
           "runs_in_window": 7
+        }
+      },
+      "Security Review": {
+        "security-review": {
+          "median": 3,
+          "p90": 4,
+          "ceiling_min_per_run": 8,
+          "runs_in_window": 10,
+          "billed_runs_in_window": 0,
+          "_note": "runs only on self-hosted runners in this window, so this ceiling is not a cost ceiling"
+        }
+      },
+      "Code Review": {
+        "code-review": {
+          "median": 3,
+          "p90": 5,
+          "ceiling_min_per_run": 10,
+          "runs_in_window": 9,
+          "billed_runs_in_window": 0,
+          "_note": "runs only on self-hosted runners in this window, so this ceiling is not a cost ceiling"
         }
       }
     },
