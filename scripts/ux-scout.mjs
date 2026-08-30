@@ -51,6 +51,18 @@ const LIVE = process.env.UX_SCOUT_LIVE === '1'
 const DISABLED = process.env.UX_SCOUT_DISABLED === '1'
 const WINDOW_DAYS = Number(process.env.UX_SCOUT_WINDOW_DAYS || 7)
 
+// -- the one launcher every automation goes through (docs/CONTRACT-agent-run-2026-08-30.md) --
+// The scout no longer spawns `claude` itself: agent-run reads the cockpit's automation switches,
+// strips the Anthropic env, picks the engine and enforces the wall-clock cap.
+// ABSOLUTE path on purpose: this repo and Cockpit sit at the SAME absolute paths on the desktop
+// and on the laptop; a path derived from cwd or $HOME is what would differ between the machines.
+const AGENT_RUN = 'C:/Business/Internal Projects/Cockpit/scripts/agent-run.mjs'
+const AGENT_RUN_JOB = 'ux-scout'
+// Exit 76 = Roger switched the automations off in the cockpit. A deliberate off, never a failure
+// (contract section 7): one log line, no [ALERT] mail, nothing written, nothing emailed, exit 0.
+const SWITCHED_OFF_EXIT = 76
+let switchedOff = false
+
 /**
  * The signal sources. Each entry says which repo to resolve the PROD ref from, and how to
  * turn that product's own failure table into (pattern, count, distinct_users, authenticated).
@@ -399,11 +411,12 @@ function narrate(product, rows) {
   // row. Fixing one bug armed another.
   //
   // No shell. Explicit binary, args array, exactly the pattern board-drainer.mjs already uses.
-  const CLAUDE_BIN = process.platform === 'win32' ? 'claude.exe' : 'claude'
+  // process.execPath is the node already running this file, so nothing hard-codes a node path;
+  // everything after `--` is the engine's own argv, unchanged - including --disallowedTools.
   // This call only narrates findings and asks for no tools, but it is still an autonomous
   // spawn of the CLI, so it carries the same deny list as every other dispatcher. One
   // invariant with no exceptions is what deploy-deny-tools.test.mjs can actually enforce.
-  const res = spawnSync(CLAUDE_BIN, ['-p', prompt, '--disallowedTools', DEPLOY_DENY_TOOLS.join(',')], {
+  const res = spawnSync(process.execPath, [AGENT_RUN, '--job', AGENT_RUN_JOB, '--', '-p', prompt, '--disallowedTools', DEPLOY_DENY_TOOLS.join(',')], {
     encoding: 'utf-8', timeout: 5 * 60 * 1000,
     // ALWAYS the subscription CLI, never a metered key. Roger's standing rule, 2026-08-29: the
     // API key is only for work a customer triggers inside a product. This spawn inherited the
@@ -416,6 +429,13 @@ function narrate(product, rows) {
       return e
     })(),
   })
+  // spawnSync does NOT throw on a non-zero exit; the code is on res.status. 76 is not a failed
+  // narration - it is the cockpit switch being off, which stops the whole scout run below.
+  if (res.status === SWITCHED_OFF_EXIT) {
+    switchedOff = true
+    log('  automations are switched off in the cockpit - UX Scout run skipped (a deliberate off, not a failure)')
+    return {}
+  }
   if (res.status !== 0 || !res.stdout) {
     log(`  narration unavailable (${res.error?.message || `exit ${res.status}`}); reporting without it`)
     return {}
@@ -612,7 +632,15 @@ async function main() {
   for (const f of findings) {
     if (!f.authenticated.length) continue
     const map = narrate(f.product, f.authenticated)
+    if (switchedOff) break
     for (const r of f.authenticated) r.narrative = map[r.message_pattern] || null
+  }
+
+  // A deliberate off ends the run HERE: before the Measured pass, before a single scout_report is
+  // written and before the digest is emailed. Returning normally means exit 0 and no [ALERT].
+  if (switchedOff) {
+    log('UX Scout stopped: the automations are switched off in the cockpit. Nothing written, nothing emailed.')
+    return
   }
 
   // Measured pass: re-check every signal whose fix is old enough to judge. Runs before the

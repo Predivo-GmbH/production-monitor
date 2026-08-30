@@ -100,6 +100,19 @@ const NON_BROWSER_UA = 'board-drainer/1.0'   // sb_secret keys are 403'd under a
 const LIVE = process.env.BOARD_DRAINER_LIVE === '1'
 const FIXTURE = process.env.BOARD_DRAINER_FIXTURE || null
 
+// -- the one launcher every automation goes through (docs/CONTRACT-agent-run-2026-08-30.md) --
+// The drainer no longer spawns `claude` itself: agent-run reads the cockpit's automation
+// switches, strips the Anthropic env, picks the engine and enforces the wall-clock cap.
+// ABSOLUTE path on purpose: this repo and Cockpit sit at the SAME absolute paths on the desktop
+// and on the laptop, so an absolute path is the portable one; a path derived from cwd or $HOME
+// is what would differ between the two machines.
+const AGENT_RUN = 'C:/Business/Internal Projects/Cockpit/scripts/agent-run.mjs'
+const AGENT_RUN_JOB = 'board-drainer'
+// Exit 76 = Roger switched the automations off in the cockpit. A deliberate off, never a failure
+// (contract section 7): no [ALERT] mail, no failure written back to the board, no ping, exit 0.
+const SWITCHED_OFF_EXIT = 76
+let switchedOff = false
+
 // ── logging ─────────────────────────────────────────────────────────────────────────────
 function log(msg) {
   const line = `[${new Date().toISOString()}] ${msg}`
@@ -1420,8 +1433,10 @@ function dispatchAgent(inc, mode) {
   let policy = SYSTEM_POLICY
   if (mode === 'verify') policy += VERIFY_NOTE
   if (!LIVE) policy += DRY_NOTE
-  const CLAUDE_BIN = process.platform === 'win32' ? 'claude.exe' : 'claude'
+  // process.execPath is the node already running this file, so nothing hard-codes a node path;
+  // everything after `--` is the engine's own argv, unchanged.
   const args = [
+    AGENT_RUN, '--job', AGENT_RUN_JOB, '--',
     '-p', buildUserPrompt(inc),
     '--append-system-prompt', policy,
     ...agentToolFlags(allowedTools),
@@ -1430,7 +1445,7 @@ function dispatchAgent(inc, mode) {
     '--output-format', 'json',
   ]
   try {
-    execFileSync(CLAUDE_BIN, args, {
+    execFileSync(process.execPath, args, {
       stdio: ['ignore', 'inherit', 'inherit'],
       timeout: AGENT_TIMEOUT_MS,
       maxBuffer: 64 * 1024 * 1024,
@@ -1446,6 +1461,13 @@ function dispatchAgent(inc, mode) {
       })(),
     })
   } catch (e) {
+    // execFileSync THROWS on a non-zero exit; the code is on err.status. 76 is not an error at
+    // all: the cockpit switch is off, so nothing was spawned. Return the sentinel and let the
+    // caller stop the run - do NOT fall through to the timeout bookkeeping below.
+    if (e?.status === SWITCHED_OFF_EXIT) {
+      log('  automations are switched off in the cockpit - no agent dispatched (a deliberate off, not a failure)')
+      return AGENT_SWITCHED_OFF
+    }
     log(`  agent errored/timed out: ${(e.message || '').split('\n')[0]}`)
     timedOut = true
   }
@@ -1509,6 +1531,11 @@ export function stuckWhoMustAct(whoMustAct) {
  *  execFileSync timeout or a spawn failure. Distinct from `null`, which means the agent RAN and
  *  chose to say nothing. */
 export const AGENT_TIMED_OUT = Symbol.for('board-drainer.agent-timed-out')
+
+/** Returned by dispatchAgent when agent-run exited 76: Roger has switched the automations off in
+ *  the cockpit. Nothing ran, so this is neither a timeout nor a failed attempt - the run stops
+ *  where it is, charges nobody an attempt, alarms nothing, and ends at exit 0. */
+export const AGENT_SWITCHED_OFF = Symbol.for('board-drainer.automations-switched-off')
 
 /**
  * Should a timed-out dispatch cost the item one of its MAX_ATTEMPTS tries?
@@ -1941,11 +1968,30 @@ async function main() {
       // Counted at DISPATCH, not at success: the alarm asks whether the loop is moving, and a
       // dispatch that fails is still a loop that moved. Persisted, because the run that
       // dispatches nothing is the one whose "when did we last move" has to survive.
+      const lastDispatchBefore = state.lastDispatchAt || null
       runStats.dispatched += 1
       runStats.last_dispatch_at = new Date().toISOString()
       state.lastDispatchAt = runStats.last_dispatch_at
       saveState(state)
       const verdict = dispatchAgent(inc, cls.mode)
+      // Handled FIRST: the cockpit switch is off, so no agent ran. Undo the dispatch we counted
+      // optimistically above (a count must name what actually happened), leave the attempt
+      // counters and the board untouched, and stop - the switch is fleet-wide, so the remaining
+      // items would only re-learn the same thing.
+      if (verdict === AGENT_SWITCHED_OFF) {
+        runStats.dispatched -= 1
+        runStats.last_dispatch_at = lastDispatchBefore
+        state.lastDispatchAt = lastDispatchBefore
+        // The heartbeat's own vocabulary for 'this run did not work the board, on purpose':
+        // check-drainer-progress.mjs reads runStats.skipped and reports it as switched-off
+        // rather than as a stalled fixer. Without it, dispatchable>0 with dispatched=0 would
+        // read as a red stall - a deliberate off must never look like a failure.
+        runStats.skipped = 'automations switched off in the cockpit (agent-run exit 76)'
+        switchedOff = true
+        saveState(state)
+        log(`  ${inc.key}: not dispatched - automations are switched off in the cockpit. Nothing recorded; it is picked up when they are switched back on.`)
+        break
+      }
       // A TIMEOUT is infrastructure, not a failed diagnosis. Note that AGENT_TIMED_OUT is a
       // Symbol and therefore TRUTHY, so this must be tested BEFORE the `!verdict` branch below
       // or it would be handed to verdictToUpsert() as if it were a real verdict.
@@ -2036,7 +2082,8 @@ if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
   main().then(
     async () => {
       await writeRunHeartbeat(null)
-      const hc = process.env.BOARD_DRAINER_HC; if (hc) fetch(hc).catch(() => {})
+      // Contract section 7: on a deliberate off the caller pings NOTHING - not success, not /fail.
+      const hc = process.env.BOARD_DRAINER_HC; if (hc && !switchedOff) fetch(hc).catch(() => {})
     },
     async (e) => {
       console.error(e)

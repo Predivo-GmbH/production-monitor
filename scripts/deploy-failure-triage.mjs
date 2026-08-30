@@ -77,6 +77,21 @@ const MODEL = 'claude-opus-4-8'
 const MAX_TURNS = 60
 const AGENT_TIMEOUT_MS = 18 * 60 * 1000
 
+// -- the one launcher every automation goes through (docs/CONTRACT-agent-run-2026-08-30.md) --
+// Triage no longer spawns `claude` itself: agent-run strips the Anthropic env, picks the engine
+// and enforces the wall-clock cap. Deploy Triage is one of the THREE WATCHERS, so it is declared
+// --exempt: it keeps running when Roger switches the automations off, and it always runs on
+// Claude. The flag is checked against the shim's own job table, so it cannot grant itself that.
+// ABSOLUTE path on purpose: this repo and Cockpit sit at the SAME absolute paths on the desktop
+// and on the laptop; a path derived from cwd or $HOME is what would differ between the machines.
+const AGENT_RUN = 'C:/Business/Internal Projects/Cockpit/scripts/agent-run.mjs'
+const AGENT_RUN_JOB = 'deploy-triage'
+// Exit 76 = switched off in the cockpit. Being exempt, this job should never SEE 76 - but an
+// exemption that is only true by assumption is not a guarantee, so it is handled: one log line,
+// no alert mail, no verdict written, no dedup record, no healthcheck ping, exit 0 (contract s7).
+const SWITCHED_OFF_EXIT = 76
+let switchedOff = false
+
 function sh(cmd, opts = {}) {
   return execSync(cmd, { encoding: 'utf-8', timeout: opts.timeout || 30_000, cwd: opts.cwd, stdio: opts.inherit ? 'inherit' : 'pipe' })?.toString() ?? ''
 }
@@ -250,8 +265,10 @@ function runAgent(c, workdir, dryRun) {
   const DRY_NOTE = '\n\n⚠️ DRY RUN: Do NOT branch, commit, push, edit, or open PRs — investigate read-only and write ONLY triage-verdict.json. In "action", describe what you WOULD do, prefixed "[DRY-RUN would] ".'
   const policy = (dryRun ? SYSTEM_POLICY + DRY_NOTE : SYSTEM_POLICY) + DEPLOY_DENY_POLICY_NOTE
 
-  const CLAUDE_BIN = process.platform === 'win32' ? 'claude.exe' : 'claude'
+  // process.execPath is the node already running this file, so nothing hard-codes a node path;
+  // everything after `--` is the engine's own argv, unchanged.
   const args = [
+    AGENT_RUN, '--job', AGENT_RUN_JOB, '--exempt', '--',
     '-p', buildUserPrompt(c, workdir),
     '--append-system-prompt', policy,
     ...agentToolFlags(allowedTools),
@@ -269,7 +286,7 @@ function runAgent(c, workdir, dryRun) {
   delete agentEnv.ANTHROPIC_AUTH_TOKEN
   delete agentEnv.ANTHROPIC_BASE_URL
   try {
-    execFileSync(CLAUDE_BIN, args, {
+    execFileSync(process.execPath, args, {
       cwd: workdir,
       stdio: ['ignore', 'inherit', 'inherit'],
       timeout: AGENT_TIMEOUT_MS,
@@ -277,6 +294,12 @@ function runAgent(c, workdir, dryRun) {
       env: agentEnv,
     })
   } catch (e) {
+    // execFileSync THROWS on a non-zero exit; the code is on err.status.
+    if (e?.status === SWITCHED_OFF_EXIT) {
+      switchedOff = true
+      log('  automations are switched off in the cockpit - deploy triage skipped (a deliberate off, not a failure). Deploy Triage is exempt, so seeing this means the exemption is not holding.')
+      return []
+    }
     log(`  agent errored/timed out for ${c.name}: ${e.message?.split('\n')[0]}`)
   }
 
@@ -354,6 +377,14 @@ async function main() {
     if (!workdir) { log(`  ${c.name}: clone unavailable — skipping this tick (will retry)`); continue }
 
     const verdicts = runAgent(c, workdir, dryRun)
+    // Handled FIRST, BEFORE the dedup record below: nothing ran, so this failed deploy must not
+    // be marked handled (that would hide it forever) and must not become an UNKNOWN/escalate
+    // diagnosis in the alert mail. Any verdicts already gathered from EARLIER candidates are real
+    // work and are still emailed after the loop.
+    if (switchedOff) {
+      log(`  ${c.name}: not diagnosed - automations are switched off in the cockpit. Nothing recorded; it is picked up when they are switched back on.`)
+      break
+    }
 
     // Record so we don't re-diagnose the same broken commit next tick (even on agent error — a fix
     // PR, once open, will be picked up by hasOpenAgentPr; a failed diagnosis shouldn't loop forever).
@@ -662,6 +693,6 @@ async function sendPromoEmail(items, { mode = 'alert' } = {}) {
 // Heartbeat (2026-08-10 reliability plan): success ping / fail signal to healthchecks.io.
 const HC = pingUrl('deploytriage-localrunner')
 Promise.resolve().then(main).then(
-  () => (HC ? fetch(HC).catch(() => {}) : undefined),
+  () => (HC && !switchedOff ? fetch(HC).catch(() => {}) : undefined),   // contract s7: a deliberate off pings NOTHING
   (e) => Promise.resolve(HC ? fetch(`${HC}/fail`).catch(() => {}) : null).then(() => { console.error(e); process.exitCode = 1 }),
 )

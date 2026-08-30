@@ -192,12 +192,26 @@ function main() {
   const DRY_NOTE = '\n\n⚠️ DRY RUN: Do NOT commit, push, edit files, or open PRs — investigate read-only and write ONLY triage-verdict.json. In each verdict\'s "action" field, describe what you WOULD have done, prefixed "[DRY-RUN would] ".'
   const policy = (dryRun ? SYSTEM_POLICY + DRY_NOTE : SYSTEM_POLICY) + DEPLOY_DENY_POLICY_NOTE
 
+  // Exit 76 = switched off in the cockpit. Declared OUT here on purpose: inside the `try` it is
+  // not in scope in the `catch` that reads it, and a ReferenceError there would turn a
+  // deliberate off into a crash - the loudest possible way to fail at being quiet.
+  const SWITCHED_OFF = 76
   try {
     // Headless Claude Code via execFileSync (args ARRAY, no shell) — passing the multi-line
     // system prompt through a shell string mangles it on Windows (cmd/PowerShell parse the policy
     // text as commands). execFileSync avoids all quoting on both Linux (cloud) and Windows (local).
-    const CLAUDE_BIN = process.platform === 'win32' ? 'claude.exe' : 'claude'
+    // 2026-08-30: THROUGH THE SHIM, NOT STRAIGHT TO CLAUDE. Every automation launches via
+    // Cockpit/scripts/agent-run.mjs, which reads Roger's on/off and Claude-or-Kimi switches and
+    // translates the flags. Contract: Cockpit/docs/CONTRACT-agent-run-2026-08-30.md.
+    //
+    // THIS FILE WAS MISSED BY THE ORIGINAL SWEEP AND IT IS THE MAIN PATH FOR THIS JOB. The sweep
+    // found local-triage-runner.mjs, which is what the scheduled task starts, and converted the
+    // guard spawn there - but that runner shells out to THIS script, which does the real work and
+    // had its own spawn. A job can have more than one door, and converting the one you found first
+    // leaves the other wide open: Agent Triage would have carried a switch that did nothing.
+    const AGENT_RUN = 'C:/Business/Internal Projects/Cockpit/scripts/agent-run.mjs'
     const args = [
+      AGENT_RUN, '--job', 'agent-triage', '--',
       '-p', userPrompt,
       '--append-system-prompt', policy,
       ...agentToolFlags(allowedTools),
@@ -205,7 +219,7 @@ function main() {
       '--model', MODEL,
       '--output-format', 'json',
     ]
-    execFileSync(CLAUDE_BIN, args, {
+    execFileSync(process.execPath, args, {
       stdio: ['ignore', 'inherit', 'inherit'], // ignore stdin: prompt comes via -p, avoids a 3s "no stdin" wait
       timeout: AGENT_TIMEOUT_MS,
       maxBuffer: 64 * 1024 * 1024,
@@ -221,7 +235,14 @@ function main() {
       })(),
     })
   } catch (e) {
-    console.error('agent-triage: Claude run errored/timed out:', e.message?.split('\n')[0])
+    // A DELIBERATE OFF IS NOT AN ERROR, and must not be logged as one. Checked FIRST, because
+    // everything below treats a non-zero exit as a fault and would file this as "Claude run
+    // errored" - a false failure of exactly the kind this fleet exists to catch.
+    if (e && e.status === SWITCHED_OFF) {
+      console.log('agent-triage: the automations are switched off in the cockpit, so no agent was run. This is deliberate and not a failure.')
+      return
+    }
+    console.error('agent-triage: agent run errored/timed out:', e.message?.split('\n')[0])
   }
 
   // Fold the agent's verdict into the alert payload.

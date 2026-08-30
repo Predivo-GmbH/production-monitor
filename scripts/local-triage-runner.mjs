@@ -36,6 +36,19 @@ const STATE = join(BASE, 'state.json')
 const LOG = join(BASE, 'runner.log')
 const DRY = process.env.LOCAL_TRIAGE_DRY_RUN === '1'
 
+// -- the one launcher every automation goes through (docs/CONTRACT-agent-run-2026-08-30.md) --
+// Nothing here spawns `claude` directly any more. agent-run reads the cockpit's automation
+// switches, strips the Anthropic env, picks the engine and enforces the wall-clock cap.
+// ABSOLUTE path on purpose: this repo and Cockpit sit at the SAME absolute paths on the desktop
+// and on the laptop, so an absolute path is the portable one here; a path derived from cwd or
+// from $HOME is the thing that would differ between the two machines.
+const AGENT_RUN = 'C:/Business/Internal Projects/Cockpit/scripts/agent-run.mjs'
+const AGENT_RUN_JOB = 'agent-triage'
+// Exit 76 = Roger switched the automations off in the cockpit. A deliberate off, never a failure
+// (contract section 7): log one line, no alert, no failure outcome, no healthcheck ping, exit 0.
+const SWITCHED_OFF_EXIT = 76
+let switchedOff = false
+
 function sh(cmd, opts = {}) {
   const out = execSync(cmd, {
     encoding: 'utf-8',
@@ -160,7 +173,10 @@ function triageOneGuard(state, wf, run) {
   delete env.ANTHROPIC_API_KEY // force the LOCAL subscription CLI, never a metered key
   try {
     // execFileSync with an args ARRAY (no shell) — see agent-triage.mjs for why (Windows quoting).
-    execFileSync(process.platform === 'win32' ? 'claude.exe' : 'claude', [
+    // process.execPath is the node already running this file, so the runner never hard-codes a
+    // node path; everything after `--` is the engine's own argv, unchanged.
+    execFileSync(process.execPath, [
+      AGENT_RUN, '--job', AGENT_RUN_JOB, '--',
       '-p', prompt,
       '--append-system-prompt', policy,
       ...agentToolFlags(allowedTools),
@@ -168,7 +184,15 @@ function triageOneGuard(state, wf, run) {
       '--model', 'claude-opus-4-8',
       '--output-format', 'json',
     ], { stdio: ['ignore', 'inherit', 'inherit'], timeout: 10 * 60_000, maxBuffer: 64 * 1024 * 1024, cwd: WORKDIR, env })
-  } catch (e) { log(`guard-triage agent errored/timed out: ${e.message.split('\n')[0]}`) }
+  } catch (e) {
+    // execFileSync THROWS on a non-zero exit; the code is on err.status.
+    if (e?.status === SWITCHED_OFF_EXIT) {
+      switchedOff = true
+      log('automations are switched off in the cockpit - guard triage skipped (a deliberate off, not a failure)')
+      return   // BEFORE the handledGuards write below: a guard run nothing looked at is not handled
+    }
+    log(`guard-triage agent errored/timed out: ${e.message.split('\n')[0]}`)
+  }
   if (!state.handledGuards) state.handledGuards = {}
   state.handledGuards[wf] = run.databaseId
   saveState(state)
@@ -185,6 +209,7 @@ function triageGuards(state) {
     if (!run || run.status !== 'completed' || run.conclusion !== 'failure') continue
     if (state.handledGuards?.[wf] === run.databaseId) { log(`[guard ${wf}] run #${run.databaseId} already triaged — skip`); continue }
     triageOneGuard(state, wf, run)
+    if (switchedOff) return   // the switch is fleet-wide; the other guards would only re-learn it
   }
 }
 
@@ -198,6 +223,6 @@ function main() {
 // Heartbeat (2026-08-10 reliability plan): success ping / fail signal to healthchecks.io.
 const HC = pingUrl('agenttriage-localrunner')
 Promise.resolve().then(main).then(
-  () => (HC ? fetch(HC).catch(() => {}) : undefined),
+  () => (HC && !switchedOff ? fetch(HC).catch(() => {}) : undefined),
   (e) => Promise.resolve(HC ? fetch(`${HC}/fail`).catch(() => {}) : null).then(() => { console.error(e); process.exitCode = 1 }),
 )

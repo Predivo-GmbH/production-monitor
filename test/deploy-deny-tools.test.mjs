@@ -47,13 +47,30 @@ t('the agent is TOLD the rule as well as blocked by it', () => {
 })
 
 // ── The property that survives the next script somebody adds ──────────────────
+// UPDATED 2026-08-30 — the dispatchers no longer name `claude` at all.
+// Every automation now launches through one shim, Cockpit/scripts/agent-run.mjs, which reads
+// Roger's on/off and Claude-or-Kimi switches. The old detector looked for the literal string
+// `claude` / `CLAUDE_BIN`, so the moment the dispatchers were converted it found 2 instead of 5 -
+// and one of those two was a false positive (`owner: 'claude'`). The assertion went red, which is
+// the detector doing its job: IT NOTICED THE SHAPE CHANGED RATHER THAN QUIETLY COVERING NOTHING.
+// Had it been written loosely enough to keep passing, the deny-list invariant would have stopped
+// covering four dispatchers with no signal at all - the exact silent-coverage-loss this file exists
+// to prevent. So it is taught the new shape rather than relaxed.
+const LAUNCHES_AN_AGENT = [
+  /agent-run\.mjs/,                 // the shim - the shape every dispatcher uses from 2026-08-30
+  /['"]claude(\.exe)?['"]\s*[,)]/,  // a direct spawn: the argument position, not the word anywhere
+  /CLAUDE_BIN/,
+]
 const spawners = readdirSync(SCRIPTS)
   .filter((f) => f.endsWith('.mjs'))
   .map((f) => ({ f, src: readFileSync(join(SCRIPTS, f), 'utf-8') }))
-  .filter((s) => /['"]claude(\.exe)?['"]/.test(s.src) || /CLAUDE_BIN/.test(s.src))
+  .filter((s) => LAUNCHES_AN_AGENT.some((re) => re.test(s.src)))
 
-t('every script that spawns the Claude CLI was found (a rename must not empty this list)', () => {
-  assert.ok(spawners.length >= 5, `expected at least 5 spawners, found ${spawners.length}`)
+t('every script that spawns an agent was found (a rename or a shim must not empty this list)', () => {
+  // Five is the floor because five is what the fleet has: board-drainer, deploy-failure-triage,
+  // ux-scout, agent-triage and local-triage-runner. A number that only ever goes up is not a
+  // constraint; this one is here so that a refactor which hides a dispatcher fails loudly.
+  assert.ok(spawners.length >= 5, `expected at least 5 spawners, found ${spawners.length}: ${spawners.map((s) => s.f).join(', ')}`)
 })
 
 for (const { f, src } of spawners) {
