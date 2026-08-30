@@ -119,3 +119,108 @@ at 0.06 MB/s, and withdrawn before anything was bought.
 - `sessions_timebox` and `sessions_inactivity_timeout` are `0` on every project read, so no
   login on any product ever expires. Turning that on changes how long real customers stay
   signed in, so it is Roger's decision, not an engineering default.
+
+
+---
+
+# Closing record, 2026-08-30
+
+Roger signed this off with "you can consider it the task is done". Everything below was
+measured, not assumed, and every number has its arithmetic or its source next to it.
+
+## 1. The cause, in one paragraph
+
+ScoutCopilot's machine ran Supabase platform build `supabase-postgres-17.6.1.084`. On that
+build it read ~74 KB from disk for every page fault, ~96 times a second, permanently. Nothing
+we wrote was involved. The free upgrade to `17.6.1.166` fixed it. All 21 projects are now on
+`17.6.1.166`, upgraded staging-first (9 staging, gate passed 20:00:40 UTC) with production
+gated behind a clean staging result (12 projects, healthy 20:10:52 UTC).
+
+## 2. Everything that was NOT the cause, each killed by measurement
+
+| Theory | How it died |
+|---|---|
+| Abandoned health-check logins | Deleted 15,824; disk rate went 1.05 -> 1.11 MB/s, unchanged |
+| The database itself | Data disk 195 GB vs OS disk 29,251 GB over the same 31.9 days |
+| Visitor traffic | BackOffice: 15,906 requests/6h at 0.48 MB/s; ScoutCopilot: 5,391 at 7.74 |
+| The free plan / small machine | LaunchReady, identical 431 MB, runs at 0.06 MB/s |
+| Edge-function count | BackOffice has 55 and is quiet; ScoutCopilot had 16 and was not |
+| Checkpoints | 66 in 6 hours, writing 5-107 buffers each |
+| Disk nearly full | 76.0% ScoutCopilot vs 79.4% BackOffice; the quiet ones are fuller |
+| A stuck machine | Restart moved it 74.1 -> 74.4 KB per fault, i.e. nothing |
+| Needing bigger machines | Recommended in the first draft, **withdrawn**, never bought |
+
+## 3. What was actually changed
+
+| Change | Where | Result |
+|---|---|---|
+| Platform build `.084` -> `.166` | all 21 projects | ScoutCopilot 7.74 -> 0.67 MB/s (0.67/7.74 = 8.7%) |
+| Monitor signs out after each run | `lib/revokeSessions.ts` | proven: 3 logins left 8 sessions, teardown took it to 0 |
+| Abandoned sessions deleted | 7 products, then 2 more | 111,117 + 2,167 = **113,284** |
+| Stale-login expiry, 30d idle / 180d absolute | 2 Pro projects natively, 19 by hourly sweep | first sweep removed 3,515 |
+| Disk-load watch, warn 2 MB/s fail 4 | `check-supabase-machine-health.mjs` | 12 products |
+| Build-currency watch | `check-supabase-build-currency.mjs` | every account, 15 tokens |
+| Alarms reach the cockpit | `lib/fleet-signal.mjs` | proven: real signal filed, read back, deleted |
+
+Fleet disk load after, all 20 readable machines, 180s window: highest BackOffice 1.67 MB/s,
+ScoutCopilot 0.02 MB/s, **fleet total 6.33 MB/s**. ScoutCopilot alone was 7.74 MB/s before,
+so the whole estate now moves less disk than that one machine did.
+
+## 4. Session policy and why it is what it is
+
+Supabase's docs: keep the 1-hour access token ("most applications should use the default"),
+keep refresh-token rotation, keep the 10-second reuse window ("we do not recommend changing
+this value"). All three were already correct on all 21 projects and were NOT touched.
+
+OWASP's familiar figures (idle 15-30 min, absolute 4-8 h) are written for applications where
+the session cookie IS the credential. With an hourly rotating token they would sign customers
+out repeatedly for no gain. Deliberately not applied.
+
+What was missing was the long stop: `sessions_timebox` and `sessions_inactivity_timeout` read
+`0` on all 21. Now idle 30 days / absolute 180 days everywhere. Supabase gates the native
+setting behind Pro (402 "User sessions can only be configured on Pro Plans and up") and only
+2 of 21 are Pro, so the other 19 get the identical policy from `expire-stale-sessions.mjs`
+hourly, at no cost.
+
+## 5. My own guards were broken three times, always as a FALSE ALL-CLEAR
+
+Every one found only by running them against the real fleet:
+
+1. The metric parser built its regex from an escaped JS string and matched nothing, so every
+   machine read as "unreadable" and the check exited 0. A peer session found the same bug the
+   same night; their version is upstream and mine was dropped.
+2. A 30-second sample window was shorter than Supabase's counter refresh, so both samples read
+   identical values and **all 20 machines scored a perfect 0.00 MB/s, OK**. Window now 180s and
+   an unmoved counter pair reports as inconclusive.
+3. Both checks only called `process.exit(1)`, which reds the run and triggers `send-alert.mjs`
+   — which reads Playwright's `results.json`. The email would have listed **zero** failures
+   while the finding appeared nowhere. Both now file to `cockpit.predivo.ch/signals`.
+
+Plus a fourth in the expiry sweep: the "remaining" count sat inside the delete statement, where
+every CTE reads the pre-delete snapshot, so it printed "deleted 3384, 9401 remain" against a
+pre-delete total of 9401. Caught by verifying against the live database instead of the script's
+own output. 24 tests now cover these.
+
+## 6. Cost
+
+**Nothing, at any step.** Every fix was a free platform upgrade or code. The one spending
+recommendation I made (~$9.68/month per project for Micro compute, from Supabase's billing
+catalogue) was disproven by LaunchReady running the same 431 MB machine at 0.06 MB/s and
+withdrawn before anything was bought.
+
+## 7. Left open, each needing its own session
+
+- `noreply@backoffice.predivo.ch` is STILL creating sessions inside BackOffice and never
+  signing out (1,682 cleared today, was still adding at 11:10). Not the production-monitor,
+  whose sign-out fix shipped in c55d376. The 30-day expiry now caps it, but the leak is real.
+- ScoutCopilot's `error_log` holds 2,865 rows of one repeated `generate-photo` "Missing or
+  invalid Authorization header", roughly 24/hour, steady.
+
+## 8. The process lesson, which cost the most
+
+The first diagnosis (abandoned logins) was asserted from a plausible story and shipped with a
+confident report and a code fix. Disproving it took five minutes: remove the suspected cause,
+measure again. **Where an experiment is possible, run it before reporting, and put the
+before-and-after in the report.** And a comparison already sitting in the fleet beats any
+theory: SignalScore held 11,956 of the same abandoned sessions with zero symptom, which killed
+the login theory on hour one, and I did not look for it.
