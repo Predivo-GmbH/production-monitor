@@ -12,7 +12,7 @@
  */
 import assert from 'node:assert'
 import { readFileSync } from 'node:fs'
-import { sweepSql, IDLE_DAYS, ABSOLUTE_DAYS } from '../scripts/expire-stale-sessions.mjs'
+import { sweepSql, sweep, IDLE_DAYS, ABSOLUTE_DAYS } from '../scripts/expire-stale-sessions.mjs'
 
 let passed = 0, failed = 0
 const check = (name, fn) => {
@@ -48,6 +48,41 @@ check('the remaining count is NOT inside the delete statement', () => {
   assert.ok(!/remaining/.test(sql), 'a count inside the delete reads the pre-delete snapshot and reports a false number')
   const src = readFileSync(new URL('../scripts/expire-stale-sessions.mjs', import.meta.url), 'utf8')
   assert.ok(/select count\(\*\) remaining from auth\.sessions/.test(src), 'remaining must be counted in its own statement')
+})
+
+// A dead management token must land in `blind`, never vanish silently. Before this was
+// fixed, `if (!r.ok) continue` dropped a 401 token's entire account from the sweep, so the
+// run exited 0 with a smaller project count and those products' logins were never expired —
+// which is how 113,284 abandoned sessions accumulated.
+const acheck = async (name, fn) => {
+  try { await fn(); console.log(`  ok   - ${name}`); passed++ }
+  catch (e) { console.log(`  FAIL - ${name}: ${e.message}`); failed++ }
+}
+const withStubbedFetch = async (impl, fn) => {
+  const real = globalThis.fetch
+  globalThis.fetch = impl
+  try { return await fn() } finally { globalThis.fetch = real }
+}
+
+await acheck('a revoked token is recorded as unreadable, not silently skipped', async () => {
+  const results = await withStubbedFetch(
+    async () => ({ ok: false, status: 401, json: async () => ({}) }),
+    () => sweep({ SUPABASE_TOKEN_DEAD: 'sbp_revoked' }, true),
+  )
+  const blind = results.filter((r) => !r.ok)
+  assert.strictEqual(blind.length, 1, 'the dead token must produce exactly one unreadable entry')
+  assert.strictEqual(blind[0].product, 'SUPABASE_TOKEN_DEAD', 'the entry must name the credential')
+  assert.ok(/401/.test(blind[0].error), 'the error must carry the HTTP status')
+})
+
+await acheck('a network error on the project listing is recorded, not swallowed', async () => {
+  const results = await withStubbedFetch(
+    async () => { throw new Error('ECONNRESET') },
+    () => sweep({ SUPABASE_TOKEN_FLAKY: 'sbp_x' }, true),
+  )
+  const blind = results.filter((r) => !r.ok)
+  assert.strictEqual(blind.length, 1, 'the unreachable token must produce one unreadable entry')
+  assert.ok(/ECONNRESET/.test(blind[0].error), 'the error must carry the network cause')
 })
 
 console.log(`\n${passed} passed, ${failed} failed.`)

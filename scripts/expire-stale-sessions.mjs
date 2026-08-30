@@ -68,9 +68,15 @@ export async function sweep(env = process.env, dry = false) {
     let projects = []
     try {
       const r = await fetch('https://api.supabase.com/v1/projects', { headers: { Authorization: `Bearer ${pat}` } })
-      if (!r.ok) continue
+      // A token that no longer authenticates must be RECORDED, not skipped. Skipping it
+      // contributes zero projects, so every product under that account silently vanishes
+      // from `seen` and the run goes green on a shrinking project count — the exact "a
+      // project we cannot reach is not a swept project" failure the board signal below
+      // exists to prevent, and how 113,284 abandoned sessions built up unnoticed. Mirrors
+      // check-supabase-build-currency.mjs, which records the dead token as unreadable.
+      if (!r.ok) { seen.set(`token:${key}`, { product: key, ok: false, error: `management API returned ${r.status} — token dead or rotated` }); continue }
       projects = await r.json()
-    } catch { continue }
+    } catch (e) { seen.set(`token:${key}`, { product: key, ok: false, error: `management API unreachable — ${e.message}` }); continue }
     for (const p of projects) {
       if (seen.has(p.ref)) continue
       try {
