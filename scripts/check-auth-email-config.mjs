@@ -100,7 +100,7 @@ async function main() {
         rows.push({ name: p.name, rate: cfg.rate_limit_email_sent, smtp: cfg.smtp_host || 'null', hook: cfg.hook_send_email_enabled, ok: reasons.length === 0 })
         if (reasons.length) violations.push({ project: p.name, testName: 'auth-email config', error: reasons.join('; ') })
       } catch (err) {
-        rows.push({ name: p.name, rate: '?', smtp: '?', hook: '?', ok: false })
+        rows.push({ name: p.name, rate: '?', smtp: '?', hook: '?', ok: false, err: err.message })
         violations.push({ project: p.name, testName: 'auth-email config', error: `lookup failed: ${err.message}` })
       }
     }
@@ -110,6 +110,11 @@ async function main() {
   console.log('PROJECT'.padEnd(22), 'RATE'.padEnd(5), 'SMTP'.padEnd(22), 'HOOK'.padEnd(6), 'STATUS')
   for (const r of rows) {
     console.log(String(r.name).padEnd(22), String(r.rate).padEnd(5), String(r.smtp).padEnd(22), String(r.hook).padEnd(6), r.ok ? 'OK' : '*** AT RISK ***')
+  }
+  const lookupFailures = rows.filter((r) => r.err)
+  if (lookupFailures.length) {
+    console.log('\nLOOKUP FAILURES (project could not be audited - Management-API error, not a config value):')
+    for (const r of lookupFailures) console.log('  -', String(r.name).padEnd(20), '-', r.err)
   }
   if (warnings.length) {
     console.log('\nWARN (latent - does not fail the guard, but act before launch):')
