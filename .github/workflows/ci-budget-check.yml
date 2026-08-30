@@ -38,7 +38,10 @@ jobs:
         run: node scripts/check-ci-budget.mjs
         env:
           GH_TOKEN: ${{ secrets.DASHBOARD_PAT }}
-          CI_BUDGET_WINDOW_DAYS: ${{ inputs.window_days || 7 }}
+          # 2026-08-30: scheduled runs use a 3-day window until the pre-migration runner tail
+          # (2026-08-23/24) decays out of the 7-day window. Revert to 7 after 2026-09-07.
+          # Manual dispatch keeps default 7 so a short window is an explicit choice.
+          CI_BUDGET_WINDOW_DAYS: ${{ inputs.window_days || 3 }}
 
       - name: Heartbeat
         if: always()
