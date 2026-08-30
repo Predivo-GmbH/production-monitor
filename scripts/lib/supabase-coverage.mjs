@@ -53,9 +53,13 @@ export function coverageGaps(findings, baseline) {
   return baseline.projects.filter((p) => !seen.has(p.ref))
 }
 
-/** One line a person can read, for whichever sweep is printing it. */
-export function coverageLine(gaps, baseline, noun = 'projects') {
+/**
+ * One line a person can read, for whichever sweep is printing it. `verb` is what this
+ * particular sweep DID to the project, so the sentence stays grammatical for each caller:
+ * the build check reads a project, the session sweep sweeps it.
+ */
+export function coverageLine(gaps, baseline, verb = 'read') {
   if (!baseline) return `coverage: UNPROVEN — scripts/lib/supabase-projects-baseline.json is absent or empty, so a project that vanished from every token would not be noticed`
   const missing = gaps?.length ? ` — MISSING: ${gaps.map((p) => p.product).join(', ')}` : ''
-  return `coverage: ${baseline.projects.length - (gaps?.length ?? 0)}/${baseline.projects.length} expected ${noun} read${missing}`
+  return `coverage: ${baseline.projects.length - (gaps?.length ?? 0)}/${baseline.projects.length} expected projects ${verb}${missing}`
 }

@@ -214,7 +214,7 @@ if (process.argv[1] && process.argv[1].endsWith('expire-stale-sessions.mjs')) {
   // "projects", which inflated the reassuring number using the very thing that was broken.
   const projects = results.filter((r) => !r.isToken)
   console.log(`${projects.length} projects, ${blind.length} unreadable, ${total} stale sessions ${dry ? 'would be' : ''} removed (policy: idle ${IDLE_DAYS}d, absolute ${ABSOLUTE_DAYS}d)`)
-  console.log(coverageLine(gaps, baseline, 'projects swept'))
+  console.log(coverageLine(gaps, baseline, 'swept'))
 
   // A dead token that cost no coverage moves OUT of the blindness row and into the
   // housekeeping row — but only that token moves. Everything else still files as blindness,
