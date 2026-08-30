@@ -245,6 +245,33 @@ jobs:
           YTMIGRATION_SUPABASE_URL: ${{ secrets.YTMIGRATION_SUPABASE_URL }}
           YTMIGRATION_SERVICE_ROLE_KEY: ${{ secrets.YTMIGRATION_SERVICE_ROLE_KEY }}
 
+      # Expire stale logins. Supabase gates its own sessions_timebox / inactivity settings
+      # behind Pro (PATCH /config/auth answers 402), and only 2 of 21 projects are Pro, so
+      # this reproduces the same policy for the other 19 at no cost: idle 30 days, absolute
+      # 180 days. Before 2026-08-29 nothing expired anywhere and 113,284 abandoned sessions
+      # had accumulated. First real sweep removed 3,515.
+      - name: Expire stale logins on every project
+        if: always()
+        run: node scripts/expire-stale-sessions.mjs
+        env:
+          BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
+          SUPABASE_TOKEN_API: ${{ secrets.SUPABASE_TOKEN_API }}
+          SUPABASE_TOKEN_ARIVIOO: ${{ secrets.SUPABASE_TOKEN_ARIVIOO }}
+          SUPABASE_TOKEN_BACKOFFICE: ${{ secrets.SUPABASE_TOKEN_BACKOFFICE }}
+          SUPABASE_TOKEN_BOATBUDDY: ${{ secrets.SUPABASE_TOKEN_BOATBUDDY }}
+          SUPABASE_TOKEN_CHANNELMOVER: ${{ secrets.SUPABASE_TOKEN_CHANNELMOVER }}
+          SUPABASE_TOKEN_DISTRIBUTIONOS: ${{ secrets.SUPABASE_TOKEN_DISTRIBUTIONOS }}
+          SUPABASE_TOKEN_LAUNCHREADY: ${{ secrets.SUPABASE_TOKEN_LAUNCHREADY }}
+          SUPABASE_TOKEN_MUELLER: ${{ secrets.SUPABASE_TOKEN_MUELLER }}
+          SUPABASE_TOKEN_REPLYFLOW: ${{ secrets.SUPABASE_TOKEN_REPLYFLOW }}
+          SUPABASE_TOKEN_SCOUTCOPILOT: ${{ secrets.SUPABASE_TOKEN_SCOUTCOPILOT }}
+          SUPABASE_TOKEN_VALRANO: ${{ secrets.SUPABASE_TOKEN_VALRANO }}
+          BACKOFFICE_SUPABASE_ACCESS_TOKEN: ${{ secrets.BACKOFFICE_SUPABASE_ACCESS_TOKEN }}
+          REPLYFLOW_SUPABASE_ACCESS_TOKEN: ${{ secrets.REPLYFLOW_SUPABASE_ACCESS_TOKEN }}
+          SIGNALSCORE_SUPABASE_ACCESS_TOKEN: ${{ secrets.SIGNALSCORE_SUPABASE_ACCESS_TOKEN }}
+          VALRANO_SUPABASE_ACCESS_TOKEN: ${{ secrets.VALRANO_SUPABASE_ACCESS_TOKEN }}
+          YTMIGRATION_SUPABASE_ACCESS_TOKEN: ${{ secrets.YTMIGRATION_SUPABASE_ACCESS_TOKEN }}
+
       - name: Supabase build currency (how far behind each project is)
         if: always()
         run: node scripts/check-supabase-build-currency.mjs
