@@ -34,6 +34,14 @@ jobs:
           SUPABASE_TOKEN_SCOUTCOPILOT: ${{ secrets.SUPABASE_TOKEN_SCOUTCOPILOT }}
           SUPABASE_TOKEN_BACKOFFICE: ${{ secrets.BACKOFFICE_SUPABASE_ACCESS_TOKEN }}
           SUPABASE_TOKEN_BOATBUDDY: ${{ secrets.SUPABASE_TOKEN_BOATBUDDY }}
+          # Additional management tokens, under their own names, purely so the
+          # ownership fallback has the same candidates check-supabase-build-currency.mjs
+          # has. The SUPABASE_TOKEN_* pins above are unchanged; these only widen the set
+          # the guard may fall back to when a pinned name has gone stale.
+          BACKOFFICE_SUPABASE_ACCESS_TOKEN: ${{ secrets.BACKOFFICE_SUPABASE_ACCESS_TOKEN }}
+          REPLYFLOW_SUPABASE_ACCESS_TOKEN: ${{ secrets.REPLYFLOW_SUPABASE_ACCESS_TOKEN }}
+          SIGNALSCORE_SUPABASE_ACCESS_TOKEN: ${{ secrets.SIGNALSCORE_SUPABASE_ACCESS_TOKEN }}
+          VALRANO_SUPABASE_ACCESS_TOKEN: ${{ secrets.VALRANO_SUPABASE_ACCESS_TOKEN }}
           ALERT_SMTP_HOST: ${{ secrets.ALERT_SMTP_HOST }}
           ALERT_SMTP_PORT: ${{ secrets.ALERT_SMTP_PORT }}
           ALERT_SMTP_USER: ${{ secrets.ALERT_SMTP_USER }}

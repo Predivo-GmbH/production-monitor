@@ -123,6 +123,22 @@ jobs:
         timeout-minutes: 18
         run: npx playwright test --project=chromium
         env:
+          # Every account's Supabase MANAGEMENT token. The edge-function discovery
+          # tests pin one token per project by NAME, and a name is only a guess about
+          # which account owns that project — when the guess goes stale the test can
+          # fall back to whichever of these can actually see the ref, instead of
+          # reddening the whole run over a label (lib/supabaseToken.ts).
+          SUPABASE_TOKEN_API: ${{ secrets.SUPABASE_TOKEN_API }}
+          SUPABASE_TOKEN_ARIVIOO: ${{ secrets.SUPABASE_TOKEN_ARIVIOO }}
+          SUPABASE_TOKEN_BACKOFFICE: ${{ secrets.SUPABASE_TOKEN_BACKOFFICE }}
+          SUPABASE_TOKEN_BOATBUDDY: ${{ secrets.SUPABASE_TOKEN_BOATBUDDY }}
+          SUPABASE_TOKEN_CHANNELMOVER: ${{ secrets.SUPABASE_TOKEN_CHANNELMOVER }}
+          SUPABASE_TOKEN_DISTRIBUTIONOS: ${{ secrets.SUPABASE_TOKEN_DISTRIBUTIONOS }}
+          SUPABASE_TOKEN_LAUNCHREADY: ${{ secrets.SUPABASE_TOKEN_LAUNCHREADY }}
+          SUPABASE_TOKEN_MUELLER: ${{ secrets.SUPABASE_TOKEN_MUELLER }}
+          SUPABASE_TOKEN_REPLYFLOW: ${{ secrets.SUPABASE_TOKEN_REPLYFLOW }}
+          SUPABASE_TOKEN_SCOUTCOPILOT: ${{ secrets.SUPABASE_TOKEN_SCOUTCOPILOT }}
+          SUPABASE_TOKEN_VALRANO: ${{ secrets.SUPABASE_TOKEN_VALRANO }}
           # BackOffice
           BACKOFFICE_URL: https://backoffice.predivo.ch
           BACKOFFICE_SUPABASE_URL: ${{ secrets.BACKOFFICE_SUPABASE_URL }}

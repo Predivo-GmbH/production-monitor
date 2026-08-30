@@ -321,13 +321,12 @@ test.describe('ChannelMover — Production Monitor', () => {
     // automatically — there is no list to keep in sync, so an intentional
     // removal can never leave a stale entry behind a false 404 alarm.
     test('all deployed edge functions are reachable (auto-discovered)', async () => {
-      expect(
-        ACCESS_TOKEN,
-        'YTMIGRATION_SUPABASE_ACCESS_TOKEN is not set — cannot discover deployed functions',
-      ).toBeTruthy()
-
+      // No assertion that ACCESS_TOKEN is set: the token NAME is only a hint about
+      // which account owns this project, and listDeployedFunctions falls back to any
+      // management token that can actually see the ref. Demanding this exact name is
+      // what turned one stale label into an hourly red run (lib/supabaseToken.ts).
       const ref = projectRefFromUrl(SUPABASE_URL)
-      const deployed = await listDeployedFunctions(ref, ACCESS_TOKEN!)
+      const deployed = await listDeployedFunctions(ref, ACCESS_TOKEN)
       expect(deployed.length, 'No edge functions discovered for project').toBeGreaterThan(0)
 
       const results = await Promise.all(

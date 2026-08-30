@@ -9,6 +9,8 @@
  * spec edit, no drift.
  */
 
+import { findTokenForProject, managementTokenKeys } from './supabaseToken'
+
 /** Extract the Supabase project ref from its URL (https://<ref>.supabase.co). */
 export function projectRefFromUrl(supabaseUrl: string): string {
   const host = new URL(supabaseUrl).hostname
@@ -17,15 +19,54 @@ export function projectRefFromUrl(supabaseUrl: string): string {
   return ref
 }
 
-/** List the slugs of every edge function currently deployed to a project. */
+async function fetchFunctions(projectRef: string, accessToken: string) {
+  return fetch(`https://api.supabase.com/v1/projects/${projectRef}/functions`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  })
+}
+
+/** A refusal of the TOKEN, as opposed to anything about the project itself. */
+const isTokenRefused = (status: number) => status === 401 || status === 403
+
+/**
+ * List the slugs of every edge function currently deployed to a project.
+ *
+ * `accessToken` is the token the caller believes owns this project. If it is
+ * missing or refused, we do NOT go red on that alone — a token name is a guess
+ * about account ownership and guesses go stale (see lib/supabaseToken.ts: a
+ * pinned 401 here reddened the monitor hourly from 2026-08-27 while a working
+ * token for the same project sat unused in the same environment). We ask the
+ * other management tokens who actually owns the project and carry on, loudly.
+ */
 export async function listDeployedFunctions(
   projectRef: string,
-  accessToken: string,
+  accessToken: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<string[]> {
-  const res = await fetch(
-    `https://api.supabase.com/v1/projects/${projectRef}/functions`,
-    { headers: { Authorization: `Bearer ${accessToken}` } },
-  )
+  let res = accessToken ? await fetchFunctions(projectRef, accessToken) : undefined
+
+  if (!res || isTokenRefused(res.status)) {
+    const pinnedKey = accessToken
+      ? managementTokenKeys(env).find((k) => env[k] === accessToken)
+      : undefined
+    const fallback = await findTokenForProject(projectRef, env, pinnedKey)
+    if (!fallback) {
+      const why = res
+        ? `the token it was given returned HTTP ${res.status}`
+        : 'it was given no token'
+      throw new Error(
+        `listDeployedFunctions(${projectRef}) failed: ${why}, and no other Supabase ` +
+          `management token in this environment can see that project. Either the project ` +
+          `ref is stale or its account's token was never added as a secret — both need a person.`,
+      )
+    }
+    console.warn(
+      `[supabase] ${projectRef}: ${pinnedKey ?? 'the pinned token'} is no longer accepted ` +
+        `for this project; used ${fallback.key} instead. The pinned name should be repaired.`,
+    )
+    res = await fetchFunctions(projectRef, fallback.token)
+  }
+
   if (!res.ok) {
     throw new Error(
       `listDeployedFunctions(${projectRef}) failed: HTTP ${res.status} ${await res.text()}`,

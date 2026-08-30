@@ -18,9 +18,15 @@
  * latent risk (pre-launch MVP that DOES use the GoTrue mailer): prints WARNING, does not
  * fail. Each verdict was source-audited; see memory session_three_red_workflows_2026_06_18.
  *
- * Tokens: SUPABASE_TOKEN_<ACCT> per account. Missing tokens reported for ENFORCED only.
+ * Tokens: SUPABASE_TOKEN_<ACCT> per account, treated as a HINT about ownership rather
+ * than a fact — the ACCOUNTS map is documentation and documentation drifts. A pinned
+ * token that is refused falls back to any management token that can actually see the
+ * project (lib/supabase-token.mjs), and the stale name is reported, not hidden. Only a
+ * project NO token can see is reported unaudited, for ENFORCED projects.
  * Optional alert via ALERT_SMTP_*. Exit 1 when any ENFORCED project is at risk/missing.
  */
+
+import { findTokenForProject, isTokenRefused } from './lib/supabase-token.mjs'
 
 const MIN_RATE_LIMIT = 10
 const STAGING = 'staging/test environment - no real users; e2e auth tests bypass email (password-grant)'
@@ -72,6 +78,35 @@ async function getAuthConfig(ref, token) {
   return res.json()
 }
 
+/**
+ * Read a project's auth config, preferring the token this file says owns it.
+ *
+ * The ACCOUNTS map above is documentation of who owns what, and documentation
+ * drifts. When the pinned token is refused we ask the other tokens rather than
+ * failing the guard over a stale label — but we return WHICH token answered, so
+ * the drift gets reported instead of buried. Returns null when nothing in the
+ * environment can see the project at all; that one really is unauditable.
+ */
+async function readAuthConfig(ref, pinnedKey, env = process.env) {
+  const pinned = env[pinnedKey]
+  if (pinned) {
+    try {
+      return { cfg: await getAuthConfig(ref, pinned), usedKey: pinnedKey, fellBackFrom: null }
+    } catch (err) {
+      // A non-auth error is about the PROJECT, not the token — no other token fixes it.
+      const status = Number(String(err.message).replace('HTTP ', ''))
+      if (!isTokenRefused(status)) throw err
+    }
+  }
+  const fallback = await findTokenForProject(ref, env, pinnedKey)
+  if (!fallback) return null
+  return {
+    cfg: await getAuthConfig(ref, fallback.token),
+    usedKey: fallback.key,
+    fellBackFrom: pinned ? pinnedKey : null,
+  }
+}
+
 function evaluate(cfg) {
   const rate = cfg.rate_limit_email_sent
   const hasCustomDelivery = Boolean(cfg.smtp_host) || cfg.hook_send_email_enabled === true
@@ -87,15 +122,19 @@ async function main() {
   const rows = []
   const exempt = []
   const warnings = []
+  const staleTokens = []
 
   for (const [acct, projects] of Object.entries(ACCOUNTS)) {
-    const token = process.env[`SUPABASE_TOKEN_${acct}`]
+    const pinnedKey = `SUPABASE_TOKEN_${acct}`
     for (const p of projects) {
       if (p.exempt) { exempt.push({ name: p.name, reason: p.exempt }); continue }
       if (p.warn) { warnings.push({ name: p.name, reason: p.warn }); continue }
-      if (!token) { missingTokens.push(`${p.name} (account ${acct})`); continue }
       try {
-        const cfg = await getAuthConfig(p.ref, token)
+        const read = await readAuthConfig(p.ref, pinnedKey)
+        if (!read) { missingTokens.push(`${p.name} (account ${acct}, ref ${p.ref}) — no management token in this environment can see it`); continue }
+        const { cfg, usedKey, fellBackFrom } = read
+        // Audited fine, so it must NOT fail the guard — but the map is wrong and says so.
+        if (fellBackFrom) staleTokens.push(`${p.name}: ${fellBackFrom} is no longer accepted; audited with ${usedKey} instead`)
         const reasons = evaluate(cfg)
         rows.push({ name: p.name, rate: cfg.rate_limit_email_sent, smtp: cfg.smtp_host || 'null', hook: cfg.hook_send_email_enabled, ok: reasons.length === 0 })
         if (reasons.length) violations.push({ project: p.name, testName: 'auth-email config', error: reasons.join('; ') })
@@ -115,6 +154,11 @@ async function main() {
   if (lookupFailures.length) {
     console.log('\nLOOKUP FAILURES (project could not be audited - Management-API error, not a config value):')
     for (const r of lookupFailures) console.log('  -', String(r.name).padEnd(20), '-', r.err)
+  }
+  if (staleTokens.length) {
+    console.log('')
+    console.log('STALE TOKEN NAMES (audited via another token - fix the ACCOUNTS map in this file):')
+    for (const t of staleTokens) console.log('  -', t)
   }
   if (warnings.length) {
     console.log('\nWARN (latent - does not fail the guard, but act before launch):')
