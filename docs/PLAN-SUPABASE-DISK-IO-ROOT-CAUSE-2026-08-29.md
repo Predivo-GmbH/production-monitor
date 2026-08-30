@@ -66,3 +66,56 @@ effect again. Where an experiment is possible, run it before reporting, and put 
 before-and-after in the report. A comparison that already exists in the fleet, SignalScore
 holding the same junk with none of the symptom, beats any theory and was available from the
 first hour.
+
+
+## Fleet outcome, measured 2026-08-30
+
+All 21 Supabase projects verified live: `ACTIVE_HEALTHY` and `current_app_version ==
+latest_app_version == supabase-postgres-17.6.1.166`. Upgraded staging-first (9 projects,
+gate passed 20:00:40 UTC), production behind the gate (12 projects, all healthy 20:10:52).
+
+Disk load across all 20 readable machines, 180-second window:
+
+| machine | disk load | per fetch |
+|---|---|---|
+| BackOffice (highest now) | 1.67 MB/s | 19.0 KB |
+| ReplyFlow | 1.05 MB/s | 27.2 KB |
+| Valrano Production | 0.98 MB/s | 27.4 KB |
+| ChannelMover | 0.16 MB/s | 14.4 KB |
+| DistributionOS | 0.06 MB/s | 11.3 KB |
+| ScoutCopilot | 0.02 MB/s | 6.3 KB |
+
+Fleet total 6.33 MB/s across 20 machines. ScoutCopilot alone was 7.74 MB/s before the
+upgrade, so the whole estate now moves less disk than that one machine did. 0 FAIL,
+0 WARN, 0 unreadable.
+
+## The watchdog was broken twice, both times as a false all-clear
+
+Running it for real rather than trusting it found both:
+
+1. The metric parser built its regex from an escaped JS string and matched nothing, so
+   every machine reported "unreadable". A peer session found the same bug independently
+   the same night; their exported regex version is upstream and was kept, mine dropped.
+2. The 30-second sample window was shorter than Supabase's own counter refresh, so both
+   samples read identical values and **all 20 machines scored a perfect 0.00 MB/s, OK**.
+   Window raised to 180s; an unmoved counter pair is now reported as inconclusive.
+
+Both are pinned by `test/check-supabase-machine-health.test.mjs` (19 cases, all passing).
+A monitor reporting perfect zeros across a whole fleet is lying, and that is the specific
+shape this file exists to stop.
+
+## Cost
+
+Money spent: **nothing**. Every step was a free platform upgrade. The advice to buy Micro
+compute add-ons (~$9.68/month per project, from Supabase's billing catalogue) was written
+into the first draft of this plan, disproven by LaunchReady running the same 431 MB machine
+at 0.06 MB/s, and withdrawn before anything was bought.
+
+## Still open, each its own subject
+
+- BackOffice holds 1,688 non-healthcheck sessions, DistributionOS 486 — probably the IMAP
+  OTP account, which the name filter on this sweep did not match.
+- ScoutCopilot's `error_log` holds 2,865 rows of one repeated `generate-photo` auth error.
+- `sessions_timebox` and `sessions_inactivity_timeout` are `0` on every project read, so no
+  login on any product ever expires. Turning that on changes how long real customers stay
+  signed in, so it is Roger's decision, not an engineering default.
