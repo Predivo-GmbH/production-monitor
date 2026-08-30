@@ -9,11 +9,33 @@
  *
  * Any management token in the environment is used, so a new account is covered by adding
  * its token as a secret and nothing else.
+ *
+ * THE 2026-08-30 HOLE (this change): the sweep only ever reported on projects some token
+ * HANDED it. A project that no token could see was not "unreadable" — it was ABSENT, and
+ * absent reads as fine. The run printed "21 projects checked, 0 behind" and went green on
+ * exactly the state this watchdog exists to catch: a product nobody is watching. Meanwhile
+ * the same run went RED, every hour, because one stored token answered 401 — a credential
+ * whose projects were all being read by other tokens anyway. The check was loud about the
+ * harmless case and silent about the dangerous one.
+ *
+ * Both halves need the same missing fact: what the fleet is SUPPOSED to contain. That is
+ * scripts/lib/supabase-projects-baseline.json, in the house style of scripts/lib/
+ * mailer-baseline.json — a written-down expectation, so a gap is a fact instead of a guess.
+ * With it, a dead token is decidable rather than merely alarming:
+ *   every baseline project read by SOME token -> the sweep is COMPLETE. A dead token cost
+ *     us no coverage, so it is housekeeping (a board row), not an hourly alarm.
+ *   a baseline project no token can see    -> genuinely unwatched. RED, and it says which.
+ *   no baseline file at all                -> coverage is UNPROVEN, and a dead token stays
+ *     red, because nothing has established what the sweep should have found.
  */
+
+import { readFileSync } from 'node:fs'
 
 import { boardSecret, fileSignal, signal } from "./lib/fleet-signal.mjs"
 
 const TOKEN_KEYS = (env) => Object.keys(env).filter((k) => /^SUPABASE_TOKEN_|_SUPABASE_ACCESS_TOKEN$|^SUPABASE_ACCESS_TOKEN$/.test(k))
+
+const BASELINE_FILE = new URL('./lib/supabase-projects-baseline.json', import.meta.url)
 
 export async function checkBuildCurrency(env = process.env) {
   const seen = new Map()
@@ -32,9 +54,13 @@ export async function checkBuildCurrency(env = process.env) {
       let e = {}
       try { e = await (await fetch(`https://api.supabase.com/v1/projects/${p.ref}/upgrade/eligibility`, { headers: H })).json() } catch { /* reported below */ }
       const cur = e.current_app_version, latest = e.latest_app_version
-      if (!cur || !latest) { seen.set(p.ref, { product: p.name, level: 'unreadable', detail: 'could not read build version' }); continue }
+      // `ref` is carried on every project finding so coverage can be compared against the
+      // baseline by ref. Names are what a person reads; refs are what actually identifies
+      // a project, and a project gets renamed far more easily than it gets a new ref.
+      if (!cur || !latest) { seen.set(p.ref, { ref: p.ref, product: p.name, level: 'unreadable', detail: 'could not read build version' }); continue }
       const behind = cur !== latest
       seen.set(p.ref, {
+        ref: p.ref,
         product: p.name,
         level: behind ? (e.eligible ? 'warn' : 'blocked') : 'ok',
         detail: behind
@@ -44,6 +70,42 @@ export async function checkBuildCurrency(env = process.env) {
     }
   }
   return [...seen.values()]
+}
+
+/** The written-down expectation, or null when it has not been established yet. */
+export function loadBaseline(file = BASELINE_FILE) {
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8'))
+    return Array.isArray(parsed?.projects) && parsed.projects.length ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Baseline projects that NO token in this environment could see.
+ *
+ * The three-valued return is the whole point and must not be collapsed to an array:
+ *   null -> coverage is UNPROVEN (no baseline). Not the same as "nothing missing".
+ *   []   -> coverage is PROVEN COMPLETE. Every project we expect was read this run.
+ *   [..] -> these products are unwatched right now.
+ * Reading `[]` and `null` as the same thing is precisely the bug this file used to have,
+ * where "the sweep returned no complaints" was treated as "the sweep saw everything".
+ */
+export function coverageGaps(findings, baseline) {
+  if (!baseline?.projects?.length) return null
+  const seen = new Set(findings.filter((f) => !f.isToken && f.ref).map((f) => f.ref))
+  return baseline.projects.filter((p) => !seen.has(p.ref))
+}
+
+/** Coverage gaps rendered as ordinary unreadable findings, so one blindness path reports all of them. */
+export function missingFindings(gaps) {
+  return (gaps ?? []).map((p) => ({
+    ref: p.ref,
+    product: p.product,
+    level: 'unreadable',
+    detail: `no management token in this environment can see project ${p.ref} — it is expected by scripts/lib/supabase-projects-baseline.json but no token listed it`,
+  }))
 }
 
 /**
@@ -61,6 +123,12 @@ export async function checkBuildCurrency(env = process.env) {
  * fleet-signal.mjs is "a filed alarm exits 0, only a failed READ exits non-zero", and a
  * watchdog that could not read IS a failed read. Filing does not make it green; it makes
  * the red legible. Pure so the payload is unit-tested without the network.
+ *
+ * A dead token reaches this row only while coverage is UNPROVEN. Once the baseline shows
+ * the sweep was complete without it, the caller sends it to deadTokenSignal instead —
+ * because claiming "nobody is watching" about a project that was read minutes ago is a
+ * false statement, and a watchdog that cries about the harmless case gets ignored on the
+ * dangerous one.
  */
 export function blindSignal(findings) {
   const blind = findings.filter((f) => f.level === 'unreadable')
@@ -81,12 +149,78 @@ export function blindSignal(findings) {
   })
 }
 
+/**
+ * The board row for a dead token that cost us NOTHING — every project we expect was read
+ * this run by a token that still works.
+ *
+ * This is deliberately a warning with no red. The remedy is deleting or replacing a secret,
+ * which the automation is not allowed to do, so reddening the hourly monitor for it creates
+ * an alarm that literally cannot be cleared by anything on duty — and an alarm that can
+ * never be cleared is one everybody learns to scroll past. Housekeeping still gets said out
+ * loud, on the board, with the exact command, because a secret store full of dead
+ * credentials misleads the next person who reads it.
+ *
+ * Returns null unless coverage is PROVEN complete — an unproven sweep has no business
+ * calling a dead token harmless.
+ */
+export function deadTokenSignal(findings, gaps, baseline) {
+  const dead = findings.filter((f) => f.level === 'unreadable' && f.isToken)
+  if (!dead.length || gaps === null || gaps.length) return null
+  const names = dead.map((f) => f.product)
+  const expected = baseline?.projects?.length ?? 0
+  return signal({
+    key: 'supabase-dead-management-token',
+    product: 'fleet',
+    severity: 'warning',
+    needsHuman: true,
+    title: `${dead.length} stored Supabase management token(s) no longer work`,
+    summary: `${names.join(', ')} answer 401 at api.supabase.com. Nothing is unwatched because of it: all ${expected} projects expected by scripts/lib/supabase-projects-baseline.json were read this run by tokens that still work, so the build-currency sweep was complete without these. What remains is housekeeping — a secret holding a dead credential lies to the next person who reads the secret list, and it hides the day it becomes the only route to something. Remove or replace it with: gh secret delete ${names[0]} -R Arivioo/production-monitor. This is filed as a warning and does not red the monitor on purpose: deleting a credential is not something the automation is allowed to do, so an hourly red here could never be cleared by anyone on duty and would only train everyone to ignore red.`,
+    detail: { deadTokens: names, projectsExpected: expected, sweepComplete: true },
+  })
+}
+
+/**
+ * Whether this run exits non-zero, and why — pure, so the policy is testable without a network.
+ *
+ * Wired into the CLI below and pinned by a test that SPAWNS this script. 6f2fd93 is the
+ * reason for that belt and braces: an exit policy here was exported, documented and unit
+ * tested while the CLI had quietly stopped calling it, so a green test proved nothing about
+ * what the product actually did.
+ */
+export function exitDecision(findings, gaps) {
+  const reasons = []
+  const projectBlind = findings.filter((f) => f.level === 'unreadable' && !f.isToken)
+  const blocked = findings.filter((f) => f.level === 'blocked')
+  const deadTokens = findings.filter((f) => f.level === 'unreadable' && f.isToken)
+  if (projectBlind.length) reasons.push(`${projectBlind.length} project(s) could not be read: ${projectBlind.map((f) => f.product).join(', ')}`)
+  if (blocked.length) reasons.push(`${blocked.length} project(s) are behind and NOT eligible to upgrade: ${blocked.map((f) => f.product).join(', ')}`)
+  if (deadTokens.length && gaps === null) reasons.push(`${deadTokens.length} management token(s) are dead and there is no project baseline, so the sweep cannot be shown to have been complete without them`)
+  return { code: reasons.length ? 1 : 0, reasons }
+}
+
 if (process.argv[1] && process.argv[1].endsWith('check-supabase-build-currency.mjs')) {
-  const findings = await checkBuildCurrency()
+  const baseline = loadBaseline()
+  const swept = await checkBuildCurrency()
+  const gaps = coverageGaps(swept, baseline)
+  const findings = [...swept, ...missingFindings(gaps)]
+
   for (const f of findings) console.log(`${String(f.level).toUpperCase().padEnd(11)} ${String(f.product).slice(0, 32).padEnd(34)} ${f.detail}`)
   const behind = findings.filter((f) => f.level === 'warn' || f.level === 'blocked')
   const blind = findings.filter((f) => f.level === 'unreadable')
-  console.log(`${findings.length} projects checked, ${behind.length} behind the current build, ${blind.length} unreadable`)
+  const projects = findings.filter((f) => !f.isToken)
+  // Counted separately because the old line called a dead TOKEN one of the "projects
+  // checked", which inflated the reassuring number using the very thing that was broken.
+  console.log(`${projects.length} projects checked, ${behind.length} behind the current build, ${blind.length} unreadable`)
+  console.log(baseline
+    ? `coverage: ${baseline.projects.length - (gaps?.length ?? 0)}/${baseline.projects.length} expected projects read${gaps.length ? ` — MISSING: ${gaps.map((p) => p.product).join(', ')}` : ''}`
+    : 'coverage: UNPROVEN — scripts/lib/supabase-projects-baseline.json is absent or empty, so a project that vanished from every token would not be noticed')
+
+  // What the sweep actually saw, so the baseline is bootstrapped and audited from ground
+  // truth (the API's own refs and names) instead of hand-copied out of Credentials.txt,
+  // where dead and superseded refs sit next to live ones.
+  console.log('::group::observed project inventory (ground truth for scripts/lib/supabase-projects-baseline.json)')
+  console.log(JSON.stringify({ projects: projects.filter((f) => f.ref).map((f) => ({ ref: f.ref, product: f.product })).sort((a, b) => a.product.localeCompare(b.product)) }, null, 2))
+  console.log('::endgroup::')
 
   // One board row for the whole sweep, not one per project: 19 of 21 were behind on
   // 2026-08-29 and nineteen separate rows would bury the board rather than inform it.
@@ -105,19 +239,30 @@ if (process.argv[1] && process.argv[1].endsWith('check-supabase-build-currency.m
     }))
     console.log('filed to the cockpit signals board: supabase-build-currency')
   }
+
   // Behind-but-eligible is now on the board, so it must not also red the run every hour.
-  // A project that cannot be READ, or is behind and NOT eligible to upgrade, needs a human.
-  // Blindness gets its OWN board row first: it is the reason this check was red on
-  // 2026-08-30 and it was the one finding that reached nobody. A board outage while filing
-  // must not swallow the original finding, so the failure is printed and the exit stands.
-  if (blind.length) {
-    const row = blindSignal(findings)
+  // Blindness gets its OWN board row: it is the reason this check was red on 2026-08-30 and
+  // it was the one finding that reached nobody.
+  //
+  // A dead token that cost no coverage is moved OUT of the blindness row and into the
+  // housekeeping row — but only that token moves. Everything else still files as blindness,
+  // because "one subject here is harmless" must never become "so say nothing about the
+  // others"; a run can perfectly well have a redundant dead token AND a project that would
+  // not report its version, and the second one is the whole job. A board outage while
+  // filing must not swallow the finding, so failures are printed per row and the exit
+  // below stands regardless.
+  const housekeeping = deadTokenSignal(findings, gaps, baseline)
+  const stillBlind = housekeeping ? findings.filter((f) => !(f.isToken && f.level === 'unreadable')) : findings
+  for (const row of [housekeeping, stillBlind.some((f) => f.level === 'unreadable') ? blindSignal(stillBlind) : null].filter(Boolean)) {
     try {
       await fileSignal(boardSecret(), row)
       console.log(`filed to the cockpit signals board: ${row.key}`)
     } catch (e) {
-      console.error(`::error::could not file the blind finding to the board: ${e.message}`)
+      console.error(`::error::could not file the finding to the board: ${e.message}`)
     }
   }
-  if (blind.length || findings.some((f) => f.level === 'blocked')) process.exit(1)
+
+  const { code, reasons } = exitDecision(findings, gaps)
+  for (const r of reasons) console.error(`::error::${r}`)
+  process.exit(code)
 }
