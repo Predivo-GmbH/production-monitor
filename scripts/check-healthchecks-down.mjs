@@ -157,6 +157,25 @@ export function signalFor(check, now = Date.now()) {
 }
 
 /**
+ * Which open rows a recovery run may resolve, pure and testable.
+ *
+ * SCOPED TO REAL CHECK SLUGS ONLY (2026-08-30). The recovery loop used to resolve every open row
+ * under source=healthchecks that was not in `downKeys`. But a row that is NOT a check slug — a
+ * diagnosis/analysis row the closer routes here, anything filed under this source that is not a
+ * live check — can NEVER appear in `downKeys`, so it was force-resolved by construction: title,
+ * summary and severity overwritten with "It checked in again". That erased root-cause rows within
+ * the hour (proved by an accidental A/B: the healthchecks-sourced analysis row was wiped, its
+ * production-monitor twin, written 0.17s apart, survived). Fix: resolve a key ONLY where it
+ * intersects the FULL check set (`allCheckKeys`) and is not currently down. A non-check row is now
+ * left completely alone. ROLLUP_KEY is not a check slug and is settled below on its own threshold,
+ * so it is excluded here explicitly as well.
+ */
+export function recoveredCheckKeys({ openKeys, allCheckKeys, downKeys }) {
+  return [...openKeys].filter((key) =>
+    key !== ROLLUP_KEY && allCheckKeys.has(key) && !downKeys.has(key))
+}
+
+/**
  * The whole flood decision, pure and testable: given what is dark, what gets filed and what may
  * ring. Returns the exact bodies main() posts, in the order it posts them.
  *
@@ -252,6 +271,9 @@ async function main() {
   const open = await boGet(secret, `fleet_signals?source=eq.${SOURCE}&state=in.(open,superseded)&select=key`)
   const openKeys = new Set(open.map((r) => r.key))
   const downKeys = new Set(down.map((c) => c.slug || c.name))
+  // Every slug this account actually knows about — down, quiet or never-pinged. A recovery may only
+  // resolve a row whose key is one of these; anything else filed under this source is not ours to touch.
+  const allCheckKeys = new Set(checks.map((c) => c.slug || c.name))
 
   const { rollup, members } = planSignals(down)
 
@@ -263,14 +285,12 @@ async function main() {
   }
   for (const m of members) await fileSignal(secret, m)
 
-  // Recovered: resolve only what is actually open, so the cockpit's "self-resolved" count stays
-  // a fact about the fleet rather than an artefact of this script running every hour.
-  for (const key of openKeys) {
-    // The rollup is not a check and can never appear in downKeys. Letting this loop see it would
-    // resolve it in the same run that filed it: the alarm cancelling itself a millisecond after it
-    // was raised. It is settled below, against the threshold that created it.
-    if (key === ROLLUP_KEY) continue
-    if (downKeys.has(key)) continue
+  // Recovered: resolve only rows that are (a) real check slugs and (b) no longer down, so the
+  // cockpit's "self-resolved" count stays a fact about the fleet rather than an artefact of this
+  // script running every hour — and, critically, so a non-check row filed under this source (a
+  // diagnosis the closer routed here, say) is NEVER erased by a recovery it can never be part of.
+  // The rollup is settled below on its own threshold, not here.
+  for (const key of recoveredCheckKeys({ openKeys, allCheckKeys, downKeys })) {
     await fileSignal(secret, {
       source: SOURCE, key, kind: 'incident', severity: 'info', state: 'resolved',
       title: `Scheduled job is running again: ${key}`,

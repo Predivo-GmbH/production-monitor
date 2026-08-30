@@ -6,7 +6,7 @@
 import assert from 'node:assert'
 import { fileURLToPath } from 'node:url'
 import {
-  classifyChecks, signalFor, readHcKeys, planSignals, ROLLUP_KEY, ROLLUP_THRESHOLD,
+  classifyChecks, signalFor, readHcKeys, planSignals, recoveredCheckKeys, ROLLUP_KEY, ROLLUP_THRESHOLD,
 } from '../scripts/check-healthchecks-down.mjs'
 
 let n = 0
@@ -159,6 +159,52 @@ t('nothing dark: nothing filed, and no rollup to clear against', () => {
   const { rollup, members } = planSignals([], NOW)
   assert.equal(rollup, null)
   assert.equal(members.length, 0)
+})
+
+// ── recovery resolves ONLY real check slugs ────────────────────────────────────
+// THE DEFECT THIS PINS. The recovery loop used to resolve every open row under source=healthchecks
+// that was not currently down. A row that is not a check slug can never be in `downKeys`, so it was
+// force-resolved by construction — erasing diagnosis/analysis rows the closer routes under this
+// source within the hour. Recovery must intersect the FULL check set, never the whole source.
+const set = (...xs) => new Set(xs)
+
+t('a recovered check (a real slug, no longer down) is resolved', () => {
+  const keys = recoveredCheckKeys({
+    openKeys: set('nightly-backup'), allCheckKeys: set('nightly-backup'), downKeys: set(),
+  })
+  assert.deepEqual(keys, ['nightly-backup'])
+})
+
+t('a check still down is NOT resolved', () => {
+  const keys = recoveredCheckKeys({
+    openKeys: set('nightly-backup'), allCheckKeys: set('nightly-backup'), downKeys: set('nightly-backup'),
+  })
+  assert.deepEqual(keys, [])
+})
+
+t('a NON-CHECK row (a diagnosis routed under this source) is NEVER resolved — the core fix', () => {
+  const keys = recoveredCheckKeys({
+    openKeys: set('monitor-job-dark-work-items-not-released-on-recovery'),
+    allCheckKeys: set('nightly-backup', 'inbox-triage'),   // real check slugs only
+    downKeys: set(),
+  })
+  assert.deepEqual(keys, [])
+})
+
+t('a mixed board: only the recovered real checks come back, the analysis row is left alone', () => {
+  const keys = recoveredCheckKeys({
+    openKeys: set('inbox-triage', 'gsc-daily-check', 'closer-digest-board-link-points-at-superseded-rows'),
+    allCheckKeys: set('inbox-triage', 'gsc-daily-check', 'brain-processor'),
+    downKeys: set('gsc-daily-check'),   // still down
+  })
+  assert.deepEqual(keys.sort(), ['inbox-triage'])
+})
+
+t('the rollup key is never resolved here even if it is somehow a known slug — it is settled on its threshold', () => {
+  const keys = recoveredCheckKeys({
+    openKeys: set(ROLLUP_KEY), allCheckKeys: set(ROLLUP_KEY), downKeys: set(),
+  })
+  assert.deepEqual(keys, [])
 })
 
 console.log(`\n${n} tests passed.`)
