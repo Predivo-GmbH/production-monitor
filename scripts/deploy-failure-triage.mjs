@@ -267,10 +267,14 @@ function runAgent(c, workdir, dryRun) {
 
   // process.execPath is the node already running this file, so nothing hard-codes a node path;
   // everything after `--` is the engine's own argv, unchanged.
+  // --add-dir <workdir> has two jobs: it widens Claude's read context to the clone (harmless), and
+  // on a Kimi takeover run it is what KIMI_JOB_WRITE_ROOTS is built from - without it the Kimi
+  // boundary would refuse every write in the clone and the takeover would be a wasted run.
   const args = [
     AGENT_RUN, '--job', AGENT_RUN_JOB, '--exempt', '--',
     '-p', buildUserPrompt(c, workdir),
     '--append-system-prompt', policy,
+    '--add-dir', workdir,
     ...agentToolFlags(allowedTools),
     '--max-turns', String(MAX_TURNS),
     '--model', MODEL,
