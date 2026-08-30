@@ -29,13 +29,15 @@
  *     red, because nothing has established what the sweep should have found.
  */
 
-import { readFileSync } from 'node:fs'
-
 import { boardSecret, fileSignal, signal } from "./lib/fleet-signal.mjs"
+// Moved to scripts/lib/ on 2026-08-30 when expire-stale-sessions.mjs failed with the exact
+// same signature and needed the same answer. Re-exported so this module's public surface
+// (and its test) is unchanged by the move.
+import { coverageGaps, coverageLine, loadBaseline } from './lib/supabase-coverage.mjs'
+
+export { coverageGaps, loadBaseline }
 
 const TOKEN_KEYS = (env) => Object.keys(env).filter((k) => /^SUPABASE_TOKEN_|_SUPABASE_ACCESS_TOKEN$|^SUPABASE_ACCESS_TOKEN$/.test(k))
-
-const BASELINE_FILE = new URL('./lib/supabase-projects-baseline.json', import.meta.url)
 
 export async function checkBuildCurrency(env = process.env) {
   const seen = new Map()
@@ -70,32 +72,6 @@ export async function checkBuildCurrency(env = process.env) {
     }
   }
   return [...seen.values()]
-}
-
-/** The written-down expectation, or null when it has not been established yet. */
-export function loadBaseline(file = BASELINE_FILE) {
-  try {
-    const parsed = JSON.parse(readFileSync(file, 'utf8'))
-    return Array.isArray(parsed?.projects) && parsed.projects.length ? parsed : null
-  } catch {
-    return null
-  }
-}
-
-/**
- * Baseline projects that NO token in this environment could see.
- *
- * The three-valued return is the whole point and must not be collapsed to an array:
- *   null -> coverage is UNPROVEN (no baseline). Not the same as "nothing missing".
- *   []   -> coverage is PROVEN COMPLETE. Every project we expect was read this run.
- *   [..] -> these products are unwatched right now.
- * Reading `[]` and `null` as the same thing is precisely the bug this file used to have,
- * where "the sweep returned no complaints" was treated as "the sweep saw everything".
- */
-export function coverageGaps(findings, baseline) {
-  if (!baseline?.projects?.length) return null
-  const seen = new Set(findings.filter((f) => !f.isToken && f.ref).map((f) => f.ref))
-  return baseline.projects.filter((p) => !seen.has(p.ref))
 }
 
 /** Coverage gaps rendered as ordinary unreadable findings, so one blindness path reports all of them. */
@@ -211,9 +187,7 @@ if (process.argv[1] && process.argv[1].endsWith('check-supabase-build-currency.m
   // Counted separately because the old line called a dead TOKEN one of the "projects
   // checked", which inflated the reassuring number using the very thing that was broken.
   console.log(`${projects.length} projects checked, ${behind.length} behind the current build, ${blind.length} unreadable`)
-  console.log(baseline
-    ? `coverage: ${baseline.projects.length - (gaps?.length ?? 0)}/${baseline.projects.length} expected projects read${gaps.length ? ` — MISSING: ${gaps.map((p) => p.product).join(', ')}` : ''}`
-    : 'coverage: UNPROVEN — scripts/lib/supabase-projects-baseline.json is absent or empty, so a project that vanished from every token would not be noticed')
+  console.log(coverageLine(gaps, baseline))
 
   // What the sweep actually saw, so the baseline is bootstrapped and audited from ground
   // truth (the API's own refs and names) instead of hand-copied out of Credentials.txt,
