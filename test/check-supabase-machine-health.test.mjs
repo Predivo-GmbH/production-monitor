@@ -13,6 +13,7 @@
  * Run: node test/check-supabase-machine-health.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
+import fs2 from 'node:fs'
 import { metricValue, exitDecision, discover } from '../scripts/check-supabase-machine-health.mjs'
 
 let passed = 0
@@ -153,5 +154,17 @@ check('end-to-end: a keyless product maps to an unreadable finding that exitDeci
   assert.match(dec.message, /SCOUTCOPILOT/, 'and it must be named in the alert')
 })
 
+
+// A pair of samples whose counters have not moved means we sampled inside one metrics-refresh
+// window, NOT that the machine is idle. Before 2026-08-30 the gap was 30s, shorter than the
+// refresh, so ALL 20 machines reported a perfect 0.00 MB/s and the check went green across the
+// whole fleet — the same false all-clear as the regex bug, arriving by a different road.
+check('identical counters between samples must NOT read as 0.00 MB/s OK', () => {
+  const src = fs2.readFileSync(new URL('../scripts/check-supabase-machine-health.mjs', import.meta.url), 'utf8')
+  assert.ok(/SAMPLE_GAP_MS = 180_000/.test(src), 'sample gap must be longer than the metrics refresh (180s)')
+  assert.ok(/counters did not move/.test(src), 'a no-movement sample pair must be reported as inconclusive')
+  const guardBeforeMath = src.indexOf('counters did not move') < src.indexOf('const dt = (b.at - a.at)')
+  assert.ok(guardBeforeMath, 'the no-movement guard must run BEFORE the rate is computed')
+})
 console.log(`\n${passed} passed, ${failed} failed.`)
 process.exitCode = failed ? 1 : 0
