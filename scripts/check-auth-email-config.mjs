@@ -103,7 +103,12 @@ async function readAuthConfig(ref, pinnedKey, env = process.env) {
   return {
     cfg: await getAuthConfig(ref, fallback.token),
     usedKey: fallback.key,
-    fellBackFrom: pinned ? pinnedKey : null,
+    // Report the fallback whether the pinned token was REFUSED or simply ABSENT.
+    // An unset/empty SUPABASE_TOKEN_<ACCT> (a deleted or never-renewed secret, which
+    // in CI expands to '') is exactly the blind spot this commit warned against:
+    // it would resolve via a sibling token and vanish from the output. Surface it.
+    fellBackFrom: pinnedKey,
+    pinnedMissing: !pinned,
   }
 }
 
@@ -132,9 +137,12 @@ async function main() {
       try {
         const read = await readAuthConfig(p.ref, pinnedKey)
         if (!read) { missingTokens.push(`${p.name} (account ${acct}, ref ${p.ref}) — no management token in this environment can see it`); continue }
-        const { cfg, usedKey, fellBackFrom } = read
+        const { cfg, usedKey, fellBackFrom, pinnedMissing } = read
         // Audited fine, so it must NOT fail the guard — but the map is wrong and says so.
-        if (fellBackFrom) staleTokens.push(`${p.name}: ${fellBackFrom} is no longer accepted; audited with ${usedKey} instead`)
+        if (fellBackFrom) {
+          const why = pinnedMissing ? 'is not set' : 'is no longer accepted'
+          staleTokens.push(`${p.name}: ${fellBackFrom} ${why}; audited with ${usedKey} instead`)
+        }
         const reasons = evaluate(cfg)
         rows.push({ name: p.name, rate: cfg.rate_limit_email_sent, smtp: cfg.smtp_host || 'null', hook: cfg.hook_send_email_enabled, ok: reasons.length === 0 })
         if (reasons.length) violations.push({ project: p.name, testName: 'auth-email config', error: reasons.join('; ') })
@@ -157,7 +165,7 @@ async function main() {
   }
   if (staleTokens.length) {
     console.log('')
-    console.log('STALE TOKEN NAMES (audited via another token - fix the ACCOUNTS map in this file):')
+    console.log('STALE TOKEN NAMES (audited via another token - fix the ACCOUNTS map, or add/renew the missing SUPABASE_TOKEN_<ACCT> secret):')
     for (const t of staleTokens) console.log('  -', t)
   }
   if (warnings.length) {

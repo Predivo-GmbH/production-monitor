@@ -113,6 +113,20 @@ await check('both real callers actually route through this module', () => {
   }
 })
 
+await check('a missing/empty pinned secret is still reported, not silently worked around', () => {
+  // The 2026-08-30 blind-spot regression: readAuthConfig returned
+  // `fellBackFrom: pinned ? pinnedKey : null`, so a DELETED or never-renewed
+  // SUPABASE_TOKEN_<ACCT> (in CI an undefined secret expands to '') resolved via a
+  // sibling token and produced no STALE TOKEN NAMES line and no UNAUDITED line — the
+  // run stayed green while another account's PAT did the audit. The commit's own
+  // invariant is "The fallback is always REPORTED". So the fallback must be flagged
+  // whether the pinned token was refused OR absent, and the message must tell them
+  // apart ("is not set" vs "is no longer accepted").
+  const guard = readFileSync(new URL('../scripts/check-auth-email-config.mjs', import.meta.url), 'utf8')
+  assert.doesNotMatch(guard, /fellBackFrom:\s*pinned\s*\?/, 'the fallback must be reported even when the pinned secret was absent, not only when it was refused')
+  assert.match(guard, /is not set/, 'the missing-secret shape must be worded and surfaced in STALE TOKEN NAMES')
+})
+
 globalThis.fetch = realFetch
 console.log(`\n${passed} passed, ${failed} failed`)
 process.exit(failed ? 1 : 0)
