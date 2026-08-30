@@ -264,5 +264,13 @@ if (process.argv[1] && process.argv[1].endsWith('check-supabase-build-currency.m
 
   const { code, reasons } = exitDecision(findings, gaps)
   for (const r of reasons) console.error(`::error::${r}`)
-  process.exit(code)
+
+  // NOT process.exit(). On Windows, exiting while undici still holds its keep-alive sockets
+  // aborts the process with a libuv assertion (UV_HANDLE_CLOSING, src\win\async.c:76) and
+  // reports 3221226505 instead of the exit code this check just decided — so anyone running
+  // the watchdog on their own machine sees a crash rather than its verdict. Letting the loop
+  // drain gives the real code on every platform; the unref'd backstop cannot hold the
+  // process open by itself, and only fires if a stuck socket is keeping it alive anyway.
+  process.exitCode = code
+  setTimeout(() => process.exit(code), 10_000).unref()
 }

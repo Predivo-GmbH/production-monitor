@@ -1,0 +1,29 @@
+{
+  "note": "What the Supabase fleet is SUPPOSED to contain. check-supabase-build-currency.mjs used to report only the projects some management token handed it, so a project no token could see was not 'unreadable' — it was absent, and absent read as fine. This file is what turns that into a fact: every ref here must be read by some token on every run, or the run goes red naming the product. It also makes a dead token decidable — if all of these were read without it, the token cost us no coverage and is housekeeping rather than an hourly alarm.",
+  "sourceOfTruth": "Captured from the Supabase Management API itself (the inventory the run prints under 'observed project inventory'), NOT from the projects' docs/Credentials.txt, where dead and superseded refs sit next to live ones. Beize Jass Tour is the proof: Credentials.txt says uyksotlmrlxhmyeopktl, the API says dkxdlovwzsxnepoteebk. ReplyFlow staging has five candidate refs on disk and only one live one.",
+  "capturedAt": "2026-08-30",
+  "capturedFrom": "https://github.com/Arivioo/production-monitor/actions/runs/33317134499",
+  "maintenance": "A project INTENTIONALLY deleted must be removed from this list in the same change, or the check reds forever asking where it went. A project ADDED shows up in the run's observed inventory and should be added here — until it is, nothing guarantees anyone is watching it.",
+  "projects": [
+    { "ref": "iooexkbuxmeryeuzpxau", "product": "Arivioo" },
+    { "ref": "xyqdyqpdjugevjmjbcdp", "product": "arivioo-staging" },
+    { "ref": "vvgqkwiqauafcflshsec", "product": "BackOffice Staging" },
+    { "ref": "xoecpzfsskalvjrtcbbl", "product": "Backoffice.predivo.ch's Project" },
+    { "ref": "dkxdlovwzsxnepoteebk", "product": "Beize Jass Tour" },
+    { "ref": "xzythvxmuxmczuiophwp", "product": "BoatBuddy" },
+    { "ref": "svpewgbwousyheohlrtt", "product": "BoatBuddy Staging" },
+    { "ref": "qswluvqunswggfmesdcs", "product": "ChannelMover" },
+    { "ref": "wlbykamxcgwduixcwadn", "product": "ChannelMover Staging" },
+    { "ref": "jckctrtkstejolddqzlk", "product": "DistributionOS Staging" },
+    { "ref": "jxjpbmkgmuunpayqgbsx", "product": "DistributionOS.predivo.ch" },
+    { "ref": "gjfcxynkirwerzxbkekh", "product": "LaunchReady Staging" },
+    { "ref": "dqmhsdzldkxngwjrxois", "product": "ReplyFlow" },
+    { "ref": "cuvqzwvyovxvvvuddtjd", "product": "replyflow-staging" },
+    { "ref": "rlcsuqwqzoqjykdiqjye", "product": "scoutcopilot.com's Project" },
+    { "ref": "ogdpgufptemcgyszmjek", "product": "SignalScore" },
+    { "ref": "blfnyxwcriyxvsaubiqb", "product": "SignalScore Staging" },
+    { "ref": "hcfeoescybfngjsphekq", "product": "supabase@launchready.predivo.ch's Project" },
+    { "ref": "mkdeftmubrkseyrrbzvp", "product": "Valrano Production" },
+    { "ref": "vfwpcgdkrwqhdivfzmrg", "product": "Valrano Staging" }
+  ]
+}
