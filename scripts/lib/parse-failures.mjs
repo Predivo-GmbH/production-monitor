@@ -60,6 +60,43 @@ export function extractFailures(suite, parentName) {
   return failures
 }
 
+/** The project label of the last-resort row deriveFailures() emits when a run failed
+ *  but produced no parseable per-test failure, no named canary and no top-level error.
+ *  Exported so send-alert.mjs can detect that fallback and replace it with the STEP that
+ *  actually failed (see failedStepRows). */
+export const NO_DETAIL_PROJECT = 'Run failed — no per-test detail'
+
+/** True when `failures` is exactly the content-free no-per-test-detail fallback — i.e. the
+ *  run went red on a non-test step (Supabase build currency / machine health / expire-sessions)
+ *  while every Playwright spec passed, so there is nothing test-shaped to show. */
+export function isNoDetailFallback(failures = []) {
+  return failures.length === 1 && failures[0]?.project === NO_DETAIL_PROJECT
+}
+
+/** Turn the `jobs` array of `gh run view <id> --json jobs` into alert rows naming each STEP
+ *  that failed. A non-test workflow step that exits 1 (build-currency finding a project
+ *  unreadable, a machine-health probe, a stale-session sweep) fails the job but writes no
+ *  Playwright result, so the alert used to synthesise a phantom "1 test(s) failed" row. This
+ *  names the real step instead — the 2026-08-30 board incident, same class as the 2026-08-21
+ *  drift-check misreport. continue-on-error steps report conclusion 'success' here (their
+ *  outcome is failure but they own a dedicated alert), so they are correctly not named. */
+export function failedStepRows(jobs = []) {
+  const rows = []
+  for (const job of jobs ?? []) {
+    for (const step of job.steps ?? []) {
+      if (step.conclusion === 'failure') {
+        rows.push({
+          project: 'Monitor step failed',
+          test: step.name || 'unnamed step',
+          error: `The workflow step "${step.name || 'unnamed step'}" exited non-zero. No Playwright test failed in this run — open the run logs for that step's output.`,
+          file: '',
+        })
+      }
+    }
+  }
+  return rows
+}
+
 /** Normalise a canary-results.json failure record into an alert row. */
 export function canaryRows(canaryFailures = []) {
   return (canaryFailures ?? []).map((c) => ({
@@ -114,7 +151,7 @@ export function deriveFailures(results, canaryFailures = []) {
     ? `${s.expected ?? '?'} passed, ${s.unexpected ?? '?'} failed, ${s.flaky ?? '?'} flaky, ${s.skipped ?? '?'} skipped`
     : 'report had no suites and no top-level errors'
   return [{
-    project: 'Run failed — no per-test detail',
+    project: NO_DETAIL_PROJECT,
     test: 'see run logs',
     error: `The run failed but produced no parseable per-test failures (${statsLine}). Likely a crash/timeout in setup or a worker died. Open the run logs.`,
     file: '',

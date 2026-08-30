@@ -1,5 +1,5 @@
 import { createMailTransport } from './lib/smtp.mjs'
-import { extractFailures, canaryRows, deriveFailures } from './lib/parse-failures.mjs'
+import { extractFailures, canaryRows, deriveFailures, isNoDetailFallback, failedStepRows } from './lib/parse-failures.mjs'
 import { readFileSync, existsSync } from 'fs'
 import { execSync } from 'child_process'
 
@@ -46,6 +46,17 @@ if (existsSync(resultsPath)) {
     error: 'test-results/results.json was not generated — the run likely crashed or timed out before Playwright wrote a report. Open the run logs.',
     file: '',
   }]
+}
+
+// A non-test always() step (Supabase build currency / machine health / expire-sessions) can
+// exit 1 while every Playwright spec passes. deriveFailures then falls through to the generic
+// "no per-test detail" row, which the header renders as "N test(s) failed" — a phantom test for
+// what was really a step failure (board incident 2026-08-30, same class as the 2026-08-21 drift
+// misreport). When that generic row is all we have, ask GitHub which STEP actually failed and
+// name it, so a red monitor says what broke. Fails safe: any error keeps the generic row.
+if (isNoDetailFallback(failures)) {
+  const stepRows = failedStepFailures()
+  if (stepRows.length) failures = stepRows
 }
 
 // Load auto-fix results if available
@@ -96,6 +107,21 @@ if (hasAutoFixes) {
 // current failure was ALSO failing in the immediately-previous monitor run (a continuing, already-
 // alerted issue). A NEW/changed failure signature always pages. FAIL-OPEN: any uncertainty (no
 // prior run, artifact missing, parse error, GH error) → send the alert. We never go silent on doubt.
+// Ask GitHub which STEP of THIS run failed, so a non-test step failure is named instead of
+// rendered as a phantom test row. FAIL-SAFE: no run id / no gh auth / any error → [] and the
+// caller keeps the generic row (never worse than before). Only replaces the row on a real hit.
+function failedStepFailures() {
+  try {
+    const runId = String(process.env.GITHUB_RUN_ID || '')
+    if (!runId) return []
+    if (!process.env.GH_TOKEN && !process.env.GITHUB_TOKEN) return []
+    const out = execSync(`gh run view ${runId} --json jobs`, { encoding: 'utf-8', timeout: 30_000 })
+    return failedStepRows(JSON.parse(out).jobs)
+  } catch {
+    return []
+  }
+}
+
 function previousFailureSignatures() {
   try {
     const currentRunId = String(process.env.GITHUB_RUN_ID || '')
@@ -172,7 +198,10 @@ if (allFixed) {
 } else {
   headerBg = '#dc2626'
   headerTitle = 'Production Monitor Alert'
-  headerSubtitle = `${failures.length} test(s) failed across ${Object.keys(projectGroups).length} project(s)`
+  // "failure(s)", not "test(s)": a row here can be a failed non-test STEP or a canary, and
+  // calling a step failure a failed test is the 2026-08-30 "1 test(s) failed when every test
+  // passed" incident. The table names exactly what broke.
+  headerSubtitle = `${failures.length} failure(s) across ${Object.keys(projectGroups).length} project(s)`
 }
 
 const html = `
@@ -260,7 +289,7 @@ await transporter.sendMail({
     ? `[AUTO-FIXED] ${autoFixCount} issue(s) resolved automatically`
     : hasAutoFixes
       ? `[PARTIAL FIX] ${failures.length} issue(s) need attention, ${autoFixCount} auto-fixed`
-      : `[ALERT] ${failures.length} test(s) failed — ${projectSummary}`,
+      : `[ALERT] ${failures.length} failure(s) — ${projectSummary}`,
   html,
 })
 
