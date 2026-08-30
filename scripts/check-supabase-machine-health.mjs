@@ -20,7 +20,10 @@
 
 const WARN_MB_S = 2.0   // sustained OS-disk traffic; the quiet fleet sits at 0.06-0.5
 const FAIL_MB_S = 4.0   // ScoutCopilot was 7.74 when Supabase complained
-const SAMPLE_GAP_MS = 30_000
+const SAMPLE_GAP_MS = 180_000  // Supabase refreshes these counters on its own scrape interval.
+                               // At 30s BOTH samples read identical values and every machine
+                               // scored a perfect 0.00 MB/s, i.e. a false all-clear across the
+                               // whole fleet. 3 minutes is comfortably longer than the refresh.
 
 // The label block is OPTIONAL: node_vmstat_pgmajfault and node_memory_MemTotal_bytes are
 // exposed WITHOUT labels, while node_disk_*_bytes_total carry a {device="..."} block. The
@@ -88,6 +91,12 @@ export async function checkMachines(env = process.env) {
     // when it loses access reads as "all clear", which is the failure mode this file exists for.
     if (!a || !b || a.read == null || b.read == null) {
       findings.push({ product: t.product, level: 'unreadable', detail: 'metrics endpoint returned no usable sample' })
+      return
+    }
+    // Counters that did not move at all mean we sampled inside one refresh window, not that
+    // the machine is idle. Reporting that as 0.00 MB/s OK is the false all-clear this check exists to avoid.
+    if (b.read === a.read && b.majfault === a.majfault) {
+      findings.push({ product: t.product, level: 'unreadable', detail: 'counters did not move between samples — window shorter than the metrics refresh' })
       return
     }
     const dt = (b.at - a.at) / 1000
