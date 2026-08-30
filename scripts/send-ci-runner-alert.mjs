@@ -97,18 +97,33 @@ if (brokenReason) {
   // limit, a dropped socket, a timeout, a crash, or a batch of failed API calls is NOT an expired
   // PAT, and telling Roger to renew the token every time trains him to distrust the one case where
   // it IS the token. So classify the reason (ratelimit | auth | other) and speak to what actually
-  // failed. A rate limit is the most important to call out: a 403 rate-limit looks exactly like a
-  // 403 auth failure, and this alarm blamed the token for it three times before this.
+  // failed. A rate limit is the most important to separate out: a 403 rate-limit looks exactly like
+  // a 403 auth failure, and this alarm blamed the token for it three times before this.
   const kind = classifyWatchdogFailure(brokenReason)
-  const likelyCauseHtml = kind === 'ratelimit'
-    ? `<p style="margin-top:16px;font-size:13px;color:#374151">
-        <strong>Most likely cause:</strong> the shared GitHub API hourly allowance was exhausted -
-        this is a <strong>rate limit, not a token problem</strong>. <strong>Do NOT rotate the
-        DASHBOARD_PAT:</strong> an invalid token could not have reached the API at all. Something
-        upstream emptied the hour (see the CI Cost Guard / github-api-budget). The check goes green
-        on its own once the allowance resets.
-      </p>`
-    : kind === 'auth'
+
+  // ...but classifying it right is only half the job: we then PAGED for it anyway. A rate-limited
+  // run is blind for a reason that is not this watchdog's to report and that Roger cannot act on -
+  // the shared hourly API allowance was emptied upstream, the token is fine, and the check goes
+  // green by itself at the reset. That condition already HAS an owner: check-github-api-budget.mjs,
+  // whose source `github-api-budget` deliberately carries no `signal_page_policy` row so it lands
+  // on /signals and "never rings his phone unasked" - the house default-nobody-chose rule. Emailing
+  // from here bypassed a decision the house had already made. On 2026-08-30 a single self-healing
+  // exhaustion (reset 17:20) sent four identical "the runner alarm is blind" pages between 16:40
+  // and 17:16, each of whose own body said the check needs nothing and fixes itself.
+  //
+  // So: do not page - but STAY RED (exit 1). A run that could not certify the fleet must never look
+  // healthy; see the "ABSENCE IS NOT SUCCESS" contract at the top of check-ci-runners.mjs. The red
+  // run and the /signals row remain; only the unasked-for email goes away.
+  if (kind === 'ratelimit') {
+    console.log(
+      'CI runner watchdog is blind on a RATE LIMIT - not paging. The shared API hour was emptied ' +
+      'upstream; the token is valid and this clears itself at the reset. github-api-budget owns ' +
+      `this condition and files it to /signals. Reason: ${brokenReason}`,
+    )
+    process.exit(1)
+  }
+
+  const likelyCauseHtml = kind === 'auth'
     ? `<p style="margin-top:16px;font-size:13px;color:#374151">
         <strong>Most likely cause:</strong> the DASHBOARD_PAT expired or lost its <code>administration</code>
         scope - the most likely auth failure of this watchdog. Renew/rescope the token and the check
