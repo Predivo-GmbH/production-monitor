@@ -18,12 +18,18 @@ if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS || !ALERT_EMAIL) {
 
 const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 
-const transporter = await createMailTransport({
+// Built at the moment we actually send, not on import. A run that decides NOT to page (the
+// rate-limit gate below) should not stand up a mail stack to then not use it — and the unit suite
+// runs deliberately without `npm ci` (see .github/workflows/test.yml, "CHEAP ON PURPOSE"), so
+// importing nodemailer at module scope made the no-send path untestable: the script died on the
+// import before it could reach the decision under test.
+let transporter = null
+const mailer = async () => (transporter ??= await createMailTransport({
   host: SMTP_HOST,
   port: SMTP_PORT,
   user: SMTP_USER,
   pass: SMTP_PASS,
-})
+}))
 
 // This step runs `if: failure()`. There are two very different reasons the checker failed:
 //   1. It ran fine and found something (fell back to paid runners) -> benign report below.
@@ -81,7 +87,7 @@ if (report.watchdog_silent) {
     </div>
   </div>
   `
-  await transporter.sendMail({
+  await (await mailer()).sendMail({
     from: `Production Monitor <${SMTP_USER}>`,
     to: ALERT_EMAIL,
     subject: `[CI RUNNERS] the runner watchdog has gone SILENT - the fleet has NO automatic fallback`,
@@ -156,7 +162,7 @@ if (brokenReason) {
     </div>
   </div>
   `
-  await transporter.sendMail({
+  await (await mailer()).sendMail({
     from: `Production Monitor <${SMTP_USER}>`,
     to: ALERT_EMAIL,
     subject: `[CI RUNNERS] watchdog could NOT complete - the runner alarm is blind`,
@@ -208,7 +214,7 @@ const html = `
   </div>
 `
 
-await transporter.sendMail({
+await (await mailer()).sendMail({
   from: `Production Monitor <${SMTP_USER}>`,
   to: ALERT_EMAIL,
   subject: `[CI RUNNERS] office PC not taking build jobs - fleet moved to paid runners`,

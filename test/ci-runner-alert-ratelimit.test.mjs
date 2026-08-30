@@ -56,16 +56,9 @@ const AUTH_REASON =
  * ECONNREFUSED rather than hanging on a real connection — that refusal is the evidence a send was
  * attempted. Nothing here can reach a real mail server, so no test can email Roger.
  */
-function runWith(reason) {
+function runReport(report) {
   const dir = mkdtempSync(join(tmpdir(), 'ci-runner-alert-'))
-  writeFileSync(join(dir, 'ci-runner-findings.json'), JSON.stringify({
-    generated_at: '2026-08-30T17:16:34.000Z',
-    watchdog_broken: true,
-    broken_reason: reason,
-    repos_with_runners: null,
-    flips: [],
-    findings: [`WATCHDOG COULD NOT COMPLETE: ${reason}`],
-  }))
+  writeFileSync(join(dir, 'ci-runner-findings.json'), JSON.stringify(report))
   const r = spawnSync(process.execPath, [SCRIPT], {
     cwd: dir,
     encoding: 'utf8',
@@ -83,6 +76,21 @@ function runWith(reason) {
   return { ...r, out: `${r.stdout || ''}${r.stderr || ''}` }
 }
 
+const runWith = (reason) => runReport({
+  generated_at: '2026-08-30T17:16:34.000Z',
+  watchdog_broken: true,
+  broken_reason: reason,
+  repos_with_runners: null,
+  flips: [],
+  findings: [`WATCHDOG COULD NOT COMPLETE: ${reason}`],
+})
+
+// "It tried to send" looks different depending on where this runs. On a dev machine nodemailer is
+// installed and the attempt dies on the closed port (ECONNREFUSED). In CI the suite runs with no
+// `npm ci` at all, so the attempt dies resolving nodemailer itself. Either way the script reached
+// its send path, which is the only thing these cases pin.
+const TRIED_TO_SEND = /ECONNREFUSED|ESOCKET|ETIMEDOUT|ERR_MODULE_NOT_FOUND|nodemailer/i
+
 check('a rate-limited watchdog sends NO email', () => {
   const r = runWith(RATELIMIT_REASON)
   assert.doesNotMatch(r.out, /alert sent/i, 'it must not report having sent a page')
@@ -98,7 +106,32 @@ check('a rate-limited watchdog still exits non-zero — blind is never healthy',
 check('the suppression is narrow: an auth failure still pages', () => {
   const r = runWith(AUTH_REASON)
   assert.doesNotMatch(r.stdout, /not paging/i, 'a broken token is exactly what this alarm is for')
-  assert.match(r.out, /ECONNREFUSED|ESOCKET|ETIMEDOUT/, 'it must have tried to send the page')
+  assert.match(r.out, TRIED_TO_SEND, 'it must have tried to send the page')
+})
+
+// The rate-limit gate above made the mail transport lazy (it used to be built on import, which is
+// why the no-send path could not be tested at all without `npm ci`). That touched all THREE send
+// sites, so the two that are not about rate limits get a case each: a refactor nobody checked is
+// how a send site quietly stops sending.
+
+check('a SILENT watchdog still pages — the fleet has no fallback while it is down', () => {
+  const r = runReport({
+    generated_at: '2026-08-30T17:16:34.000Z',
+    watchdog_silent: true,
+    findings: ['The CI runner watchdog has not run in over an hour.'],
+    flips: [],
+  })
+  assert.match(r.out, TRIED_TO_SEND, 'the silent-watchdog page must still be sent')
+})
+
+check('the ordinary "moved to paid runners" report still pages', () => {
+  const r = runReport({
+    generated_at: '2026-08-30T17:16:34.000Z',
+    repos_with_runners: 7,
+    flips: ['cockpit -> ubuntu-latest'],
+    findings: ['cockpit: 1 runner(s) registered, NONE online -> falling back to GitHub-hosted'],
+  })
+  assert.match(r.out, TRIED_TO_SEND, 'the benign fallback notice must still be sent')
 })
 
 console.log(`\n${passed} passed, ${failed} failed`)
