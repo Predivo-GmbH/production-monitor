@@ -55,6 +55,7 @@
  * check had never received a single ping.
  */
 import fs from 'node:fs'
+import { giveUpKind } from './lib/ci-budget-giveup.mjs'
 
 const OWNER = process.env.CI_BUDGET_OWNER || 'Predivo-GmbH'
 const TOKEN = process.env.GH_TOKEN || process.env.GITHUB_TOKEN
@@ -92,6 +93,10 @@ const isRateLimited = (r) =>
   (r.status === 403 && r.headers.get('x-ratelimit-remaining') === '0')
 
 async function gh(url) {
+  // Per-CALL evidence of a rate limit, so the give-up attribution below cannot be tainted by some
+  // OTHER call earlier in the sweep. quotaResetAt (the refill time) stays run-wide; only WHY this
+  // particular call gave up is local to this call.
+  let sawRateLimit = false
   for (let attempt = 0; attempt < 6; attempt++) {
     let r
     try {
@@ -109,6 +114,7 @@ async function gh(url) {
       }
       const retryAfter = Number(r.headers.get('retry-after') || 0) * 1000
       const reset = Number(r.headers.get('x-ratelimit-reset') || 0) * 1000
+      sawRateLimit = true
       if (reset > quotaResetAt) quotaResetAt = reset
       const need = retryAfter || (reset ? reset - Date.now() + 3000 : 0)
       // The cap stays: the job's own timeout-minutes is 60, so sleeping out a full hour would be
@@ -129,8 +135,9 @@ async function gh(url) {
     }
     return r.json()
   }
-  // Ran out of attempts. Attribute it to whichever cause was actually observed.
-  if (quotaResetAt) rateLimitGiveUps++
+  // Ran out of attempts. Attribute it to whichever cause THIS call actually observed - not to a
+  // run-global that any earlier rate-limited call would have set (see lib/ci-budget-giveup.mjs).
+  if (giveUpKind(sawRateLimit) === 'ratelimit') rateLimitGiveUps++
   else apiErrors++
   return null
 }
