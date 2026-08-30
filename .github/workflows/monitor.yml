@@ -438,6 +438,27 @@ jobs:
         env:
           BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
 
+      # A CUSTOMER RECEIVING THE SAME EMAIL TWICE MUST REACH ROGER. ChannelMover's lifecycle-tick
+      # started NOTICING this on 2026-08-25 (commit 9a7ab98): on a second account-level email of
+      # the same kind, to the same person, on the same UTC day, it appends a warning to its JSON
+      # response and to console.warn. It changed no send behaviour and had no reader — the only way
+      # the first duplicate was found was a human counting rows in a ledger, hours late.
+      #
+      # This reads the warning off the RESPONSE BODY, which pg_net persists into net._http_response
+      # on every scheduled 5-minute tick (the pg_cron caller ignores the response; pg_net keeps it
+      # ~6h anyway), via a read-only Management API SQL query — so the monitor never re-invokes a
+      # function that SENDS CUSTOMER EMAIL. It files `critical` / needs_human:true on the first
+      # sighting, deduped on the identity of the duplicate (product+user+step+day) so one duplicated
+      # email is one page, not one every five minutes. A duplicate email cannot self-heal, so it is
+      # never auto-resolved. A token that is unset or a read that fails reds the step — unknown is
+      # not "no duplicates". Exits 0 on a filed alarm (the signal IS the alert), like its neighbours.
+      - name: A customer emailed the same thing twice must say so
+        if: always()  # independent sensor — must run even if the monitor step above failed. Exits 0 on a filed alarm (only a failed read reds the job), so this cannot double-red one event.
+        run: node scripts/check-lifecycle-duplicate-warnings.mjs
+        env:
+          SUPABASE_TOKEN_CHANNELMOVER: ${{ secrets.SUPABASE_TOKEN_CHANNELMOVER }}
+          BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
+
       - name: Email when the CI runner watchdog has gone silent
         if: ${{ always() && steps.ci_watchdog_alive.outcome == 'failure' }}
         run: |
