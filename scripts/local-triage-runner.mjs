@@ -180,6 +180,9 @@ function triageOneGuard(state, wf, run) {
       '-p', prompt,
       '--append-system-prompt', policy,
       ...agentToolFlags(allowedTools),
+      // agent-run builds the Kimi write roots (KIMI_JOB_WRITE_ROOTS) from --add-dir and refuses a
+      // Kimi launch without one (2026-08-31, the agent-triage Kimi profile). Root = the clone.
+      '--add-dir', WORKDIR,
       '--max-turns', '40',
       '--model', 'claude-opus-4-8',
       '--output-format', 'json',

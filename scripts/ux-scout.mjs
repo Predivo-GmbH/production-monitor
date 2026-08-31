@@ -416,7 +416,11 @@ function narrate(product, rows) {
   // This call only narrates findings and asks for no tools, but it is still an autonomous
   // spawn of the CLI, so it carries the same deny list as every other dispatcher. One
   // invariant with no exceptions is what deploy-deny-tools.test.mjs can actually enforce.
-  const res = spawnSync(process.execPath, [AGENT_RUN, '--job', AGENT_RUN_JOB, '--', '-p', prompt, '--disallowedTools', DEPLOY_DENY_TOOLS.join(',')], {
+  const res = spawnSync(process.execPath, [AGENT_RUN, '--job', AGENT_RUN_JOB, '--', '-p', prompt, '--disallowedTools', DEPLOY_DENY_TOOLS.join(','),
+    // agent-run builds the Kimi write roots (KIMI_JOB_WRITE_ROOTS) from --add-dir and refuses a
+    // Kimi launch without one (2026-08-31, the ux-scout Kimi profile). A narration writes NOTHING,
+    // so the root is a dedicated EMPTY directory - never the state dir with its logs and digests.
+    '--add-dir', 'C:/Business/_ux-scout/kimi-workspace'], {
     encoding: 'utf-8', timeout: 5 * 60 * 1000,
     // ALWAYS the subscription CLI, never a metered key. Roger's standing rule, 2026-08-29: the
     // API key is only for work a customer triggers inside a product. This spawn inherited the

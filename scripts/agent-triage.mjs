@@ -215,6 +215,10 @@ function main() {
       '-p', userPrompt,
       '--append-system-prompt', policy,
       ...agentToolFlags(allowedTools),
+      // agent-run builds the Kimi write roots (KIMI_JOB_WRITE_ROOTS) from --add-dir and refuses a
+      // Kimi launch without one (2026-08-31, the agent-triage Kimi profile). The ONLY repo this
+      // job writes is the pristine clone, so the root is exactly the clone.
+      '--add-dir', WORKDIR,
       '--max-turns', String(MAX_TURNS),
       '--model', MODEL,
       '--output-format', 'json',
