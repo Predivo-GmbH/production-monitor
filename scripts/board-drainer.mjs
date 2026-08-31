@@ -1440,6 +1440,12 @@ function dispatchAgent(inc, mode) {
     '-p', buildUserPrompt(inc),
     '--append-system-prompt', policy,
     ...agentToolFlags(allowedTools),
+    // agent-run builds the Kimi write roots (KIMI_JOB_WRITE_ROOTS) from these and REFUSES a Kimi
+    // launch without at least one (2026-08-31, the board-drainer Kimi profile): the repos it may
+    // fix, plus its own verdict/state directory. On Claude they are advisory; on Kimi they are
+    // the boundary the profile's Write/Edit tools are bounded by.
+    '--add-dir', 'C:/Business/Internal Projects',
+    '--add-dir', 'C:/Business/_board-drainer',
     '--max-turns', String(MAX_TURNS),
     '--model', MODEL,
     '--output-format', 'json',
