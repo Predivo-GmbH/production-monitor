@@ -1,5 +1,6 @@
 import { createMailTransport } from './lib/smtp.mjs'
 import { extractFailures, canaryRows, deriveFailures, isNoDetailFallback, failedStepRows } from './lib/parse-failures.mjs'
+import { previousDedupView, shouldSuppressAlert } from './lib/alert-dedup.mjs'
 import { readFileSync, existsSync } from 'fs'
 import { execSync } from 'child_process'
 
@@ -104,9 +105,12 @@ if (hasAutoFixes) {
 
 // ── Edge-triggered dedup (Roger's alerting philosophy: don't re-page hourly for a KNOWN ongoing
 // issue — page once when it breaks, once when it resolves). Suppress this alert ONLY if every
-// current failure was ALSO failing in the immediately-previous monitor run (a continuing, already-
-// alerted issue). A NEW/changed failure signature always pages. FAIL-OPEN: any uncertainty (no
-// prior run, artifact missing, parse error, GH error) → send the alert. We never go silent on doubt.
+// current failure was ALSO failing in the immediately-previous monitor run — as the identical
+// continuing failure, or as a root cause (failure reason) that run already paged, now spread to
+// more specs (the 2026-08-31 re-page incident; see scripts/lib/alert-dedup.mjs). A NEW failure —
+// new test, or a known test failing for a NEW reason — always pages. FAIL-OPEN: any uncertainty
+// (no prior run, artifact missing, parse error, GH error, vague reason) → send the alert. We
+// never go silent on doubt.
 // Ask GitHub which STEP of THIS run failed, so a non-test step failure is named instead of
 // rendered as a phantom test row. FAIL-SAFE: no run id / no gh auth / any error → [] and the
 // caller keeps the generic row (never worse than before). Only replaces the row on a real hit.
@@ -122,7 +126,9 @@ function failedStepFailures() {
   }
 }
 
-function previousFailureSignatures() {
+// Build the previous run's dedup view (signatures + root-cause reasons) from its
+// test-results artifact. Returns null on ANY uncertainty → the caller fails open (sends).
+function previousDedup() {
   try {
     const currentRunId = String(process.env.GITHUB_RUN_ID || '')
     if (!process.env.GH_TOKEN && !process.env.GITHUB_TOKEN) return null   // no gh auth → fail open
@@ -135,28 +141,21 @@ function previousFailureSignatures() {
       r.status === 'completed' &&
       (r.conclusion === 'success' || r.conclusion === 'failure'))
     if (!prev) return null                          // no comparable prior run → fail open
-    if (prev.conclusion === 'success') return new Set()   // last run GREEN → every current failure is new → send
-    // Last run failed → pull its results.json artifact and extract its failure signatures.
+    if (prev.conclusion === 'success') return null  // last run GREEN → every current failure is new → send
+    // Last run failed → pull its results.json artifact and extract its failure rows.
     execSync(`gh run download ${prev.databaseId} -n test-results -D _prev_results`, { encoding: 'utf-8', timeout: 60_000 })
     const prevResults = JSON.parse(readFileSync('_prev_results/test-results/results.json', 'utf-8'))
     const prevFailures = []
     for (const suite of prevResults.suites ?? []) prevFailures.push(...extractFailures(suite, null))
-    if (prevFailures.length === 0) return null      // couldn't read prior failures → fail open
-    return new Set(prevFailures.map((f) => `${f.project}||${f.test}`))
+    return previousDedupView(prevFailures)          // empty → null → fail open
   } catch {
     return null                                     // ANY error → fail open (send)
   }
 }
 
-const currentSignatures = failures.map((f) => `${f.project}||${f.test}`)
-const prevSignatures = previousFailureSignatures()
-const allAlreadyAlerted =
-  prevSignatures instanceof Set &&
-  prevSignatures.size > 0 &&
-  currentSignatures.length > 0 &&
-  currentSignatures.every((s) => prevSignatures.has(s))
-if (allAlreadyAlerted && !allFixed) {
-  console.log(`Suppressing duplicate alert — all ${currentSignatures.length} failure(s) were already alerted in the previous run (still failing, no new/changed issue). Resolution email will fire when they recover.`)
+const prevView = previousDedup()
+if (shouldSuppressAlert(failures, prevView) && !allFixed) {
+  console.log(`Suppressing duplicate alert — all ${failures.length} failure(s) match the previous run (continuing failure or an already-paged root cause spreading; no new issue). Resolution email will fire when they recover.`)
   process.exit(0)
 }
 
