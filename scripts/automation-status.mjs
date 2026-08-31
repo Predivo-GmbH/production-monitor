@@ -1,7 +1,9 @@
 // automation-status.mjs — Collects the latest GitHub Actions run status for every
 // workflow across all tracked repos, writes automation-status.json, FTP-uploads it to
 // backoffice.predivo.ch (consumed by the BackOffice "Wie wir arbeiten" handbook), and
-// flags any workflow that has been red for more than RED_ESCALATION_HOURS.
+// flags any workflow that has been red beyond its cadence-relative escalation threshold
+// (see scripts/lib/cron-cadence.mjs: max(48h, 2x the workflow's own schedule period), so
+// a weekly job gets two real chances to recover before anyone is paged).
 //
 // Runs inside GitHub Actions (production-monitor) with GH_TOKEN + FTP creds.
 // Exists because SignalScore production deploys were silently red for 2 weeks
@@ -9,9 +11,10 @@
 
 import { execSync } from 'node:child_process'
 import { writeFileSync } from 'node:fs'
+import { BASE_ESCALATION_HOURS, thresholdForWorkflowYaml } from './lib/cron-cadence.mjs'
 
 const OWNER = 'Arivioo'
-const RED_ESCALATION_HOURS = 48
+const RED_ESCALATION_HOURS = BASE_ESCALATION_HOURS // base floor; the real threshold is per-workflow
 // Workflows that only run on PRs / rarely — "no recent runs" is normal, not a problem.
 const PR_ONLY_WORKFLOWS = ['Code Review', 'Security Review', 'Design Review']
 
@@ -103,6 +106,22 @@ for (const project of projects) {
     }
 
     const redHours = redSince ? hoursSince(redSince) : 0
+
+    // Cadence-relative threshold: a red workflow only escalates once it has been red
+    // for max(48h, 2x its own schedule period) — i.e. it has had at least two full
+    // schedule periods to recover. Only fetched for red workflows (saves API calls).
+    let schedulePeriodHours = null
+    let thresholdHours = RED_ESCALATION_HOURS
+    if (latest.conclusion === 'failure' && !prOnly) {
+      const wfFile = gh(`repos/${OWNER}/${project.repo}/contents/${wf.path}`)
+      if (wfFile && wfFile.content) {
+        const yaml = Buffer.from(wfFile.content, 'base64').toString('utf-8')
+        const t = thresholdForWorkflowYaml(yaml, NOW)
+        schedulePeriodHours = t.schedulePeriodHours
+        thresholdHours = t.thresholdHours
+      }
+    }
+
     workflowStatuses.push({
       name: wf.name,
       conclusion: latest.conclusion, // success | failure | cancelled | skipped | ...
@@ -110,15 +129,18 @@ for (const project of projects) {
       url: latest.html_url,
       redSince,
       redHours,
+      thresholdHours,
+      schedulePeriodHours,
       prOnly,
     })
 
-    if (latest.conclusion === 'failure' && !prOnly && redHours !== null && redHours >= RED_ESCALATION_HOURS) {
+    if (latest.conclusion === 'failure' && !prOnly && redHours !== null && redHours >= thresholdHours) {
       escalations.push({
         repo: project.repo,
         name: project.name,
         workflow: wf.name,
         redHours,
+        thresholdHours,
         url: latest.html_url,
       })
     }
@@ -141,7 +163,7 @@ for (const project of projects) {
 
 const report = {
   generatedAt: new Date(NOW).toISOString(),
-  redEscalationHours: RED_ESCALATION_HOURS,
+  redEscalationHours: RED_ESCALATION_HOURS, // base floor; per-workflow thresholdHours may be higher
   summary: { repos: projects.length, green, red, unknown, escalations },
   repos,
 }
@@ -199,6 +221,6 @@ if (FTP_HOST && FTP_USER && FTP_PASS) {
 writeFileSync('/tmp/automation-escalations.json', JSON.stringify(escalations, null, 2))
 
 if (escalations.length > 0) {
-  console.log(`\n${escalations.length} workflow(s) red for >${RED_ESCALATION_HOURS}h (alert email will be sent):`)
-  for (const e of escalations) console.log(`  ${e.name} / ${e.workflow} — ${e.redHours}h`)
+  console.log(`\n${escalations.length} workflow(s) red beyond their escalation threshold (alert email will be sent):`)
+  for (const e of escalations) console.log(`  ${e.name} / ${e.workflow} — red ${e.redHours}h, threshold ${e.thresholdHours}h`)
 }

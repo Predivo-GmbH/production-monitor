@@ -32,6 +32,7 @@ const rows = escalations
         <td style="padding:8px;border:1px solid #e5e7eb;font-weight:600;white-space:nowrap">${e.name}</td>
         <td style="padding:8px;border:1px solid #e5e7eb">${e.workflow}</td>
         <td style="padding:8px;border:1px solid #e5e7eb;color:#dc2626;white-space:nowrap">${e.redHours} h</td>
+        <td style="padding:8px;border:1px solid #e5e7eb;white-space:nowrap">${e.thresholdHours ?? 48} h</td>
         <td style="padding:8px;border:1px solid #e5e7eb"><a href="${e.url}" style="color:#2563eb">Run ansehen</a></td>
       </tr>`,
   )
@@ -40,8 +41,8 @@ const rows = escalations
 const html = `
   <div style="font-family:system-ui,sans-serif;max-width:700px;margin:0 auto">
     <div style="background:#dc2626;color:white;padding:16px 24px;border-radius:8px 8px 0 0">
-      <h2 style="margin:0;font-size:18px">Automation Alert — Workflows seit über 48 h rot</h2>
-      <p style="margin:4px 0 0;font-size:14px;opacity:0.9">${escalations.length} Workflow(s) schlagen seit längerem fehl und wurden nicht behoben.</p>
+      <h2 style="margin:0;font-size:18px">Automation Alert — Workflows über ihrer Eskalationsschwelle rot</h2>
+      <p style="margin:4px 0 0;font-size:14px;opacity:0.9">${escalations.length} Workflow(s) schlagen seit längerem fehl und wurden nicht behoben (Schwelle = max. 48 h oder 2× der eigene Lauf-Rhythmus).</p>
     </div>
     <div style="padding:24px;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 8px 8px">
       <table style="width:100%;border-collapse:collapse;font-size:13px">
@@ -50,6 +51,7 @@ const html = `
             <th style="padding:8px;border:1px solid #e5e7eb;text-align:left">Projekt</th>
             <th style="padding:8px;border:1px solid #e5e7eb;text-align:left">Workflow</th>
             <th style="padding:8px;border:1px solid #e5e7eb;text-align:left">Rot seit</th>
+            <th style="padding:8px;border:1px solid #e5e7eb;text-align:left">Schwelle</th>
             <th style="padding:8px;border:1px solid #e5e7eb;text-align:left">Link</th>
           </tr>
         </thead>
@@ -73,7 +75,7 @@ const transporter = await createMailTransport({
 await transporter.sendMail({
   from: `Production Monitor <${SMTP_USER}>`,
   to: ALERT_EMAIL,
-  subject: `[AUTOMATION] ${escalations.length} Workflow(s) seit >48h rot`,
+  subject: `[AUTOMATION] ${escalations.length} Workflow(s) über Eskalationsschwelle rot`,
   html,
 })
 
