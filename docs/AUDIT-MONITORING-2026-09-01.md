@@ -161,6 +161,58 @@ green`. The finding is closed; what made it dangerous was not the token but F12,
 released unchecked for a day with the only trace a red weekly run nobody watches.
 
 
+### F15 — A malformed reply cancelled a live outage alarm · FIXED
+`check-healthchecks-down.mjs` ended its read with `return (body.checks || []).map(...)`. Any 200
+whose body carried no check list produced ZERO checks, which means nothing is down, which clears
+the rollup, and `main()` then FILES a signal reading *"The scheduled jobs are running again /
+Everything that was dark is checking in again"*. A bad read did not go quiet: it wrote a positive
+all-clear over a live outage and cancelled any page still inside its self-heal window. This is one
+of the few sources permitted to ring the phone. Fixed in `a8ec07a`: `checksFrom()` throws, which is
+the file's own documented behaviour for an unreadable account. Three assertions, watched to fail
+against the old line, 27 green.
+
+### F16 — Two daily jobs could report success for doing nothing · FIXED
+`kb-learning\run-daily.cmd` requires the runner's own `phase=finish` marker before pinging green,
+because `claude -p` exits 0 even when it did no work; a weekly-limit stop and an expired login both
+exited 0 and falsely showed UP. Its two siblings, `knowledge-apply\run-daily.cmd` and
+`kb-learning\run-backfill.cmd`, called that check only when the exit code was NON-zero
+(`if not "%RC%"=="0" call :override_if_finished`), so the marker could rescue a false RED and could
+never catch a false GREEN. Fixed in BackOffice `1792873`, symmetric now, dead routine removed, and
+the decision block was run as a truth table: exit 0 with no marker returns 126 and pings failure
+(the case that was green before), exit 0 with marker 0, exit 1 with marker 0, exit 1 without 1.
+
+---
+
+## Open leads from the 2026-09-01 parallel sweep
+
+Four agents read every sensor script, all 21 spec files, all 13 workflow alert paths and all 28
+scheduled-job checks. They produced roughly sixty leads, most anchored to a quoted line. **A lead is
+not a finding: each one is verified against the source before anything is changed** — that discipline
+is why F15 was fixed within minutes and why nothing else in this list has been touched yet. Grouped:
+
+**Sensor logic, about 22 leads.** The sharpest: the CI-runner watchdog alerts on the TRANSITION to
+paid runners and is green forever after, so the fleet can sit on paid minutes indefinitely; the
+layer-2 watchdog reads a queued backlog as fresh liveness, which is the exact failure its own header
+was written against; the GitHub-allowance guard cannot see a fast burn because both alarm branches
+require a projection window a burst never satisfies; the Sentry check fetches 100 issues without
+pagination and then auto-resolves anything it did not fetch.
+
+**Test assertions that cannot fail, about 25 leads.** The highest-leverage: the probe behind every
+product's "all deployed edge functions are reachable" test sends no key, so the gateway answers 401
+before the function is ever invoked, which is the 2026-09-01 mechanism on a different endpoint. Also
+four products assert a successful login by checking the URL does not contain `/auth` while their
+login page is `/login`, an assertion that cannot fail; and eight BackOffice page tests assert only
+that an `<h1>` is visible, which the file itself records two deleted routes once satisfied via the
+not-found page's own heading.
+
+**Scheduled-job checks, about 13 leads.** Of 28 checks, only about nine are gated on the work
+succeeding; the rest ping green on an exit code from a headless CLI call that exits 0 having done
+nothing. Two structural gaps stand out: one check has pinged 2,240 times and no script, task or
+crontab anywhere sends it, so it exists in no repository and cannot be restored; and the night shift
+at the centre of the August incident has no check at all, along with the board drainer, verify sweep,
+UX scout, factory engine and commit review.
+
+
 ---
 
 ## What is built correctly, and should not be changed while fixing the above
