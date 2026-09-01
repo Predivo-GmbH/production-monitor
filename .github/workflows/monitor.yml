@@ -224,6 +224,26 @@ jobs:
           # Test user
           TEST_EMAIL: healthcheck-test@predivo.ch
 
+      # PUBLISH WHAT THE RUN ABOVE JUST PROVED, instead of throwing every pass away (2026-09-01).
+      #
+      # Until now the only thing that ever left this run was an alert email listing failures. All
+      # ~170 passes — a real browser magic-link login on 8 products, a real mailbox round trip on
+      # 5 — were discarded, so the Cockpit "Fleet health" page grew its own far weaker probes and
+      # rendered "Login OK / All clear" for LaunchReady on a morning it could not send a single
+      # login email. This step lands the evidence in product_check_run (Cockpit/sql/082) so that
+      # page can stop probing and start reporting.
+      #
+      # `if: always()` because a FAILED run is exactly the run whose results the page most needs;
+      # default if:success() would publish only the hours when nothing was wrong. The script is
+      # fire-and-forget by contract — it catches everything and exits 0, so a dashboard write can
+      # never red a monitoring job. Placed here, immediately after the suite, so it reads
+      # test-results/results.json before any later step can touch the working tree.
+      - name: Publish what was proven about each product
+        if: always()
+        run: node scripts/publish-check-results.mjs
+        env:
+          BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
+
       # Supabase machine health + build currency. Added 2026-08-29 after Supabase, not us,
       # was the first to notice that ScoutCopilot's machine was burning 7.74 MB/s of disk
       # while idle. Cause was the platform build it sat on (17.6.1.084): 74.1 KB read per

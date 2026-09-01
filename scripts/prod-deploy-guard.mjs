@@ -37,7 +37,12 @@ import { pathToFileURL } from 'url'
 // connect-platform, process-queue, …) are NEVER allowed here, by design. Extend deliberately.
 const ALLOWLIST = {
   dqmhsdzldkxngwjrxois: { label: 'ReplyFlow PROD', functions: ['monitor-sync-health'] },
-  xoecpzfsskalvjrtcbbl: { label: 'BackOffice PROD', functions: ['monitoring-board', 'health-monitor'] },
+  // `health-monitor` was removed 2026-09-01: it is being retired. It was the third implementation
+  // of "is this product up", it could never alarm about anything because nothing invoked it on a
+  // schedule, and its verdicts were the weakest of the three (a 429 from a rate-limited
+  // /auth/v1/otp read back as HEALTHY). A function nobody should deploy again does not belong on
+  // a deploy allowlist.
+  xoecpzfsskalvjrtcbbl: { label: 'BackOffice PROD', functions: ['monitoring-board'] },
 }
 
 const DAILY_CAP = 2
