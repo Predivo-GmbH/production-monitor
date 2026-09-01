@@ -19,6 +19,7 @@
  */
 
 import { boardSecret, fileSignal, signal } from "./lib/fleet-signal.mjs"
+import { sanitizeEnvAndReport } from "./lib/credentials.mjs"
 
 const WARN_MB_S = Number(process.env.DISK_WARN_MB_S || 2.0)   // sustained OS-disk traffic; the quiet fleet sits at 0.06-0.5
 const FAIL_MB_S = Number(process.env.DISK_FAIL_MB_S || 4.0)   // ScoutCopilot was 7.74 when Supabase complained
@@ -167,6 +168,17 @@ export function blindSignal(findings) {
 }
 
 if (process.argv[1] && process.argv[1].endsWith('check-supabase-machine-health.mjs')) {
+  // One invisible character in a key blinds this check without ever naming the key. On
+  // 2026-09-01 a UTF-8 BOM on JASSTOUR_SERVICE_ROLE_KEY made the metrics request unsendable,
+  // sample() caught the throw, and the run reported "UNREADABLE JASSTOUR — metrics endpoint
+  // returned no usable sample": honest, and completely unactionable. Repaired here and named in
+  // the log so the cause is visible. See lib/credentials.mjs for the incident.
+  //
+  // Inside the CLI guard, not at module scope: the unit tests import discover()/checkMachines()
+  // and must not have the real process.env rewritten underneath them as a side effect of an
+  // import. main() reads process.env after this line, so the repair still reaches it.
+  sanitizeEnvAndReport()
+
   const findings = await checkMachines()
   for (const f of findings) console.log(`${String(f.level).toUpperCase().padEnd(11)} ${String(f.product).padEnd(20)} ${f.detail}`)
   const loud = findings.filter((f) => f.level === 'fail' || f.level === 'warn')
