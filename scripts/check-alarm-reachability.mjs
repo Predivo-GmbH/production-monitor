@@ -23,7 +23,7 @@
  *      six of which had already filed something page-worthy.
  *   2. A HAND-OFF THAT LOOKED LIKE A DELIVERY. board-drainer cancelled the pending page when it
  *      moved a finding to the work board. 18 of the 21 lost pages. Fixed in board-drainer.mjs
- *      (pageFieldsOnSupersede) and migration 156.
+ *      (pageFieldsOnSupersede) and migration 157.
  *   3. A CRITICAL FINDING THAT CANNOT PAGE ITSELF. The rule is `needs_human AND
  *      severity='critical'`. A signal marked critical with needs_human=false is a contradiction:
  *      the producer said it was the worst class of thing and simultaneously that nobody need be

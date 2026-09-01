@@ -216,7 +216,7 @@ code. **The code fix alone does nothing**, and believing otherwise is how this g
 staying broken: `due_pages()` filters `state in ('open','acknowledged')`, so a superseded row
 would keep a `page_due_at` no sweep ever looks at — armed-looking, forever, and silent, which is
 worse than the bug because it reads as green. The other half is BackOffice migration
-`156_a_handoff_is_not_a_delivery.sql`, which readmits exactly the one marker this path writes.
+`157_a_handoff_is_not_a_delivery.sql`, which readmits exactly the one marker this path writes.
 Roger's own dismissals stay silent: he has already seen those.
 
 ### F18 — The alarm on the auto-fixer called a 95%-abandoned board "working" · FIXED

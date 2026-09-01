@@ -50,7 +50,7 @@ t('a RE-ARMED page — delivered once, then scheduled again — survives', () =>
 })
 
 t('the marker is the one due_pages() admits, and only this path writes it', () => {
-  // Migration 156 lets a superseded row back into the sweep ONLY on this exact string. If this
+  // Migration 157 lets a superseded row back into the sweep ONLY on this exact string. If this
   // assertion and that migration ever disagree, the page is armed and undeliverable — which
   // reads as green. They are pinned to each other here on purpose.
   const out = pageFieldsOnSupersede({ page_due_at: iso(+9 * 60000), paged_at: null })
