@@ -502,6 +502,22 @@ jobs:
         run: node scripts/check-products-down.mjs
         env:
           BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
+          # THE ANON KEYS ARE THE SENSOR, not decoration. Supabase's gateway rejects a keyless
+          # request to /auth/v1/health itself, with 401, before it ever reaches GoTrue - so the
+          # probe that ran here without them answered "healthy" for twenty hours while ReplyFlow
+          # and SignalScore logins were dead (2026-09-01). A product whose key is missing here is
+          # reported UNPROVEN on every run, never OK. One line per product in fleet_projects.
+          REPLYFLOW_ANON_KEY: ${{ secrets.REPLYFLOW_ANON_KEY }}
+          SIGNALSCORE_ANON_KEY: ${{ secrets.SIGNALSCORE_ANON_KEY }}
+          BACKOFFICE_ANON_KEY: ${{ secrets.BACKOFFICE_ANON_KEY }}
+          SCOUTCOPILOT_ANON_KEY: ${{ secrets.SCOUTCOPILOT_ANON_KEY }}
+          VALRANO_ANON_KEY: ${{ secrets.VALRANO_ANON_KEY }}
+          YTMIGRATION_ANON_KEY: ${{ secrets.YTMIGRATION_ANON_KEY }}   # ChannelMover, pre-rename secret name
+          ARIVIOO_ANON_KEY: ${{ secrets.ARIVIOO_ANON_KEY }}
+          BOATBUDDY_ANON_KEY: ${{ secrets.BOATBUDDY_ANON_KEY }}
+          DISTRIBUTIONOS_ANON_KEY: ${{ secrets.DISTRIBUTIONOS_ANON_KEY }}
+          LAUNCHREADY_ANON_KEY: ${{ secrets.LAUNCHREADY_ANON_KEY }}
+          JASSTOUR_ANON_KEY: ${{ secrets.JASSTOUR_ANON_KEY }}
 
       - name: Email when the CI runner watchdog has gone silent
         if: ${{ always() && steps.ci_watchdog_alive.outcome == 'failure' }}

@@ -12,6 +12,7 @@ import assert from 'node:assert'
 import {
   reasonsUnreachable, brandMatches, signalFor, confirmUnreachable, CONFIRM_ATTEMPTS,
   probeAuth, assertFleetReadable, coverageLine,
+  classifyAuth, authKeyEnvName, authKeyFor, authCoverageLine,
 } from '../scripts/check-products-down.mjs'
 
 let n = 0
@@ -218,6 +219,56 @@ t('the run says how much of the fleet it covered, both ways', () => {
   assert.match(coverageLine(12, 12), /checking 12 of 12/)
   assert.match(coverageLine(12, 12), /every active product is watched/)
   assert.match(coverageLine(7, 12), /5 carry in_health=false and are watched by NOTHING/)
+})
+
+
+// ── THE 2026-09-01 DEFECT: a keyless probe of /auth/v1/health can never see an outage ────────
+//
+// ReplyFlow and SignalScore auth was dead for twenty hours and this sensor printed "OK" on every
+// hourly run. Both statuses below were measured on the live projects that morning, while every
+// customer login was failing: keyless -> 401 from the gateway, keyed -> 503 from GoTrue. The old
+// predicate was `status < 500`, so the keyless 401 read as healthy. Every assertion here fails
+// against that version.
+
+t('a keyless 401 is NOT health - the gateway answered, the auth service was never reached', () => {
+  assert.equal(classifyAuth(401, { keyed: false }), null)
+  assert.notEqual(classifyAuth(401, { keyed: false }), true, 'this exact `true` cost 20 hours of downtime')
+})
+
+t('a keyed 503 from GoTrue is the outage, and says so', () => {
+  assert.equal(classifyAuth(503, { keyed: true }), false)
+  const r = reasonsUnreachable({ site: { ok: true }, auth: { ok: false, detail: 'HTTP 503' }, brand: true })
+  assert.equal(r.length, 1)
+  assert.match(r[0], /database and login backend/)
+})
+
+t('a keyed 200 is the only thing allowed to mean healthy', () => {
+  assert.equal(classifyAuth(200, { keyed: true }), true)
+  assert.equal(classifyAuth(200, { keyed: false }), null, 'without a key even a 200 proves nothing about GoTrue')
+})
+
+t('could-not-tell never pages: an unproven auth verdict produces no reason', () => {
+  assert.deepEqual(reasonsUnreachable({ site: { ok: true }, auth: { ok: null, detail: 'HTTP 401' }, brand: true }), [])
+})
+
+t('the anon key env name follows the convention monitor.yml already uses', () => {
+  assert.equal(authKeyEnvName('ReplyFlow'), 'REPLYFLOW_ANON_KEY')
+  assert.equal(authKeyEnvName('SignalScore'), 'SIGNALSCORE_ANON_KEY')
+  assert.equal(authKeyEnvName('Distribution-OS'), 'DISTRIBUTIONOS_ANON_KEY')
+  assert.equal(authKeyEnvName('Jass-Tour'), 'JASSTOUR_ANON_KEY')
+  assert.equal(authKeyEnvName('ChannelMover'), 'YTMIGRATION_ANON_KEY', 'renamed product, secrets kept the old prefix')
+})
+
+t('a blank key is no key, so it can never be passed off as a keyed probe', () => {
+  assert.equal(authKeyFor('ReplyFlow', { REPLYFLOW_ANON_KEY: '   ' }), null)
+  assert.equal(authKeyFor('ReplyFlow', {}), null)
+  assert.equal(authKeyFor('ReplyFlow', { REPLYFLOW_ANON_KEY: 'sb_publishable_x' }), 'sb_publishable_x')
+})
+
+t('a run that could not prove an auth backend says so instead of reading as watched', () => {
+  assert.match(authCoverageLine(11, 12, ['Predivo']), /UNPROVEN for Predivo/)
+  assert.match(authCoverageLine(11, 12, ['Predivo']), /watched by NOTHING/)
+  assert.match(authCoverageLine(12, 12), /12 of 12 products/)
 })
 
 console.log(`\n${n} assertions passed.`)

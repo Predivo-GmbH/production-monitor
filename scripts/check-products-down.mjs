@@ -127,15 +127,65 @@ export async function probeSite(url) {
   }
 }
 
+/**
+ * ANON KEY PER PRODUCT, because a keyless probe of this endpoint can NEVER see an outage.
+ *
+ * Env name is the product name upper-cased with everything non-alphanumeric removed, which is
+ * the convention monitor.yml already uses for every other secret. ChannelMover is the one
+ * product whose secrets predate its rename, so it is listed rather than guessed.
+ */
+const AUTH_KEY_ALIASES = { CHANNELMOVER: 'YTMIGRATION' }
+
+export function authKeyEnvName(productName) {
+  const slug = String(productName || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
+  return `${AUTH_KEY_ALIASES[slug] || slug}_ANON_KEY`
+}
+
+export function authKeyFor(productName, env = process.env) {
+  const v = env[authKeyEnvName(productName)]
+  return v && v.trim() ? v.trim() : null
+}
+
+/**
+ * WHAT A STATUS FROM /auth/v1/health ACTUALLY MEANS — written after 2026-09-01, when this
+ * function's predecessor reported "OK ReplyFlow" and "OK SignalScore" on every hourly run for
+ * twenty hours while no customer of either product could log in.
+ *
+ * The old line was `ok: res.status < 500` on a fetch that sent no `apikey`. Supabase's gateway
+ * rejects a keyless request itself, before it ever tries to reach GoTrue, and it answers
+ * **401 "No API key found in request"**. 401 is under 500, so the probe answered healthy — and
+ * it would answer healthy with the auth service deleted. Measured on both dead projects that
+ * morning: keyless → 401, and the same URL with an anon key → 503 upstream connect error.
+ *
+ * So: only a KEYED probe can report health at all. A keyless or key-rejected probe is
+ * `null` = could not tell, which is never a reason to page and never a reason to say fine.
+ */
+export function classifyAuth(status, { keyed }) {
+  if (status >= 500) return false                 // GoTrue itself is failing. This is the outage.
+  if (status === 401 || status === 403) return null // the gateway answered, not the service
+  if (!keyed) return null                          // any keyless verdict is unproven by construction
+  return true
+}
+
 /** Is the product's own auth backend up? Down means nobody can sign in or load their data. */
-export async function probeAuth(ref) {
+export async function probeAuth(ref, key = null) {
   if (!ref) return { ok: true, detail: 'no Supabase project — nothing to check' }
+  const headers = { 'User-Agent': NON_BROWSER_UA }
+  if (key) { headers.apikey = key; headers.Authorization = `Bearer ${key}` }
   try {
-    const res = await withTimeout(fetch(`https://${ref}.supabase.co/auth/v1/health`, { headers: { 'User-Agent': NON_BROWSER_UA } }))
-    return { ok: res.status < 500, detail: `HTTP ${res.status}` }
+    const res = await withTimeout(fetch(`https://${ref}.supabase.co/auth/v1/health`, { headers }))
+    const ok = classifyAuth(res.status, { keyed: Boolean(key) })
+    const why = ok === null ? (key ? ' — the gateway answered, not the auth service' : ' — no anon key for this product, so this proves nothing') : ''
+    return { ok, detail: `HTTP ${res.status}${why}` }
   } catch (err) {
     return { ok: false, detail: err.message }
   }
+}
+
+/** Say out loud how many auth verdicts were actually proven. An unproven one must never read as fine. */
+export function authCoverageLine(proven, expected, unproven = []) {
+  if (proven === expected) return `auth: ${proven} of ${expected} products' auth backends actually probed`
+  return `auth: only ${proven} of ${expected} products' auth backends could be probed — UNPROVEN for ${unproven.join(', ')} (missing anon key); their logins are watched by NOTHING here`
 }
 
 /**
@@ -166,7 +216,7 @@ export function reasonsUnreachable({ site, auth, brand }) {
 
 /** Probe once. Split out so the retry loop and the tests can both drive it. */
 async function probeOnce(p) {
-  const [site, auth] = await Promise.all([probeSite(p.prod_url), probeAuth(p.supabase_ref)])
+  const [site, auth] = await Promise.all([probeSite(p.prod_url), probeAuth(p.supabase_ref, authKeyFor(p.name))])
   const brand = site.ok ? brandMatches(site.body, p.brand_keyword) : null
   return { site, auth, brand }
 }
@@ -180,10 +230,10 @@ export async function confirmUnreachable(p, probe = probeOnce, sleep = (ms) => n
   for (let attempt = 1; attempt <= CONFIRM_ATTEMPTS; attempt++) {
     last = await probe(p)
     const reasons = reasonsUnreachable(last)
-    if (reasons.length === 0) return { reasons: [], attempts: attempt }
+    if (reasons.length === 0) return { reasons: [], attempts: attempt, last }
     if (attempt < CONFIRM_ATTEMPTS) await sleep(CONFIRM_GAP_MS)
   }
-  return { reasons: reasonsUnreachable(last), attempts: CONFIRM_ATTEMPTS }
+  return { reasons: reasonsUnreachable(last), attempts: CONFIRM_ATTEMPTS, last }
 }
 
 /**
@@ -277,12 +327,20 @@ async function main() {
   const openKeys = new Map(open.map((r) => [r.key, r]))
 
   const down = []
+  const authExpected = fleet.filter((p) => p.supabase_ref).map((p) => p.name)
+  const authUnproven = []
   for (const p of fleet) {
-    const { reasons, attempts } = await confirmUnreachable(p)
-    if (reasons.length === 0) { console.log(`  OK    ${p.name}`); continue }
+    const { reasons, attempts, last } = await confirmUnreachable(p)
+    if (p.supabase_ref && last && last.auth && last.auth.ok === null) authUnproven.push(p.name)
+    if (reasons.length === 0) {
+      const caveat = p.supabase_ref && last && last.auth && last.auth.ok === null ? `  (auth UNPROVEN: ${last.auth.detail})` : ''
+      console.log(`  OK    ${p.name}${caveat}`)
+      continue
+    }
     console.log(`  DOWN  ${p.name} after ${attempts} attempt(s): ${reasons.join('; ')}`)
     down.push({ p, reasons })
   }
+  console.log(authCoverageLine(authExpected.length - authUnproven.length, authExpected.length, authUnproven))
 
   if (dry) { console.log('--dry: nothing written.'); return 0 }
 
