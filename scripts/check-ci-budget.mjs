@@ -78,7 +78,9 @@ const H = {
 // The retry-and-attribution loop lives in lib/gh-budget-fetch.mjs so a test can drive the exact
 // give-up attribution with a stubbed fetch (see test/ci-budget-giveup.test.mjs). stats carries the
 // three run-wide counters the loop mutates; the rest of this file reads them after the sweep.
-const stats = { apiErrors: 0, rateLimitGiveUps: 0, quotaResetAt: 0 }
+const stats = { apiErrors: 0, rateLimitGiveUps: 0, quotaResetAt: 0, calls: 0, stoppedBy: null, lowestRemaining: null }
+// maxCalls / reserve default inside makeGh; see the CALL CAP note there for why there are two
+// limits and why tripping either must not be allowed to print PASS.
 const gh = makeGh({ headers: H, stats })
 
 // FULL timestamp, not .slice(0,10). A date-only `created>=` boundary includes the whole of that
@@ -266,6 +268,19 @@ if (stats.apiErrors > 0) {
     `HARNESS: ${stats.apiErrors} API calls failed, so the figures below are incomplete and this run cannot certify anything.`,
   )
 }
+// The guard's OWN safety cap tripped. Its own line, because the remedy is different from every
+// other harness failure here: nothing is broken, this run simply refused to spend the rest of the
+// fleet's API hour on itself. Narrow the window or wait for the refill - do NOT raise the cap to
+// make the red go away, which would restore exactly the 2026-08-29 behaviour it exists to prevent.
+if (stats.stoppedBy) {
+  const [kind] = stats.stoppedBy.split(':')
+  const why = kind === 'maxcalls'
+    ? `this run hit its own per-run ceiling of ${stats.stoppedBy.split(':')[1]} API calls`
+    : `the shared GitHub hour was down to ${stats.lowestRemaining} calls and this run stood down to leave the rest for the fleet`
+  failures.push(
+    `HARNESS: the sweep was stopped early because ${why}. It made ${stats.calls} calls and the figures below are INCOMPLETE, so this run certifies nothing. On 2026-08-29 three back-to-back dispatches of this guard took the fleet allowance to 0/5000 and everything else that needed the API that hour stopped; that is what this limit prevents. Re-run with a smaller CI_BUDGET_WINDOW_DAYS, or after the quota refills. Do not raise the cap to clear this.`,
+  )
+}
 // Separate line, separate wording: an empty API hour is a scheduling problem with a known
 // remedy (wait for the refill), not evidence that the fleet or the checker is broken. Saying
 // "N API calls failed" for this sent the 2026-08-29 investigation into the code for nothing.
@@ -317,6 +332,12 @@ if (projected > cfg.monthly_minute_budget) {
 console.log(`window            : last ${WINDOW_DAYS} days (created >= ${since})`)
 console.log(`repos scanned     : ${repos.filter((r) => !r.archived).length} (${privateRepos.length} private, which are the ones that cost money)`)
 console.log(`runs examined     : ${totalRuns}`)
+// Printed on EVERY run, pass or fail. What this guard costs the shared API hour was invisible
+// until it had already emptied it; a number that is climbing towards the cap should be readable
+// before it trips, not only in the failure that says it did.
+console.log(
+  `github api calls  : ${stats.calls}${stats.lowestRemaining !== null ? `   (lowest remaining on the shared 5000/hour: ${stats.lowestRemaining})` : ''}${stats.stoppedBy ? `   STOPPED EARLY: ${stats.stoppedBy}` : ''}`,
+)
 console.log(`billed minutes    : ${billedMinutes} (private repos on GitHub-hosted runners)`)
 console.log(`free minutes      : ${freeMinutes} (public repos)   ${selfHostedMinutes} (private repos on our own runners)`)
 console.log(

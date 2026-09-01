@@ -20,14 +20,59 @@ export const isRateLimited = (r) =>
 // in place, so the caller keeps the same run-wide totals it read as module globals before. fetchImpl,
 // sleepImpl and now are injected so a test can drive the loop deterministically and without real
 // waits; production passes none of them and gets the real fetch / setTimeout / Date.now.
+// ── THE CALL CAP (2026-09-01) ───────────────────────────────────────────────────────────────
+// The GitHub REST allowance is 5000 requests an hour and it is SHARED BY THE WHOLE FLEET - every
+// repo, every workflow, every local script, all on the one token. A full 7-day sweep here needs
+// roughly 2400 of them, so THREE dispatches of this guard in one night on 2026-08-29 took the
+// fleet's allowance to 0/5000 and everything else that needed the API that hour simply stopped.
+// This guard exists to protect a budget; it must not be the thing that spends one.
+//
+// Two independent limits, because they fail for different reasons:
+//
+//   maxCalls - an absolute ceiling on how many calls ONE run may make, whatever the quota says.
+//              This is the one that stops a runaway loop or a window_days someone typed as 90.
+//   reserve  - a floor under the SHARED remaining quota, read from x-ratelimit-remaining on the
+//              live responses. This is the one that stops a legitimate sweep from taking the last
+//              of an hour that other jobs are already halfway through consuming. A cap counted
+//              only against our own calls cannot see that, which is exactly the "a limit is only
+//              as real as the key it counts against" trap: the number that matters is what is
+//              LEFT on the shared key, not how many we personally have spent.
+//
+// Hitting either does NOT return partial numbers as if they were complete. It sets stoppedBy, and
+// check-ci-budget turns that into a HARNESS failure, so a capped run can never print PASS. An
+// incomplete sweep reporting a clean fleet is the precise failure this whole checker exists to
+// avoid, and it would be worse coming from its own safety limit.
 export function makeGh({
   headers,
   stats,
+  // SIZED AGAINST A LEGITIMATE SWEEP, not against a round number. A 7-day window - the default
+  // for a manual dispatch - examines roughly 2400 runs and therefore needs roughly 2400 calls, so
+  // a ceiling of 2200 would have turned every honest 7-day run red. A gate that goes red on a
+  // healthy run is one people learn to scroll past, which is worse than not having it. 3000
+  // leaves headroom above the real worst case while still being well under the 5000 hour, and
+  // `reserve` is the limit that actually does the protecting.
+  maxCalls = Number(process.env.CI_BUDGET_MAX_CALLS || 3000),
+  reserve = Number(process.env.CI_BUDGET_RESERVE || 1200),
   fetchImpl = fetch,
   sleepImpl = (ms) => new Promise((r) => setTimeout(r, ms)),
   now = () => Date.now(),
 }) {
+  // Initialised here rather than assumed of the caller's object, so an older caller that passes
+  // the original three-field stats still gets working counters instead of NaN.
+  stats.calls ??= 0
+  stats.stoppedBy ??= null
+  stats.lowestRemaining ??= null
   return async function gh(url) {
+    // Once stopped, STAY stopped. Returning null here costs nothing and keeps the sweep's own
+    // loops (5 repo pages, 20 run pages per repo, one jobs call per run) draining harmlessly to
+    // completion rather than needing a bail-out at each of the three call sites.
+    if (stats.stoppedBy) return null
+    if (stats.calls >= maxCalls) {
+      stats.stoppedBy = `maxcalls:${maxCalls}`
+      console.error(`  STOPPED: this run has made ${stats.calls} API calls, its cap. Nothing further will be requested.`)
+      return null
+    }
+    stats.calls++
     // Per-CALL evidence of a rate limit, so the give-up attribution below cannot be tainted by some
     // OTHER call earlier in the sweep. quotaResetAt (the refill time) stays run-wide; only WHY this
     // particular call gave up is local to this call.
@@ -58,6 +103,26 @@ export function makeGh({
         console.error(`  rate limited, waiting ${Math.round(wait / 1000)}s`)
         await sleepImpl(wait)
         continue
+      }
+      // The shared-quota floor. Read on every answered call, including 404s and errors, because
+      // GitHub charges for those too and a sweep over a repo it cannot see would otherwise burn
+      // the hour while never touching this check.
+      const remainingHeader = r.headers.get('x-ratelimit-remaining')
+      if (remainingHeader !== null && remainingHeader !== '') {
+        const remaining = Number(remainingHeader)
+        if (Number.isFinite(remaining)) {
+          if (stats.lowestRemaining === null || remaining < stats.lowestRemaining) {
+            stats.lowestRemaining = remaining
+          }
+          if (remaining < reserve) {
+            stats.stoppedBy = `reserve:${remaining}<${reserve}`
+            console.error(
+              `  STOPPED: only ${remaining} calls left on the shared GitHub hour (floor ${reserve}). ` +
+                'Leaving the rest for the fleet rather than emptying it.',
+            )
+            return null
+          }
+        }
       }
       if (r.status === 404) return null
       if (!r.ok) {
