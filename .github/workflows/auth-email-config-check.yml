@@ -7,7 +7,12 @@ name: Auth Email Config Guard
 
 on:
   schedule:
-    - cron: '0 6 * * 1' # Mondays 06:00 UTC
+    # DAILY since 2026-09-01, was Mondays. This guard is the one that catches a product
+    # unable to send login or password-reset emails, which is a customer being locked out.
+    # A weekly cadence means a regression made on Monday afternoon is invisible until the
+    # following Monday. It is a handful of read-only API calls, so the cost of daily is
+    # noise-free: it only mails when a project is actually at risk.
+    - cron: '0 6 * * *' # every day 06:00 UTC
   workflow_dispatch: {}
 
 jobs:

@@ -93,6 +93,43 @@ In the 2026-09-01 08:57 run, the first `nightly-gauntlet` failure left the other
 tests reported as skipped rather than run. A red that stops looking cannot tell you how wide the
 problem is.
 
+### F9 — Two security guards have been emailing nobody · FIXED
+`check-rls-grants.mjs` and `check-auth-email-config.mjs` send their alert only
+`if (violations.length && process.env.ALERT_SMTP_HOST)`, and their workflows fed that from
+`secrets.ALERT_SMTP_*` and `secrets.ALERT_TO`. **None of those secrets exist in the repo** -
+`gh secret list` shows `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, which is what monitor.yml sends
+with. The 2026-08-31 run log shows `ALERT_SMTP_HOST:` empty, so the condition was false and the
+only trace of the finding was a red workflow nothing watches.
+That run was not a false alarm: it found three SECURITY DEFINER RPCs on BackOffice executable by
+`authenticated` with a spoofable slug argument, plus over-broad anon grants on 129 and 22 tables.
+Fixed in `d6cbae3`: both workflows now use the secrets that exist, and both scripts print an
+explicit `NOT EMAILED` line when they find something with no channel configured. Proven by
+dispatching the guard: the run at 09:54 shows `ALERT_SMTP_HOST: ***` and no send error.
+The finding itself is parked on the board as *"Three work-board database functions can be run by
+any logged-in user"*, deliberately not fixed here because those functions are what the cockpit
+calls as an authenticated user.
+
+### F10 — Nothing asked whether our own guards still run · FIXED
+Thirteen workflows in this repo are on a cron and only four ping healthchecks.io. For the other
+nine - the auth-email guard, the RLS guard, the drift check, the daily keep-alive that stops free
+Supabase projects being paused, and five more - a schedule that silently stopped looks exactly
+like a guard that runs and finds nothing wrong. GitHub disables schedules on its own after repo
+inactivity, a cron can be dropped in an edit, and a workflow can be disabled by hand; none of
+those produce a red run, because they produce no run.
+Fixed in `d29816e`: `scripts/check-workflow-cadence.mjs` reads every cron in the repo, derives the
+expected interval, and compares it with the newest scheduled run GitHub reports. Overdue is 3x the
+interval, the same "only a persistently dead job fires" rule the pg_cron heartbeat uses. An
+unparseable cron, a workflow GitHub will not answer for, and a workflow with no scheduled run are
+each DEAD, never fine. 13 assertions, watched to fail against the naive version. It runs hourly
+inside the monitor, and its first live run judged all 13 workflows inside their windows.
+
+### F11 — A customer-facing guard on a weekly clock · FIXED
+`auth-email-config-check` is the guard that catches a product unable to send login or
+password-reset emails, and it ran on Mondays. A regression made on Monday afternoon was invisible
+until the following Monday. It is a handful of read-only API calls, so it is now daily. The RLS
+guard stays weekly on purpose: it currently has a real open finding, and a daily mail about a
+finding already on the board is the kind of noise that trains an alarm away.
+
 ---
 
 ## What is built correctly, and should not be changed while fixing the above
@@ -111,8 +148,9 @@ problem is.
 
 ## Not yet audited
 
-14 of the 18 `scripts/check-*.mjs` sensors have not been examined one by one against the two
-questions. Also outstanding: the 22 healthchecks.io checks mapped to what each actually proves;
+11 of the 18 `scripts/check-*.mjs` sensors have not been examined one by one against the two
+questions (`check-auth-email-config`, `check-rls-grants` and `check-cron-heartbeats` were, and the
+first two are the subject of F9). Also outstanding: the 22 healthchecks.io checks mapped to what each actually proves;
 the remaining Cockpit tiles and their feeds; the alert-to-inbox path end to end (F6 is the finding
 that this path is the weak one, not the sensors); and whether any scheduled job's own failure can
 go unnoticed the way the monitor's did.
