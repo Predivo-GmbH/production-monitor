@@ -182,10 +182,22 @@ export async function probeAuth(ref, key = null) {
   }
 }
 
-/** Say out loud how many auth verdicts were actually proven. An unproven one must never read as fine. */
-export function authCoverageLine(proven, expected, unproven = []) {
-  if (proven === expected) return `auth: ${proven} of ${expected} products' auth backends actually probed`
-  return `auth: only ${proven} of ${expected} products' auth backends could be probed — UNPROVEN for ${unproven.join(', ')} (missing anon key); their logins are watched by NOTHING here`
+/**
+ * Say out loud how many auth verdicts were actually proven. An unproven one must never read as fine.
+ *
+ * The denominator is products carrying a `supabase_ref` IN THE REGISTRY, not products that have a
+ * backend, and those are not the same set: on 2026-09-01 BoatBuddy, Distribution-OS and arivioo
+ * each had a live Supabase project in their own credentials file and a blank `supabase_ref` row,
+ * so every layer treated them as site-only and nothing checked whether anyone could log in. This
+ * line therefore reports BOTH numbers. A ratio that only counts what it was handed is how "7 of 7"
+ * would read as full coverage over a fleet of twelve.
+ */
+export function authCoverageLine(proven, expected, unproven = [], noBackend = 0) {
+  const tail = noBackend > 0
+    ? `; ${noBackend} more carry no backend in the registry, so no login is checked for them at all`
+    : ''
+  if (proven === expected) return `auth: ${proven} of ${expected} products with a registered backend actually probed${tail}`
+  return `auth: only ${proven} of ${expected} products with a registered backend could be probed — UNPROVEN for ${unproven.join(', ')} (missing anon key); their logins are watched by NOTHING here${tail}`
 }
 
 /**
@@ -340,7 +352,7 @@ async function main() {
     console.log(`  DOWN  ${p.name} after ${attempts} attempt(s): ${reasons.join('; ')}`)
     down.push({ p, reasons })
   }
-  console.log(authCoverageLine(authExpected.length - authUnproven.length, authExpected.length, authUnproven))
+  console.log(authCoverageLine(authExpected.length - authUnproven.length, authExpected.length, authUnproven, fleet.length - authExpected.length))
 
   if (dry) { console.log('--dry: nothing written.'); return 0 }
 

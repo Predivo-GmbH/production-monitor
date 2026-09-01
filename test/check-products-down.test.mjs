@@ -271,4 +271,13 @@ t('a run that could not prove an auth backend says so instead of reading as watc
   assert.match(authCoverageLine(12, 12), /12 of 12 products/)
 })
 
+t('a full score over a partial fleet says how many products it never looked at', () => {
+  // 7 of 7 probed, out of twelve products: the three with a live Supabase project and a blank
+  // registry row are the ones nobody would have counted. Defect: printing only the ratio.
+  const line = authCoverageLine(7, 7, [], 5)
+  assert.match(line, /7 of 7 products with a registered backend/)
+  assert.match(line, /5 more carry no backend in the registry/)
+  assert.match(line, /no login is checked for them at all/)
+})
+
 console.log(`\n${n} assertions passed.`)
