@@ -33,9 +33,9 @@ import { boardSecret, fileSignal, signal } from "./lib/fleet-signal.mjs"
 // Moved to scripts/lib/ on 2026-08-30 when expire-stale-sessions.mjs failed with the exact
 // same signature and needed the same answer. Re-exported so this module's public surface
 // (and its test) is unchanged by the move.
-import { coverageGaps, coverageLine, loadBaseline } from './lib/supabase-coverage.mjs'
+import { coverageGaps, coverageLine, loadBaseline, managementApiOnly, outOfManagementApiReach, outOfReachLine } from './lib/supabase-coverage.mjs'
 
-export { coverageGaps, loadBaseline }
+export { coverageGaps, loadBaseline, managementApiOnly, outOfManagementApiReach }
 
 const TOKEN_KEYS = (env) => Object.keys(env).filter((k) => /^SUPABASE_TOKEN_|_SUPABASE_ACCESS_TOKEN$|^SUPABASE_ACCESS_TOKEN$/.test(k))
 
@@ -163,6 +163,32 @@ export function deadTokenSignal(findings, gaps, baseline) {
  * tested while the CLI had quietly stopped calling it, so a green test proved nothing about
  * what the product actually did.
  */
+/**
+ * The board row for a baseline project NO management token in this repo can reach.
+ *
+ * Filed here and NOT also from expire-stale-sessions.mjs: it is one fact about one missing
+ * credential, and two scripts filing it would breed two rows for a single subject, which the
+ * stable-`key` rule in fleet-signal.mjs exists to prevent. Both scripts still PRINT it, so
+ * neither log can be read as an all-clear.
+ *
+ * Warning, not needs_human: the correct next action is "a person adds a management token",
+ * which is not an outage and must not ring a phone at 03:00. It also deliberately does not
+ * red the run — see managementApiOnly()'s note on why an uncloseable hourly red is worse
+ * than no red at all.
+ */
+export function outOfReachSignal(unreachable) {
+  if (!unreachable?.length) return null
+  return signal({
+    key: 'supabase-project-out-of-management-reach',
+    product: unreachable.length === 1 ? unreachable[0].product : 'fleet',
+    severity: 'warning',
+    needsHuman: false,
+    title: `${unreachable.length} live Supabase project(s) sit in an account this monitor has no token for`,
+    summary: `${unreachable.map((p) => `${p.product} (${p.ref})`).join(', ')}: no SUPABASE_TOKEN_* / *_SUPABASE_ACCESS_TOKEN secret in Arivioo/production-monitor belongs to the owning account, so nothing checks how far behind its Postgres build is and nothing expires its stale logins. This is not an outage and the product is otherwise watched (its disk load is measured directly with its service-role key). It is a permanent hole in two fleet sweeps until someone adds the token.`,
+    detail: `Beize Jass Tour is the case that created this row. Until 2026-09-01 the baseline named the OLD project dkxdlovwzsxnepoteebk, abandoned empty on 2026-08-22, so both sweeps reported a healthy result about a database with nothing in it. The live one is uyksotlmrlxhmyeopktl in account 11api@predivo.ch, proven by the deployed bundle at https://beize-jass-tour.mueller.ro and by jass-tour-ui-kit/docs/Credentials.txt, which also already holds a management PAT for that account (created 2026-08-22, expires 2027-08-21). Adding it as a repo secret named SUPABASE_TOKEN_JASSTOUR closes this permanently; the automation is not permitted to set credentials, so it is left to a person.`,
+  })
+}
+
 export function exitDecision(findings, gaps) {
   const reasons = []
   const projectBlind = findings.filter((f) => f.level === 'unreadable' && !f.isToken)
@@ -175,7 +201,12 @@ export function exitDecision(findings, gaps) {
 }
 
 if (process.argv[1] && process.argv[1].endsWith('check-supabase-build-currency.mjs')) {
-  const baseline = loadBaseline()
+  // Compared against the projects a management token could POSSIBLY see, not the whole
+  // fleet — a project in an account we hold no PAT for is out of reach, not unswept-by-
+  // accident, and is reported on its own line below instead of as a gap nobody can close.
+  const fullBaseline = loadBaseline()
+  const baseline = managementApiOnly(fullBaseline)
+  const unreachable = outOfManagementApiReach(fullBaseline)
   const swept = await checkBuildCurrency()
   const gaps = coverageGaps(swept, baseline)
   const findings = [...swept, ...missingFindings(gaps)]
@@ -188,6 +219,8 @@ if (process.argv[1] && process.argv[1].endsWith('check-supabase-build-currency.m
   // checked", which inflated the reassuring number using the very thing that was broken.
   console.log(`${projects.length} projects checked, ${behind.length} behind the current build, ${blind.length} unreadable`)
   console.log(coverageLine(gaps, baseline))
+  const outOfReach = outOfReachLine(unreachable, 'read')
+  if (outOfReach) console.log(outOfReach)
 
   // What the sweep actually saw, so the baseline is bootstrapped and audited from ground
   // truth (the API's own refs and names) instead of hand-copied out of Credentials.txt,
@@ -227,7 +260,7 @@ if (process.argv[1] && process.argv[1].endsWith('check-supabase-build-currency.m
   // below stands regardless.
   const housekeeping = deadTokenSignal(findings, gaps, baseline)
   const stillBlind = housekeeping ? findings.filter((f) => !(f.isToken && f.level === 'unreadable')) : findings
-  for (const row of [housekeeping, stillBlind.some((f) => f.level === 'unreadable') ? blindSignal(stillBlind) : null].filter(Boolean)) {
+  for (const row of [housekeeping, outOfReachSignal(unreachable), stillBlind.some((f) => f.level === 'unreadable') ? blindSignal(stillBlind) : null].filter(Boolean)) {
     try {
       await fileSignal(boardSecret(), row)
       console.log(`filed to the cockpit signals board: ${row.key}`)

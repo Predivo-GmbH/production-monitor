@@ -258,8 +258,11 @@ check('CLI: discovering ZERO machines exits non-zero and names what the baseline
 // process at all, reported as nothing whatsoever.
 // ---------------------------------------------------------------------------------------
 
+// The ref here is the LIVE Jass-Tour database (account 11api@predivo.ch), not the abandoned
+// dkxdlovwzsxnepoteebk this fixture used to name. Corrected 2026-09-01 together with the
+// baseline itself — a test that teaches the wrong ref is how the wrong ref spreads.
 const JASSTOUR_BASELINE = { projects: [
-  { ref: 'dkxdlovwzsxnepoteebk', product: 'Beize Jass Tour' },
+  { ref: 'uyksotlmrlxhmyeopktl', product: 'Beize Jass Tour' },
   { ref: 'aaaaaaaaaaaaaaaaaaaa', product: 'Other Product' },
 ] }
 
@@ -269,7 +272,7 @@ check('DEFECT, proven by injection: a baseline project with NO *_SUPABASE_URL an
   const env = { OTHER_SUPABASE_URL: 'https://aaaaaaaaaaaaaaaaaaaa.supabase.co', OTHER_SERVICE_ROLE_KEY: 'sb_secret_x' }
   const discovered = discover(env)
   assert.equal(discovered.length, 1, 'only the wired product is discovered')
-  assert.ok(!discovered.some((d) => d.ref === 'dkxdlovwzsxnepoteebk'), 'Jass-Tour never appears — not even as a reasoned/unreadable row')
+  assert.ok(!discovered.some((d) => d.ref === 'uyksotlmrlxhmyeopktl'), 'Jass-Tour never appears — not even as a reasoned/unreadable row')
 
   // What the CLI computed BEFORE this fix: findings straight from discover(), nothing else.
   const preFixFindings = discovered.map((t) => (t.reason ? { product: t.product, level: 'unreadable', detail: t.reason } : { product: t.product, level: 'ok' }))
@@ -283,7 +286,7 @@ check('FIX: coverageGaps() catches the same missing product, and folding it in m
   const gaps = coverageGaps(discovered, JASSTOUR_BASELINE)
   assert.equal(gaps.length, 1)
   assert.equal(gaps[0].product, 'Beize Jass Tour')
-  assert.equal(gaps[0].ref, 'dkxdlovwzsxnepoteebk')
+  assert.equal(gaps[0].ref, 'uyksotlmrlxhmyeopktl')
 
   const findings = [...discovered.map((t) => ({ product: t.product, level: 'ok' })), ...missingFindings(gaps)]
   const dec = exitDecision(findings)
@@ -292,10 +295,10 @@ check('FIX: coverageGaps() catches the same missing product, and folding it in m
 })
 
 check('missingFindings: a gap becomes a named, actionable finding, not a bare count', () => {
-  const [f] = missingFindings([{ ref: 'dkxdlovwzsxnepoteebk', product: 'Beize Jass Tour' }])
+  const [f] = missingFindings([{ ref: 'uyksotlmrlxhmyeopktl', product: 'Beize Jass Tour' }])
   assert.equal(f.level, 'unreadable')
   assert.equal(f.product, 'Beize Jass Tour')
-  assert.match(f.detail, /dkxdlovwzsxnepoteebk/, 'the ref must be in the text — that is what a person needs to go look it up')
+  assert.match(f.detail, /uyksotlmrlxhmyeopktl/, 'the ref must be in the text — that is what a person needs to go look it up')
   assert.equal(missingFindings(null).length, 0, 'unproven coverage (no baseline) invents no findings')
   assert.equal(missingFindings(undefined).length, 0)
 })
@@ -314,7 +317,7 @@ check('DEFECT, proven by injection: the UNFILTERED shared baseline manufactures 
   const stagingCount = real.projects.filter((p) => /staging/i.test(p.product)).length
   assert.ok(stagingCount > 0, 'sanity: the real baseline does contain staging projects')
   // discover() sees only what THIS step actually wires — no staging secret among them, by design.
-  const prodEnv = { JASSTOUR_SUPABASE_URL: 'https://dkxdlovwzsxnepoteebk.supabase.co', JASSTOUR_SERVICE_ROLE_KEY: 'sb_secret_x' }
+  const prodEnv = { JASSTOUR_SUPABASE_URL: 'https://uyksotlmrlxhmyeopktl.supabase.co', JASSTOUR_SERVICE_ROLE_KEY: 'sb_secret_x' }
   const gapsAgainstRawBaseline = coverageGaps(discover(prodEnv), real)
   assert.ok(gapsAgainstRawBaseline.length >= stagingCount,
     'THE BUG: comparing against the unfiltered fleet baseline reports every staging project as missing, every single run, forever')
@@ -335,7 +338,7 @@ check('productionOnly() is a no-op on null/empty baselines (unproven coverage st
 
 check('a fully-covered run has zero gaps and stays green on coverage alone', () => {
   const env = {
-    JASSTOUR_SUPABASE_URL: 'https://dkxdlovwzsxnepoteebk.supabase.co', JASSTOUR_SERVICE_ROLE_KEY: 'sb_secret_x',
+    JASSTOUR_SUPABASE_URL: 'https://uyksotlmrlxhmyeopktl.supabase.co', JASSTOUR_SERVICE_ROLE_KEY: 'sb_secret_x',
     OTHER_SUPABASE_URL: 'https://aaaaaaaaaaaaaaaaaaaa.supabase.co', OTHER_SERVICE_ROLE_KEY: 'sb_secret_y',
   }
   const gaps = coverageGaps(discover(env), JASSTOUR_BASELINE)
