@@ -19,7 +19,8 @@
  */
 import assert from 'node:assert'
 import { spawnSync } from 'node:child_process'
-import { blindSignal, coverageGaps, deadTokenSignal, exitDecision, missingFindings } from '../scripts/check-supabase-build-currency.mjs'
+import { blindSignal, coverageGaps, deadTokenSignal, exitDecision, missingFindings, managementApiOnly, outOfManagementApiReach, outOfReachSignal } from '../scripts/check-supabase-build-currency.mjs'
+import { loadBaseline, outOfReachLine } from '../scripts/lib/supabase-coverage.mjs'
 
 let passed = 0
 let failed = 0
@@ -178,6 +179,83 @@ check('the SHIPPED script enforces coverage and exits on it', () => {
   assert.equal(r.status, 1, 'a run that read nothing must never exit 0')
   assert.match(r.stdout, /coverage: 0\//, 'the shipped script must report coverage, not just count what it happened to see')
   assert.match(r.stderr, /project\(s\) could not be read/, 'and it must say why it failed where a person will read it')
+})
+
+// ---------------------------------------------------------------------------------------
+// OUT OF MANAGEMENT REACH — 2026-09-01. The baseline named dkxdlovwzsxnepoteebk as "Beize
+// Jass Tour". That is the OLD project, found EMPTY on 2026-08-22 and abandoned; the live
+// database is uyksotlmrlxhmyeopktl in a NEW account (11api@predivo.ch) that no token in this
+// repo belongs to. So this sweep spent ten days printing "OK Beize Jass Tour current" about a
+// database with nothing in it — a green reading standing in for the real one, which is the
+// exact class of lie the baseline file was created to end.
+//
+// Correcting the ref is necessary and not sufficient: on its own it would make this sweep
+// report a coverage gap EVERY HOUR that nobody on duty can close, because closing it means
+// adding a credential the automation is forbidden to set. These cases pin both halves.
+// ---------------------------------------------------------------------------------------
+
+const REACH_BASELINE = () => ({ projects: [
+  { ref: 'uyksotlmrlxhmyeopktl', product: 'Beize Jass Tour', managementApi: false },
+  { ref: 'aaaaaaaaaaaaaaaaaaaa', product: 'Other Product' },
+] })
+const OTHER_SWEPT = [{ ref: 'aaaaaaaaaaaaaaaaaaaa', product: 'Other Product', level: 'ok', detail: 'current' }]
+
+check('the real baseline now names the LIVE Jass-Tour database, not the abandoned one', () => {
+  const jt = loadBaseline().projects.filter((p) => /Jass/i.test(p.product))
+  assert.equal(jt.length, 1, 'exactly one Jass-Tour entry')
+  assert.equal(jt[0].ref, 'uyksotlmrlxhmyeopktl',
+    'the live project the deployed bundle at beize-jass-tour.mueller.ro signs into')
+  assert.notEqual(jt[0].ref, 'dkxdlovwzsxnepoteebk', 'the empty abandoned project must never be what a sweep reports on')
+})
+
+check('DEFECT, proven by injection: the corrected ref alone reds this sweep forever, with a gap nobody on duty can close', () => {
+  // Every token works and lists everything it CAN list. It still cannot list a project in an
+  // account it has no membership of, so that project is simply absent from the sweep.
+  const gapsUnfiltered = coverageGaps(OTHER_SWEPT, REACH_BASELINE())
+  assert.equal(gapsUnfiltered.length, 1)
+  assert.equal(gapsUnfiltered[0].product, 'Beize Jass Tour')
+  const dec = exitDecision([...OTHER_SWEPT, ...missingFindings(gapsUnfiltered)], gapsUnfiltered)
+  assert.equal(dec.code, 1, 'THE TRAP: an hourly red whose only remedy is a human adding a credential — it can never be cleared on duty')
+})
+
+check('FIX: managementApiOnly() removes it from the comparison, so a healthy sweep is green', () => {
+  const reachable = managementApiOnly(REACH_BASELINE())
+  assert.equal(reachable.projects.length, 1)
+  const gaps = coverageGaps(OTHER_SWEPT, reachable)
+  assert.deepEqual(gaps, [], 'coverage is PROVEN complete over what a token could reach')
+  assert.equal(exitDecision([...OTHER_SWEPT, ...missingFindings(gaps)], gaps).code, 0)
+})
+
+check('the excluded project is never silently dropped — it is named on its own line and on the board', () => {
+  const unreachable = outOfManagementApiReach(REACH_BASELINE())
+  assert.equal(unreachable.length, 1)
+  const line = outOfReachLine(unreachable, 'read')
+  assert.match(line, /Beize Jass Tour/)
+  assert.match(line, /uyksotlmrlxhmyeopktl/, 'the ref must be in the text — that is what a person needs to go look it up')
+
+  const row = outOfReachSignal(unreachable)
+  assert.equal(row.key, 'supabase-project-out-of-management-reach')
+  assert.equal(row.needs_human, false, 'adding a token is not an outage and must not ring a phone at 03:00')
+  assert.match(row.detail, /SUPABASE_TOKEN_JASSTOUR/, 'the row must say exactly what closes it')
+  assert.equal(outOfReachSignal([]), null, 'a fleet fully in reach files nothing')
+  assert.equal(outOfReachLine([], 'read'), null)
+})
+
+check('a project reachable by NO route is still a gap — the flag routes the finding, it does not excuse the project', () => {
+  // The flag is only ever consulted by the PAT-driven sweeps. check-supabase-machine-health.mjs
+  // reaches this same project directly with its service-role key and compares against the
+  // unfiltered (production) baseline, so nothing here removes it from every watchdog at once.
+  const baseline = { projects: [{ ref: 'uyksotlmrlxhmyeopktl', product: 'Beize Jass Tour', managementApi: false }] }
+  assert.equal(managementApiOnly(baseline).projects.length, 0, 'the PAT sweeps stop expecting it')
+  assert.equal(coverageGaps([], baseline).length, 1, 'a sweep that reaches it another way still demands it')
+})
+
+check('managementApiOnly() is a no-op on null/empty baselines and on an unflagged fleet', () => {
+  assert.equal(managementApiOnly(null), null)
+  assert.equal(managementApiOnly({ projects: [] }).projects.length, 0)
+  const plain = { projects: [{ ref: 'a', product: 'A' }, { ref: 'b', product: 'B' }] }
+  assert.equal(managementApiOnly(plain).projects.length, 2, 'an entry with no flag is reachable — the exception must be written down on purpose')
+  assert.equal(outOfManagementApiReach(plain).length, 0)
 })
 
 console.log(`\n${passed} passed, ${failed} failed`)

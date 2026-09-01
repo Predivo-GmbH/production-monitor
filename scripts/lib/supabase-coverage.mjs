@@ -63,3 +63,48 @@ export function coverageLine(gaps, baseline, verb = 'read') {
   const missing = gaps?.length ? ` — MISSING: ${gaps.map((p) => p.product).join(', ')}` : ''
   return `coverage: ${baseline.projects.length - (gaps?.length ?? 0)}/${baseline.projects.length} expected projects ${verb}${missing}`
 }
+
+/**
+ * The subset of the baseline a MANAGEMENT TOKEN could possibly reach.
+ *
+ * WHY (2026-09-01): a project can be live, customer-facing, and completely invisible to
+ * `GET https://api.supabase.com/v1/projects` — because that endpoint only ever answers for
+ * the accounts we hold a PAT for. Beize Jass Tour is the case that proved it: the live
+ * database `uyksotlmrlxhmyeopktl` sits in account 11api@predivo.ch, created during the
+ * 2026-08-22 rebuild, and no token in this repo belongs to that account. The API therefore
+ * listed only the abandoned husk `dkxdlovwzsxnepoteebk`, the baseline was captured from
+ * that listing, and both PAT-driven sweeps spent ten days reporting a reassuring result
+ * about an empty database while the real one went unswept and unchecked.
+ *
+ * Correcting the baseline's ref fixes the lie but creates a worse alarm if left there: the
+ * two PAT sweeps would report a coverage gap EVERY HOUR that nobody on duty can close,
+ * because closing it means adding a credential — which the automation is not allowed to do.
+ * That is the same trap `deadTokenSignal` already names: a red that can never be cleared
+ * only teaches people to ignore red. So the flag does not hide the project, it ROUTES it:
+ * the PAT sweeps stop counting it as their gap and report it as out of reach instead, and
+ * the watchdogs that CAN reach it another way (check-supabase-machine-health.mjs holds
+ * JASSTOUR_SERVICE_ROLE_KEY and talks to the project directly) still demand it. A project
+ * unreachable by every route would show up as a gap in all of them, which is correct.
+ *
+ * Pure, and deliberately not defaulted to `true` in the file: an entry with no flag is
+ * reachable, so this stays a narrow exception someone had to write down on purpose.
+ */
+export function managementApiOnly(baseline) {
+  if (!baseline?.projects?.length) return baseline
+  return { ...baseline, projects: baseline.projects.filter((p) => p.managementApi !== false) }
+}
+
+/** The projects managementApiOnly() removed — printed and filed, never silently dropped. */
+export function outOfManagementApiReach(baseline) {
+  return (baseline?.projects ?? []).filter((p) => p.managementApi === false)
+}
+
+/**
+ * One line naming what this sweep could not even attempt. Absent from the coverage count is
+ * exactly the "absent reads as fine" failure this whole file exists to end, so the caller
+ * prints this whenever it filters, and prints nothing when it filtered nothing.
+ */
+export function outOfReachLine(unreachable, verb = 'read') {
+  if (!unreachable?.length) return null
+  return `OUT OF REACH: ${unreachable.map((p) => `${p.product} (${p.ref})`).join(', ')} — no management token in this repo belongs to the owning Supabase account, so this sweep cannot ${verb} it at all. Not counted as coverage above, because a gap nobody on duty can close is not an hourly alarm; filed to the board for a human to add the token.`
+}

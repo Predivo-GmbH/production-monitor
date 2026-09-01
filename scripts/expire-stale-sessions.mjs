@@ -65,7 +65,7 @@
  * one we reached would not answer — which is never "nothing to do".
  */
 import { boardSecret, fileSignal, signal } from './lib/fleet-signal.mjs'
-import { coverageGaps, coverageLine, loadBaseline } from './lib/supabase-coverage.mjs'
+import { coverageGaps, coverageLine, loadBaseline, managementApiOnly, outOfManagementApiReach, outOfReachLine } from './lib/supabase-coverage.mjs'
 
 export const IDLE_DAYS = Number(process.env.SESSION_IDLE_DAYS || 30)
 export const ABSOLUTE_DAYS = Number(process.env.SESSION_ABSOLUTE_DAYS || 180)
@@ -210,7 +210,13 @@ export function exitDecision(results, gaps) {
 
 if (process.argv[1] && process.argv[1].endsWith('expire-stale-sessions.mjs')) {
   const dry = process.argv.includes('--dry')
-  const baseline = loadBaseline()
+  // Same reasoning as check-supabase-build-currency.mjs: compare against the projects a
+  // management token could possibly see. A project in an account we hold no PAT for is out
+  // of reach, printed on its own line below, and filed to the board by that script (one
+  // fact, one row) rather than reported here as a gap nobody on duty could close.
+  const fullBaseline = loadBaseline()
+  const baseline = managementApiOnly(fullBaseline)
+  const unreachable = outOfManagementApiReach(fullBaseline)
   const swept = await sweep(process.env, dry)
   const gaps = coverageGaps(swept, baseline)
   const results = [...swept, ...missingFindings(gaps)]
@@ -228,6 +234,8 @@ if (process.argv[1] && process.argv[1].endsWith('expire-stale-sessions.mjs')) {
   const projects = results.filter((r) => !r.isToken)
   console.log(`${projects.length} projects, ${blind.length} unreadable, ${total} stale sessions ${dry ? 'would be' : ''} removed (policy: idle ${IDLE_DAYS}d, absolute ${ABSOLUTE_DAYS}d)`)
   console.log(coverageLine(gaps, baseline, 'swept'))
+  const outOfReach = outOfReachLine(unreachable, 'sweep')
+  if (outOfReach) console.log(outOfReach)
 
   // A dead token that cost no coverage moves OUT of the blindness row and into the
   // housekeeping row — but only that token moves. Everything else still files as blindness,
