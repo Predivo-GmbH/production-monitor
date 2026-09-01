@@ -5,7 +5,7 @@
  * Run: node test/board-drainer.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
-import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, parkedFields, gateFor, stripCode, actionOf, plainTitle, titleObjections, workItemSlugFor, handoffPrompt, routeToWorkBoard, prose, DEPLOY_DENY_TOOLS, agentToolFlags, signalObjects, signalPhrases, matchItem, findJoinTarget, joinMarker } from '../scripts/board-drainer.mjs'
+import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, parkedFields, gateFor, stripCode, actionOf, plainTitle, titleObjections, workItemSlugFor, handoffPrompt, routeToWorkBoard, prose, DEPLOY_DENY_TOOLS, agentToolFlags, signalObjects, signalPhrases, matchItem, findJoinTarget, joinMarker, expectedBusinessApplies } from '../scripts/board-drainer.mjs'
 
 let n = 0
 const t = (name, fn) => { fn(); n++; console.log(`  ok - ${name}`) }
@@ -80,6 +80,57 @@ t('fixed WITH receipt -> closes as fixed', () => {
 t('blocked -> carries who_must_act for Roger', () => {
   const p = verdictToUpsert(inc, { class: 'D-ESCALATE', status: 'blocked', action: 'none', who_must_act: 'Roger - do X' })
   assert.equal(p.p_status, 'blocked'); assert.match(p.p_who_must_act, /Roger - do X/)
+})
+
+// ── "expected business state" must not silence a row whose own fix is undeployed ──────────
+// Measured 2026-09-01: the /signals "App errors" tile read 0 while nine unresolved production
+// errors sat in Sentry. Row sentry/141893005 had flip_count 12 - the wire reopening it hourly
+// because Sentry saw the error again, and this classifier muting it hourly - while its own
+// detail.actionTaken said "still-blocked". Every assertion below fails against the old rule,
+// which was a bare EXPECTED_BUSINESS.test(text).
+
+t('a lapsed vendor plan with NO outstanding remediation is still expected — unchanged', () => {
+  const inc = { title: 'backoffice is throwing an error: Error: Smartlead HTTP 401: {"message":"Plan expired!"}', root_cause: '', who_must_act: '' }
+  assert.equal(expectedBusinessApplies(inc), true, 'muting a lapsed vendor plan is correct and must not change')
+  assert.equal(classify(inc).mode, 'note')
+})
+
+t('THE LIVE FAILURE: the same row is NOT expected once it reports still-blocked', () => {
+  const inc = {
+    title: 'backoffice is throwing an error: Error: Smartlead HTTP 401: {"message":"Plan expired!"}',
+    root_cause: '', who_must_act: '', action_taken: 'still-blocked',
+  }
+  assert.equal(expectedBusinessApplies(inc), false, 'a row that says its own fix is undeployed is not a settled business state')
+  assert.notEqual(classify(inc).mode, 'note', 'it must fall through to normal classification, not be muted')
+})
+
+t('the disarm is narrow: only still-blocked, and case/space tolerant', () => {
+  const base = { title: 'Smartlead HTTP 401 Plan expired', root_cause: '', who_must_act: '' }
+  for (const v of ['still-blocked', 'STILL-BLOCKED', '  Still-Blocked  ']) {
+    assert.equal(expectedBusinessApplies({ ...base, action_taken: v }), false, `must disarm on ${JSON.stringify(v)}`)
+  }
+  // Anything else keeps the old behaviour exactly - the failure being fixed is a row that
+  // ANNOUNCED it was stuck and got muted anyway, not a row nobody has looked at yet.
+  for (const v of [null, undefined, '', 'fixed', 'deployed', 'no-action']) {
+    assert.equal(expectedBusinessApplies({ ...base, action_taken: v }), true, `must NOT disarm on ${JSON.stringify(v)}`)
+  }
+})
+
+t('a row with no vendor-plan wording is unaffected either way', () => {
+  const inc = { title: 'checkout throws on empty basket', root_cause: '', who_must_act: '', action_taken: 'still-blocked' }
+  assert.equal(expectedBusinessApplies(inc), false)
+})
+
+t('signalToIncident carries actionTaken through — it used to be dropped here', () => {
+  // This is the whole reason the contradiction could persist for twelve consecutive hours:
+  // the field existed on the signal and never reached the classifier.
+  const inc = signalToIncident({
+    source: 'sentry', key: '141893005', title: 'Plan expired', severity: 'warning',
+    state: 'open', summary: null, first_seen_at: '2026-08-20T00:00:00Z',
+    detail: { actionTaken: 'still-blocked', by: 'board-drainer', class: 'EXPECTED' },
+  })
+  assert.equal(inc.action_taken, 'still-blocked')
+  assert.equal(expectedBusinessApplies(inc), false)
 })
 
 console.log(`\n${n} assertions passed.`)

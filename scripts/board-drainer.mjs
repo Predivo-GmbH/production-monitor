@@ -320,6 +320,11 @@ export function signalToIncident(sig) {
     root_cause: sig.summary ?? null,
     who_must_act: detail.who_must_act ?? null,
     opened_at: sig.first_seen_at,
+    // What the LAST remediation attempt concluded, carried through so classify() can see it.
+    // It was dropped here before, which is how a row could be stamped "expected business state"
+    // while its own evidence field said the fix was written and never deployed. See
+    // expectedBusinessApplies().
+    action_taken: detail.actionTaken ?? null,
   }
 }
 
@@ -627,6 +632,60 @@ async function markScoutReport(secret, id, patch) {
 // a lapsed plan is noted, not escalated.
 const EXPECTED_BUSINESS = /\b(plan expired|plan (?:lapsed|cancelled|canceled|cancellation)|subscription (?:expired|lapsed|inactive|cancelled|canceled)|payment required|upgrade required|billing suspended|account (?:suspended|paused))\b/i
 
+/**
+ * "THE VENDOR'S PLAN LAPSED" IS ONLY AN EXPECTED STATE IF WE ARE HANDLING IT.
+ *
+ * -- WHAT WAS WRONG (measured on production, 2026-09-01) -------------------------------------
+ *
+ * The "App errors" tile on /signals read ZERO while NINE unresolved production errors sat in
+ * Sentry. The Sentry wire was not the fault: it runs hourly, reads Sentry correctly, and the
+ * 2026-08-27 audit ranked building it the #1 fix. Its output was erased downstream, here.
+ *
+ * fleet_signals row `sentry/141893005`, live values:
+ *
+ *     title            backoffice is throwing an error: Error: Smartlead HTTP 401: {"Plan expired!"}
+ *     state            resolved        occurrence_count 30        flip_count 12
+ *     detail.filed_by  check-sentry-issues     <- the wire filed it
+ *     detail.by        board-drainer           <- this function closed it
+ *     detail.class     EXPECTED
+ *     detail.actionTaken  still-blocked        <- the row saying the work is NOT done
+ *
+ * flip_count 12 is the shape of the bug: every hour the wire reopens the row because Sentry saw
+ * the error again, and every hour the drainer mutes it again. The tile is non-zero only in the
+ * minutes between. It was at 33 events when the 2026-08-27 audit named it and 51 five days later.
+ *
+ * -- WHY THE ORIGINAL RULE IS STILL RIGHT ----------------------------------------------------
+ *
+ * A lapsed vendor plan genuinely IS a business state and not an incident, and muting it is
+ * correct: nobody should be paged because Smartlead wants paying. That is not what is being
+ * changed. What was wrong is that the rule read the vendor's state and drew a conclusion about
+ * OURS. Here our own edge function throws an UNHANDLED Error 51 times BECAUSE the plan lapsed.
+ * The vendor's billing is expected; our service crashing on it is a defect, and the fix for it
+ * (BackOffice 6145f52) is committed, pushed, and has never reached production.
+ *
+ * So the row's own record already said the problem was not gone, in the one field nobody read:
+ * `detail.actionTaken = 'still-blocked'`. signalToIncident dropped it before classify() ever saw
+ * it, which is why the contradiction could persist for twelve consecutive hours.
+ *
+ *     RESOLVED MEANS THE PROBLEM IS GONE. A ROW THAT SAYS ITS OWN FIX IS UNDEPLOYED IS NOT GONE.
+ *
+ * -- THE RULE --------------------------------------------------------------------------------
+ *
+ * The expected-business shortcut still applies to everything it always did. It stops applying to
+ * a row whose last remediation attempt reported that it is STILL BLOCKED. Such a row falls
+ * through to the normal classification, where "the fix is written and needs a production deploy"
+ * is routed to a person — which is what it is.
+ *
+ * Deliberately narrow: only `still-blocked` disarms it. An absent field, a completed action, or
+ * anything else keeps the old behaviour exactly, because the failure being fixed is a row that
+ * ANNOUNCED it was stuck and got muted anyway, not a row nobody has looked at yet.
+ */
+export function expectedBusinessApplies(inc, text = `${inc?.who_must_act || ''} || ${inc?.root_cause || ''} || ${inc?.title || ''}`) {
+  if (!EXPECTED_BUSINESS.test(text)) return false
+  if (String(inc?.action_taken || '').trim().toLowerCase() === 'still-blocked') return false
+  return true
+}
+
 /** The PRESCRIBED ACTION, with the owner prefix and any of the drainer's own stuck preambles
  *  stripped. This — and only this — is what a gate is allowed to read. */
 export function actionOf(inc) {
@@ -817,7 +876,8 @@ function classify(inc) {
   const text = `${inc.who_must_act || ''} || ${inc.root_cause || ''} || ${inc.title || ''}`
 
   // Expected business state wins over every other class — it is noted, never worked or escalated.
-  if (EXPECTED_BUSINESS.test(text)) {
+  // Unless our own remediation is still outstanding: see expectedBusinessApplies().
+  if (expectedBusinessApplies(inc, text)) {
     return { owner: 'none', mode: 'note', gate: null, handoff: false, reason: 'expected business state (vendor plan/subscription lapsed) — noted, no action' }
   }
 
