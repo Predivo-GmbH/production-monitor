@@ -28,12 +28,17 @@
  */
 import { writeFileSync } from 'node:fs'
 import { auditRunnerMachines, loadExpectedMachines } from './lib/runner-machines.mjs'
+import { looksLikeRunnerLoss, confirmRunnerLoss, describeRunnerLoss, recentFailedRuns } from './lib/runner-loss.mjs'
 
 const OWNER = process.env.CI_RUNNER_OWNER || 'Predivo-GmbH'
 const TOKEN = process.env.GH_TOKEN || process.env.GITHUB_TOKEN
 const LABEL = process.env.CI_RUNNER_LABEL || 'predivo-wsl'
 const APPLY = process.env.CI_RUNNER_APPLY !== '0' // set 0 to report without changing anything
 const QUEUE_ALERT_MIN = Number(process.env.CI_RUNNER_QUEUE_ALERT_MIN || 20)
+// How far back to look for jobs a dying machine destroyed. The watchdog runs every 10 minutes, so
+// 90 covers a long outage without re-reporting yesterday; a repeat inside the window is the same
+// incident being confirmed, not a new one.
+const RUNNER_LOSS_LOOKBACK_MIN = Number(process.env.CI_RUNNER_LOSS_LOOKBACK_MIN || 90)
 
 // When the watchdog itself cannot complete (no token, blind token, no runners, API errors) it must
 // still leave a report behind, marked broken, so send-ci-runner-alert.mjs (if: failure()) has
@@ -77,7 +82,11 @@ function rateLimitReason() {
   return `GitHub API rate limit exhausted${rateLimitReset ? ` (core resets at ${rateLimitReset})` : ''} - this is a RATE LIMIT, not an auth failure. The token is valid; an invalid token could not reach the API at all. The shared hourly API allowance was emptied upstream (see the CI Cost Guard / github-api-budget), so this run cannot certify the fleet until the allowance resets. Do NOT rotate the DASHBOARD_PAT.`
 }
 
-async function gh(path, init = {}) {
+// `soft` calls are enrichment, never certification: their failure must not count towards
+// apiErrors, because apiErrors bails the whole run. Confirming an annotation is a nicety - losing
+// it should downgrade one sentence from "GitHub said so" to "it has the shape", not stop the
+// watchdog from certifying the fleet.
+async function gh(path, init = {}, { soft = false } = {}) {
   for (let attempt = 0; attempt < 5; attempt++) {
     let r
     try {
@@ -102,12 +111,12 @@ async function gh(path, init = {}) {
     if (r.status === 204) return { ok: true }
     if (!r.ok) {
       if (r.status >= 500) { await sleep(1500); continue }
-      apiErrors++
+      if (!soft) apiErrors++
       return { error: `${r.status} ${await r.text()}` }
     }
     return r.json()
   }
-  apiErrors++
+  if (!soft) apiErrors++
   return { error: 'gave up' }
 }
 
@@ -171,6 +180,30 @@ for (const repo of repos) {
     const mins = Math.round((Date.now() - new Date(run.created_at)) / 60000)
     if (mins >= QUEUE_ALERT_MIN) {
       alerts.push(`${repo}: "${run.name}" queued ${mins} min (run ${run.id})`)
+    }
+  }
+
+  // DID ONE OF OUR MACHINES DIE UNDER A JOB THAT WAS ALREADY RUNNING?
+  //
+  // Everything above this line watches PRESENCE - is a runner online now. The VM that holds our
+  // runners comes back in seconds, so a teardown is invisible to all of it: the runner was online
+  // before, online after, and only the job in between was destroyed. That is exactly how
+  // ChannelMover sat red on 2026-09-01 with every watcher green and Roger finding it himself.
+  // See scripts/lib/runner-loss.mjs for the signature and why it cannot fire on an ordinary
+  // failure. Bounded on purpose - the fleet shares one hourly API allowance.
+  const failed = await gh(`repos/${OWNER}/${repo}/actions/runs?status=failure&per_page=10`)
+  for (const run of recentFailedRuns(failed?.workflow_runs, { lookbackMinutes: RUNNER_LOSS_LOOKBACK_MIN })) {
+    const jobs = await gh(`repos/${OWNER}/${repo}/actions/runs/${run.id}/jobs?per_page=50`, {}, { soft: true })
+    for (const job of jobs?.jobs || []) {
+      if (!looksLikeRunnerLoss(job)) continue
+      // Ask GitHub to confirm, but never let that question decide whether we report. An
+      // unreachable annotations endpoint downgrades the wording; it does not hide the incident.
+      let confirmed = false
+      if (job.check_run_url) {
+        const ann = await gh(`${job.check_run_url.replace('https://api.github.com/', '')}/annotations`, {}, { soft: true })
+        confirmed = confirmRunnerLoss(ann)
+      }
+      alerts.push(describeRunnerLoss({ repo, run, job, confirmed }))
     }
   }
 }
