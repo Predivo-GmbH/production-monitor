@@ -10,7 +10,7 @@
  */
 import assert from 'node:assert'
 import {
-  isDeployWorkflow, isProductionWorkflow, currentFailures, classifyFailure, isAlarm,
+  isDeployWorkflow, isProductionWorkflow, currentFailures, classifyFailure, isAlarm, isUnreadableFile,
   signalFor, planSignals, recoveredKeys, ROLLUP_KEY, ROLLUP_THRESHOLD,
 } from '../scripts/check-deploy-failures.mjs'
 
@@ -149,6 +149,116 @@ t('the SAME step failing on a push is still a real failure', () => {
   })
   assert.equal(c.kind, 'failed-step')
   assert.equal(isAlarm(c), true)
+})
+
+t('THE LIVE SHAPE: an earlier gate fails and the prod deploy is SKIPPED - production untouched', () => {
+  // The real shape this fleet produces, and the one the original step-name-only carve-out missed.
+  // Verified live 2026-09-01: ReplyFlow run 33509332674, SignalScore 33509336490, Valrano
+  // 33509341053 - workflow_dispatch on deploy.yml, gate-e2e=failure, deploy=skipped, prod healthy.
+  const c = classifyFailure(run({ event: 'workflow_dispatch', path: '.github/workflows/deploy.yml' }), {
+    total_count: 6,
+    jobs: [
+      { name: 'gate-security', conclusion: 'success', steps: [] },
+      { name: 'gate-e2e', conclusion: 'failure', steps: [{ name: 'Run staging E2E tests', conclusion: 'failure' }] },
+      { name: 'deploy-staging', conclusion: 'skipped', steps: [] },
+      { name: 'deploy-fast', conclusion: 'skipped', steps: [] },
+      { name: 'deploy', conclusion: 'skipped', steps: [] },
+      { name: 'prod-smoke', conclusion: 'skipped', steps: [] },
+    ],
+  })
+  assert.equal(c.kind, 'gate-rejection')
+  assert.equal(isAlarm(c), false)
+})
+
+t('a scheduled gate failure that never reached a deploy is not an alarm either', () => {
+  // A nightly gate run deploys nothing; a red gate there is not a "production is failing" page.
+  const c = classifyFailure(run({ event: 'schedule', path: '.github/workflows/deploy.yml' }), {
+    total_count: 3,
+    jobs: [
+      { name: 'gate-e2e', conclusion: 'failure', steps: [{ name: 'Run staging E2E tests', conclusion: 'failure' }] },
+      { name: 'deploy', conclusion: 'skipped', steps: [] },
+      { name: 'deploy-staging', conclusion: 'skipped', steps: [] },
+    ],
+  })
+  assert.equal(c.kind, 'gate-rejection')
+  assert.equal(isAlarm(c), false)
+})
+
+// ── production-vs-staging comes from the JOB, not the file name ────────────────
+t('a red deploy-staging JOB inside deploy.yml is filed as STAGING, not production', () => {
+  // deploy.yml holds both lanes; a push failing the staging deploy job must not page as production.
+  const r = run({ event: 'push', path: '.github/workflows/deploy.yml' })
+  const c = classifyFailure(r, { total_count: 1, jobs: [{ name: 'deploy-staging', conclusion: 'failure', steps: [] }] })
+  const s = signalFor({ product: 'ReplyFlow', run: r, classification: c })
+  assert.equal(s.severity, 'warning')
+  assert.equal(s.needs_human, false)
+  assert.match(s.title, /staging deploy is failing/)
+  assert.match(s.key, /:staging$/)
+})
+
+t('the production deploy JOB failing in deploy.yml pages, and keeps the historical key', () => {
+  const r = run({ event: 'workflow_dispatch', path: '.github/workflows/deploy.yml' })
+  const c = classifyFailure(r, { total_count: 1, jobs: [{ name: 'deploy', conclusion: 'failure', steps: [{ name: 'Deploy via FTP', conclusion: 'failure' }] }] })
+  const s = signalFor({ product: 'ReplyFlow', run: r, classification: c })
+  assert.equal(s.severity, 'critical')
+  assert.equal(s.needs_human, true)
+  assert.equal(s.key, 'ReplyFlow:.github/workflows/deploy.yml')
+})
+
+t('a green staging PUSH does not erase a red production DISPATCH of the same deploy.yml', () => {
+  // The latent second half of the bug: currentFailures used to keep only the newest run per path,
+  // so a green push after a red promotion made the production failure vanish and self-resolve.
+  const red = currentFailures([
+    run({ id: 9, event: 'push', conclusion: 'success', created_at: '2026-09-01T15:00:00Z' }),
+    run({ id: 8, event: 'workflow_dispatch', conclusion: 'failure', created_at: '2026-09-01T14:00:00Z' }),
+  ])
+  assert.equal(red.length, 1)
+  assert.equal(red[0].id, 8)
+  assert.equal(red[0].event, 'workflow_dispatch')
+})
+
+t('a run GitHub could not parse is recognised from its metadata alone', () => {
+  // GitHub titles a run by the file PATH when it cannot read the file's `name:` key.
+  assert.equal(isUnreadableFile(run({ name: '.github/workflows/deploy.yml' })), true)
+  assert.equal(isUnreadableFile(run({ conclusion: 'startup_failure', name: 'Deploy to Production' })), true)
+  assert.equal(isUnreadableFile(run({ name: 'Deploy to Production' })), false)
+})
+
+t('a fixed deploy FILE stops being red once any lane of it goes green again', () => {
+  // ScoutCopilot, live 2026-09-01. deploy.yml is workflow_dispatch-only, so the only push runs are
+  // the ones GitHub manufactured because the file was unparseable. Once the file is fixed no push
+  // can ever create a deploy.yml run again, so without this the staging lane is red forever.
+  const red = currentFailures([
+    run({ id: 9, event: 'workflow_dispatch', conclusion: 'success', name: 'Deploy to Production',
+          created_at: '2026-09-01T14:51:49Z' }),
+    run({ id: 8, event: 'push', conclusion: 'failure', name: '.github/workflows/deploy.yml',
+          created_at: '2026-08-31T12:33:30Z' }),
+  ])
+  assert.equal(red.length, 0)
+})
+
+t('an OLDER success does not forgive a NEWER broken file', () => {
+  const red = currentFailures([
+    run({ id: 9, event: 'workflow_dispatch', conclusion: 'success', name: 'Deploy to Production',
+          created_at: '2026-08-27T13:29:27Z' }),
+    run({ id: 8, event: 'push', conclusion: 'failure', name: '.github/workflows/deploy.yml',
+          created_at: '2026-08-31T12:33:30Z' }),
+  ])
+  assert.equal(red.length, 1)
+  assert.equal(red[0].id, 8)
+})
+
+t('the broken-file carve-out does NOT reopen the lane-erasure bug', () => {
+  // Same shape as the lane test above, but with a REAL staging failure (readable file, so it has a
+  // proper workflow name). A later green production dispatch must NOT clear it.
+  const red = currentFailures([
+    run({ id: 9, event: 'workflow_dispatch', conclusion: 'success', name: 'Deploy to Production',
+          created_at: '2026-09-01T15:00:00Z' }),
+    run({ id: 8, event: 'push', conclusion: 'failure', name: 'Deploy to Production',
+          created_at: '2026-09-01T14:00:00Z' }),
+  ])
+  assert.equal(red.length, 1)
+  assert.equal(red[0].id, 8)
 })
 
 t('every other failure IS an alarm', () => {

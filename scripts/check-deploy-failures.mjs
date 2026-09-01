@@ -91,6 +91,35 @@ export function isProductionWorkflow(path) {
 }
 
 /**
+ * Which environment a JOB ships, decided by the job name rather than the file name. This fleet
+ * (ReplyFlow, SignalScore, ChannelMover, Valrano, Cockpit) holds staging and production in ONE
+ * deploy.yml: the `deploy-staging` job runs on push, and `deploy`/`deploy-fast` run on a manual
+ * promotion. So the file name cannot tell staging from production - the failed job can.
+ */
+export const isStagingDeployJob = (name) => /^deploy-staging$/i.test(String(name || ''))
+export const isProdDeployJob = (name) => /^(deploy|deploy-fast|prod-smoke)$/i.test(String(name || ''))
+
+/**
+ * The lane a RUN belongs to, from its trigger, used only to keep the "what is currently red"
+ * decision per-lane. A push runs the staging deploy job; a manual dispatch (or a scheduled gate
+ * pass) belongs to the production lane. Without this a green staging push and a red production
+ * dispatch of the SAME deploy.yml share one bucket, and the newer green push silently erases the
+ * red production result - the latent second half of the 2026-09-01 misfiling.
+ */
+export function runLane(run) {
+  if (!isProductionWorkflow(run.path)) return 'staging' // a dedicated deploy-staging.yml
+  return run.event === 'push' ? 'staging' : 'production'
+}
+
+/** The board key for one pipeline. Production keeps the historical `product:path` key so existing
+ * open rows resolve cleanly on recovery; a staging failure of the same file gets its own suffix so
+ * the two lanes never overwrite each other. */
+export function deployKey(product, path, production) {
+  const base = `${product}:${path}`
+  return production ? base.slice(0, 56) : `${base.slice(0, 48)}:staging`
+}
+
+/**
  * The newest COMPLETED run of each deploy workflow on this branch, and whether it is red.
  * Pure, so the whole "what is currently broken" decision is testable without GitHub.
  *
@@ -99,16 +128,58 @@ export function isProductionWorkflow(path) {
  * the previous failure is how a permanently-red pipeline reads as healthy on a busy repo.
  */
 export function currentFailures(runs) {
-  const newestByFile = new Map()
+  const newestByLane = new Map()
   for (const r of runs || []) {
     if (!isDeployWorkflow(r.path)) continue
     if (r.status !== 'completed') continue
-    const prev = newestByFile.get(r.path)
-    if (!prev || new Date(r.created_at) > new Date(prev.created_at)) newestByFile.set(r.path, r)
+    // Keyed by file AND lane: a staging-push run and a production-dispatch run of the same
+    // deploy.yml are two independent results, and neither may overwrite the other.
+    const laneKey = `${r.path}::${runLane(r)}`
+    const prev = newestByLane.get(laneKey)
+    if (!prev || new Date(r.created_at) > new Date(prev.created_at)) newestByLane.set(laneKey, r)
   }
-  return [...newestByFile.values()].filter(
+  const reds = [...newestByLane.values()].filter(
     (r) => r.conclusion === 'failure' || r.conclusion === 'startup_failure',
   )
+
+  // A BROKEN FILE IS CLEARED BY ANY LATER SUCCESS OF THAT FILE, IN EITHER LANE.
+  //
+  // classifyFailure already treats the zero-job shape as global - `production: true`, "nothing can
+  // be deployed from this repo at all" - because GitHub refused the file before reading a trigger.
+  // Recovery has to be just as global, and this is the case that proves it. ScoutCopilot's
+  // deploy.yml is workflow_dispatch-only; its ONLY push-event runs are the three GitHub
+  // manufactured on 2026-08-31 BECAUSE the file was unparseable. Fixing the file (9060158) means
+  // no push can ever create a deploy.yml run again, so the newest push run stays that failure for
+  // good and the staging lane reports red every hour with nothing anyone can do to clear it.
+  //
+  // Keeping the lane split intact: this ONLY forgives the broken-file shape. A genuine red staging
+  // push still survives a later green production dispatch, which is the erasure bug the lanes were
+  // added to stop.
+  const newestSuccessByPath = new Map()
+  for (const r of runs || []) {
+    if (!isDeployWorkflow(r.path) || r.status !== 'completed' || r.conclusion !== 'success') continue
+    const prev = newestSuccessByPath.get(r.path)
+    if (!prev || new Date(r.created_at) > new Date(prev.created_at)) newestSuccessByPath.set(r.path, r)
+  }
+  return reds.filter((r) => {
+    if (!isUnreadableFile(r)) return true
+    const ok = newestSuccessByPath.get(r.path)
+    return !(ok && new Date(ok.created_at) > new Date(r.created_at))
+  })
+}
+
+/**
+ * Did GitHub refuse to read this workflow file? Run metadata only, because currentFailures is pure.
+ *
+ * `startup_failure` is the documented conclusion, but the shape this fleet actually produced on
+ * 2026-08-31 reported plain `failure` with zero jobs. The tell in the metadata is the NAME: GitHub
+ * falls back to the file PATH when it cannot parse the file well enough to read its `name:` key,
+ * which is why those runs are titled ".github/workflows/deploy.yml" while every good run of the
+ * same file is titled "Deploy to Production". Checked 2026-09-01: all 93 workflow files in the
+ * fleet declare a `name:`, so path-as-name is not something a healthy workflow here produces.
+ */
+export function isUnreadableFile(run) {
+  return run.conclusion === 'startup_failure' || (!!run.name && run.name === run.path)
 }
 
 /**
@@ -118,27 +189,47 @@ export function currentFailures(runs) {
  * FIRST, because every other branch here assumes there is a job to look at.
  */
 export function classifyFailure(run, jobs) {
-  const total = jobs?.total_count ?? (jobs?.jobs || []).length
+  const list = jobs?.jobs || []
+  const total = jobs?.total_count ?? list.length
   if (run.conclusion === 'startup_failure' || total === 0) {
     return {
       kind: 'workflow-file',
       job: null,
       step: null,
+      production: true, // a dead file ships neither staging nor production; nothing can go out at all
       why: 'the deploy file itself is broken, so GitHub never started a single step. Nothing can be deployed from this repo until it is fixed.',
     }
   }
 
-  const failedJob = (jobs.jobs || []).find((j) => j.conclusion === 'failure')
+  const failedJob = list.find((j) => j.conclusion === 'failure')
   const failedStep = failedJob ? (failedJob.steps || []).find((s) => s.conclusion === 'failure') : null
   const stepName = failedStep?.name || null
 
-  // The safety gate refusing an ineligible commit. Production is unchanged and healthy.
-  if (run.event === 'workflow_dispatch' && stepName && /verify staging gate/i.test(stepName)) {
+  // A promotion the staging gate REFUSED. Production is unchanged and healthy. Two real shapes:
+  //   (a) the production deploy job started and bailed at its own "Verify staging gate" step;
+  //   (b) an earlier GATE job (gate-e2e, gate-security, …) failed, so the production deploy job was
+  //       skipped and never ran. This is the shape this fleet actually produces - the deploy and
+  //       its gates are separate JOBS, so no step named "Verify staging gate" ever fails, and the
+  //       original step-name-only carve-out never matched (verified live 2026-09-01: ReplyFlow,
+  //       SignalScore, Valrano dispatch runs, gate-e2e=failure, deploy=skipped, prod untouched).
+  // Only a manual promotion can be refused at its gate step (a); a push failing that step is a real
+  // broken pipeline. A gate that fails while the prod deploy never ran (b) touched no environment on
+  // a dispatch OR a scheduled gate run, so neither is an alarm - but on a push it is a real failure.
+  const prodJobs = list.filter((j) => isProdDeployJob(j.name))
+  const prodSkippedNeverRan = prodJobs.length > 0 && prodJobs.every((j) => j.conclusion === 'skipped')
+  const bailedAtGateStep =
+    run.event === 'workflow_dispatch' && stepName && /verify staging gate/i.test(stepName) &&
+    failedJob && isProdDeployJob(failedJob.name)
+  const refusedByEarlierGate =
+    run.event !== 'push' && failedJob &&
+    !isProdDeployJob(failedJob.name) && !isStagingDeployJob(failedJob.name) && prodSkippedNeverRan
+  if (bailedAtGateStep || refusedByEarlierGate) {
     return {
       kind: 'gate-rejection',
       job: failedJob?.name || null,
       step: stepName,
-      why: 'the promotion was refused because that commit had no green staging run. Production is unchanged.',
+      production: false,
+      why: 'the promotion was refused before it reached production - the production deploy never ran. Production is unchanged.',
     }
   }
 
@@ -146,14 +237,29 @@ export function classifyFailure(run, jobs) {
     return { kind: 'unknown', job: null, step: null, why: 'the run failed without naming a failed job.' }
   }
 
+  // Which environment actually broke is decided by the JOB that failed, not the file name.
+  // null = a gate/other job failed while a deploy did run; the file name decides downstream.
+  const production = isProdDeployJob(failedJob.name)
+    ? true
+    : isStagingDeployJob(failedJob.name)
+      ? false
+      : null
   return {
     kind: 'failed-step',
     job: failedJob.name,
     step: stepName,
+    production,
     why: stepName
       ? `it stopped at "${stepName}" in ${failedJob.name}.`
       : `the job ${failedJob.name} failed.`,
   }
+}
+
+/** Production-vs-staging for the SIGNAL, decided from the classification's job, not the file name. */
+export function isProductionFailure(run, classification) {
+  if (classification.kind === 'workflow-file') return true
+  if (typeof classification.production === 'boolean') return classification.production
+  return isProductionWorkflow(run.path) // unknown / a gate failure where a deploy still ran
 }
 
 /** A gate rejection is the system working. Everything else that is red is news. */
@@ -163,7 +269,7 @@ export function isAlarm(classification) {
 
 /** What ONE red pipeline says on the cockpit. */
 export function signalFor({ product, run, classification }) {
-  const production = isProductionWorkflow(run.path)
+  const production = isProductionFailure(run, classification)
   const broken = classification.kind === 'workflow-file'
   const title = broken
     ? `${product}: the deploy file is broken, nothing can ship`
@@ -172,7 +278,7 @@ export function signalFor({ product, run, classification }) {
       : `${product}: the staging deploy is failing`
   return {
     source: SOURCE,
-    key: `${product}:${run.path}`.slice(0, 56),
+    key: deployKey(product, run.path, production),
     kind: 'incident',
     severity: production ? 'critical' : 'warning',
     state: 'open',
@@ -297,8 +403,11 @@ async function main() {
     const runs = (body.workflow_runs || []).map((r) => ({ ...r, repository_full_name: p.repo }))
 
     // Every deploy workflow this repo HAS is judged, green or red, so a recovery can resolve it.
+    // Both lane keys, because staging and production of one deploy.yml are separate board rows.
     for (const r of runs) {
-      if (isDeployWorkflow(r.path)) judgedKeys.add(`${p.name}:${r.path}`.slice(0, 56))
+      if (!isDeployWorkflow(r.path)) continue
+      judgedKeys.add(deployKey(p.name, r.path, true))
+      judgedKeys.add(deployKey(p.name, r.path, false))
     }
 
     for (const run of currentFailures(runs)) {
