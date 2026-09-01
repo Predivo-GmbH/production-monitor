@@ -325,6 +325,12 @@ async function main() {
   }
 
   // ── Alert (inline ALERT_SMTP_*, mirroring check-auth-email-config.mjs) ───────
+  // A finding with no way to leave the machine is not a finding. If the mail is not
+  // configured, the run says so out loud rather than exiting quietly on a dead channel
+  // (2026-09-01: it was dead for months, because it read secrets that do not exist).
+  if (violations.length && !process.env.ALERT_SMTP_HOST) {
+    console.error('NOT EMAILED: ' + violations.length + ' project(s) with grant drift were found and ALERT_SMTP_HOST is unset, so nobody was told. Wire the mail secrets in this workflow.')
+  }
   if (violations.length && process.env.ALERT_SMTP_HOST) {
     try {
       const { createMailTransport } = await import('./lib/smtp.mjs')

@@ -42,8 +42,13 @@ jobs:
           REPLYFLOW_SUPABASE_ACCESS_TOKEN: ${{ secrets.REPLYFLOW_SUPABASE_ACCESS_TOKEN }}
           SIGNALSCORE_SUPABASE_ACCESS_TOKEN: ${{ secrets.SIGNALSCORE_SUPABASE_ACCESS_TOKEN }}
           VALRANO_SUPABASE_ACCESS_TOKEN: ${{ secrets.VALRANO_SUPABASE_ACCESS_TOKEN }}
-          ALERT_SMTP_HOST: ${{ secrets.ALERT_SMTP_HOST }}
-          ALERT_SMTP_PORT: ${{ secrets.ALERT_SMTP_PORT }}
-          ALERT_SMTP_USER: ${{ secrets.ALERT_SMTP_USER }}
-          ALERT_SMTP_PASS: ${{ secrets.ALERT_SMTP_PASS }}
-          ALERT_TO: ${{ secrets.ALERT_TO }}
+          # 2026-09-01: these referenced secrets.ALERT_SMTP_* and secrets.ALERT_TO, and NONE of
+          # those exist in this repo - `gh secret list` has SMTP_HOST/SMTP_USER/SMTP_PASS only.
+          # So `if (violations.length && process.env.ALERT_SMTP_HOST)` was always false and this
+          # guard's email has never been sent. It found real grant drift on 2026-08-31 and told
+          # nobody. Wired to the secrets that exist, same ones monitor.yml sends its alert with.
+          ALERT_SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          ALERT_SMTP_PORT: '465'
+          ALERT_SMTP_USER: ${{ secrets.SMTP_USER }}
+          ALERT_SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          ALERT_TO: rogmueller1976@gmail.com
