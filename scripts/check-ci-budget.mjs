@@ -144,6 +144,7 @@ const isSelfHosted = (job) => {
 const seen = new Map() // key(repo, workflow, job) -> {min, billed}[]
 const workflowsSeen = new Set()
 let totalRuns = 0
+let privateRuns = 0   // the only runs that can prove the harness saw the repos that GENERATE the bill
 let billedMinutes = 0
 let freeMinutes = 0
 let selfHostedMinutes = 0   // private-repo work that runs on our own laptop, so GitHub bills none of it
@@ -166,6 +167,7 @@ for (const repo of repos) {
     const runs = j?.workflow_runs || []
     for (const run of runs) {
       totalRuns++
+      if (repo.private) privateRuns++
       workflowsSeen.add(key(repo.name, run.name))
       pending.push({ repo, run })
     }
@@ -258,6 +260,18 @@ if (process.env.CI_BUDGET_EMIT === '1') {
 const failures = []
 
 // 4. absence check FIRST - a harness that saw nothing must never report a clean fleet
+// COUNTED ON PRIVATE REPOS TOO (2026-09-01 audit). `totalRuns` counted every repository, and the
+// two PUBLIC ones are the busiest we own - production-monitor alone runs a */10 watchdog - so this
+// guard's own founding incident, quoted in the header ("218 runs found, all of them from the two
+// public repos, billed total 0"), sailed straight through a floor of 100. Free minutes prove
+// nothing about the bill. The floor on private runs is deliberately ZERO rather than a number
+// nobody has measured: seeing not one run in any private repo means the harness read nothing that
+// can cost money, and that is never a clean result. Raise it once the real weekly figure is known.
+if (privateRuns === 0 && privateRepos.length) {
+  failures.push(
+    `HARNESS: not one run was read in any of the ${privateRepos.length} private repo(s) over ${WINDOW_DAYS} days, while ${totalRuns} runs were seen in total - all of them in public repos, which are free and say nothing about the bill. Treating this as a broken checker, not a quiet fleet.`,
+  )
+}
 if (totalRuns < MIN_RUNS_EXPECTED) {
   failures.push(
     `HARNESS: only ${totalRuns} runs found in ${WINDOW_DAYS} days (expected at least ${MIN_RUNS_EXPECTED}). Treating this as a broken checker, not a quiet fleet.`,

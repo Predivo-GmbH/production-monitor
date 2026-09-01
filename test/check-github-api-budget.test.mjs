@@ -72,4 +72,22 @@ t('1500 spent at half the window (projects ~3000) -> healthy', () => {
   assert.equal(j.verdict, 'healthy')
 })
 
+// ── THE FAST BURST, which both projection branches were built to refuse to judge ──
+// Added 2026-09-01: canProject requires 10% of the window elapsed AND 1500 spent, so a burst that
+// drained the allowance in the first four minutes reached neither alarm, was not yet at literal
+// zero, and came back HEALTHY - after which main() files a resolved signal that clears the
+// previous hour's alarm. This is the incident the file was written for.
+t('4900 of 5000 spent four minutes into the window -> draining/critical, no projection needed', () => {
+  const j = judgeQuota({ limit: 5000, remaining: 100, used: 4900, reset: resetIn(56 * 60) }, NOW)
+  assert.equal(j.verdict, 'draining')
+  assert.equal(j.severity, 'critical')
+})
+
+t('the floor is 5% of the limit: 5% left alarms, 6% left does not', () => {
+  const at = judgeQuota({ limit: 5000, remaining: 250, used: 4750, reset: resetIn(56 * 60) }, NOW)
+  const above = judgeQuota({ limit: 5000, remaining: 300, used: 4700, reset: resetIn(56 * 60) }, NOW)
+  assert.equal(at.verdict, 'draining')
+  assert.equal(above.verdict, 'healthy')
+})
+
 console.log(`\n${n} passed`)

@@ -86,6 +86,21 @@ export function judgeQuota(core, now = Date.now()) {
       summary: `The shared 5,000/hour GitHub allowance is at 0 with ${Math.round(secsToReset / 60)} min until it resets. While it is empty, dispatching deploys and watching workflow runs fail with "rate limit exceeded". The usual cause is our own \`gh run watch\` polling across concurrent agent sessions — wait and \`gh run view <id>\` once instead of watching.` }
   }
 
+  // A FLOOR THAT NEEDS NO PROJECTION (2026-09-01 audit). Both alarm branches below are gated on
+  // `canProject`, which refuses to speak in the first six minutes of the window or under 1,500
+  // calls spent. That guard is right about PROJECTIONS and wrong as a gate on the whole judgement:
+  // a burst that drains 4,900 calls in the first four minutes has fracElapsed 0.07, reaches
+  // neither branch, is not yet at zero, and is therefore reported healthy - after which main()
+  // files a `resolved` signal that clears whatever the previous hour raised. The fast burst is the
+  // incident this file was written for. Nothing here is a projection: this little left, this far
+  // from the reset, is the refused-deploy state in all but name whatever the clock says.
+  const floor = Math.round(limit * 0.05)
+  if (remaining <= floor && secsToReset > 120) {
+    return { ...base, verdict: 'draining', severity: 'critical',
+      title: 'GitHub API allowance is almost gone',
+      summary: `${used} of ${limit} calls are spent with ${Math.round(secsToReset / 60)} min still to run in the window and only ${remaining} left. It will start refusing deploys before it resets. The usual cause is our own \`gh run watch\` polling across concurrent sessions - wait and \`gh run view <id>\` once instead of watching.` }
+  }
+
   // Only project once the window has run far enough and enough has been spent for it to mean
   // something — otherwise a normal post-reset burst projects to nonsense.
   const canProject = fracElapsed >= 0.1 && used >= 1500
