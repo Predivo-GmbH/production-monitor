@@ -89,6 +89,19 @@ function codePointName(ch) {
 }
 
 /**
+ * A COARSE location, never the raw index -- because the raw index of a TRAILING byte IS the
+ * value's length. "Bearer " is seven characters, so a newline echoed onto the end of a 28-char
+ * key sits at index 28, and emitting that number prints the credential's length into a public
+ * CI log -- the exact thing this module's report promises never to do. start / end / interior
+ * says where the byte was, usefully, while no arithmetic recovers the length from it.
+ */
+function positionLabel(index, length) {
+  if (index === 0) return 'at the start'
+  if (index === length - 1) return 'at the end'
+  return 'in the interior'
+}
+
+/**
  * Splits a raw value into what it should have been and a description of what was wrong with it.
  *
  * The returned removals describe POSITIONS AND CODE POINTS ONLY. They never contain, quote or
@@ -100,7 +113,7 @@ export function inspectCredential(raw) {
   const removals = []
   for (let i = 0; i < value.length; i++) {
     INVISIBLE.lastIndex = 0
-    if (INVISIBLE.test(value[i])) removals.push(`${codePointName(value[i])} at position ${i}`)
+    if (INVISIBLE.test(value[i])) removals.push(`${codePointName(value[i])} ${positionLabel(i, value.length)}`)
   }
   INVISIBLE.lastIndex = 0
   const stripped = value.replace(INVISIBLE, '')

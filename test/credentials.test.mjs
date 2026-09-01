@@ -66,7 +66,7 @@ test('a clean value is returned unchanged and reported as untouched', () => {
 
 test('the report names the character and its position, and never the value', () => {
   const { removals } = inspectCredential(BOM + KEY)
-  assert.deepEqual(removals, ['U+FEFF at position 0'])
+  assert.deepEqual(removals, ['U+FEFF at the start'])
 
   // The whole log line, as it will appear in a public CI log. A credential's length is itself
   // worth knowing to an attacker, so neither the value nor its length may appear.
@@ -75,6 +75,22 @@ test('the report names the character and its position, and never the value', () 
   assert.match(line, /U\+FEFF/)
   assert.ok(!line.includes(KEY), 'the value must never reach the log')
   assert.ok(!line.includes(String(KEY.length)), 'the length must never reach the log either')
+})
+
+/**
+ * THE TRAILING BYTE, which the leading-BOM case above structurally cannot guard: a BOM at index 0
+ * happens not to equal the length, so "at position 0" passed the no-length-leak assertion while a
+ * byte at the END -- the classic "echo adds a newline, and the newline goes into the secret" --
+ * reported its raw index, and that index IS the key's length. This case is here so the promise at
+ * credentials.mjs:94-96 is guarded from both ends, not just the front.
+ */
+test('a TRAILING invisible byte reports its location without leaking the value length', () => {
+  const { removals } = inspectCredential(KEY + '\n')
+  assert.deepEqual(removals, ['U+000A at the end'])
+
+  const line = repairMessage({ name: 'JASSTOUR_SERVICE_ROLE_KEY', removals })
+  assert.match(line, /U\+000A/)
+  assert.ok(!line.includes(String(KEY.length)), 'the length must never reach the log, even for a byte at the very end')
 })
 
 test('the other invisible characters this fleet has actually been bitten by are caught', () => {
@@ -123,7 +139,7 @@ test('sanitizeEnv repairs in place, touches nothing else, and reports what it di
   assert.equal(env.JASSTOUR_ANON_KEY, KEY, 'an already-clean secret is left exactly as it was')
   assert.equal(env.PATH, `C:/bin${BOM}`, 'a non-wire variable is never rewritten')
   assert.equal(env.EMPTY_KEY, '', 'an unset secret stays unset rather than becoming a value')
-  assert.deepEqual(report, [{ name: 'JASSTOUR_SERVICE_ROLE_KEY', removals: ['U+FEFF at position 0'] }])
+  assert.deepEqual(report, [{ name: 'JASSTOUR_SERVICE_ROLE_KEY', removals: ['U+FEFF at the start'] }])
 })
 
 /**
