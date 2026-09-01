@@ -19,6 +19,10 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
+      # nodemailer lives in devDependencies; without this the alert path crashes with
+      # "Cannot find package 'nodemailer'" (run 33506279928, 2026-09-01) — a real broken-gate
+      # finding was detected and then could not be emailed. Same install step monitor.yml uses.
+      - run: npm ci
       - name: Check v11 gate coverage across the fleet
         run: node scripts/check-gate-coverage.mjs
         env:
