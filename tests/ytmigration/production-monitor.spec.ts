@@ -201,7 +201,9 @@ test.describe('ChannelMover — Production Monitor', () => {
     // After click, should navigate toward auth login (Google OAuth page)
     await page.waitForLoadState('networkidle')
     const urlAfterClick = page.url()
-    expect(urlAfterClick).toMatch(/auth\/login|accounts\.google|channelmover\.com/)
+    // NOT `|channelmover.com`: SITE_URL IS channelmover.com, so that alternative matched before the
+    // click and after any navigation at all. Both CTAs call router.push('/auth/login').
+    expect(urlAfterClick, 'the pricing CTA must navigate to /auth/login').toMatch(/\/auth\/login/)
   })
 
   // (extension page interaction test removed — extension retired, see note above)
@@ -292,7 +294,8 @@ test.describe('ChannelMover — Production Monitor', () => {
 
     // Should navigate to /auth/login (Google OAuth sign-in page)
     const urlAfter = page.url()
-    expect(urlAfter).toMatch(/auth\/login|accounts\.google|channelmover\.com/)
+    // Same as the pricing CTA above: the site's own domain can never be evidence that a click worked.
+    expect(urlAfter, 'the hero CTA must navigate to /auth/login').toMatch(/\/auth\/login/)
   })
 
   // ── Edge function reachability — catches missing deploys after migration ──

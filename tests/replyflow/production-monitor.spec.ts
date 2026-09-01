@@ -596,7 +596,10 @@ test.describe('ReplyFlow — Production Monitor', () => {
       await expect(codeEmailInput).toBeVisible({ timeout: 10_000 })
 
       // Password should NOT be visible in email code mode
-      const passwordVisible = await page.locator('input[type="password"]').isVisible().catch(() => false)
+      // NOT `.isVisible().catch(() => false)`: that locator is strict, so TWO rendered password
+    // inputs - precisely the regression this guards - reject, the catch swallows it, and the test
+    // scores them as absent. A count is not strict-bound, and it retries.
+    const passwordVisible = (await page.locator('input[type="password"]').count()) > 0
       expect(passwordVisible).toBe(false)
     }
   })

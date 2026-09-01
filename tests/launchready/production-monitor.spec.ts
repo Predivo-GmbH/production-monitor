@@ -143,7 +143,10 @@ test.describe('LaunchReady — Production Monitor', () => {
       const scoreSpan = firstCard.locator('span.text-2xl')
       await expect(scoreSpan).toBeVisible()
       const scoreVal = await scoreSpan.textContent()
-      expect(Number(scoreVal)).toBeGreaterThanOrEqual(0)
+      // NOT `>= 0`: Number('') and Number(null) are both 0, so an EMPTY score span passed, and
+      // every score the product can emit is >= 0 anyway. The score is an integer 0-100.
+      expect(String(scoreVal ?? '').trim(), 'the audit score must render as an integer').toMatch(/^\d{1,3}$/)
+      expect(Number(scoreVal)).toBeLessThanOrEqual(100)
       // Each AuditCard shows a date (month abbreviation from toLocaleDateString)
       const cardText = await firstCard.textContent()
       expect(cardText).toMatch(/Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec/)

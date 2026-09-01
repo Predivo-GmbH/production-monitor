@@ -309,7 +309,9 @@ test.describe('Distribution-OS — Production Monitor', () => {
       expect((text || '').length).toBeGreaterThan(50)
 
       // No React error boundary
-      const hasErrorBoundary = await page.locator('text=/Something went wrong|Unexpected error|application error/i').isVisible().catch(() => false)
+      // NOT `.isVisible().catch(() => false)`: an error rendered in two nodes (heading plus toast)
+      // is a strict-mode violation, the catch turns it into false, and the outage passes as healthy.
+      const hasErrorBoundary = (await page.locator('text=/Something went wrong|Unexpected error|application error/i').count()) > 0
       expect(hasErrorBoundary).toBe(false)
     }
   })

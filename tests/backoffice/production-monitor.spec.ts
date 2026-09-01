@@ -200,7 +200,12 @@ test.describe('BackOffice — Production Monitor', () => {
     if (email.confirmationLink) {
       const response = await page.goto(email.confirmationLink, { waitUntil: 'domcontentloaded' })
       const status = response?.status() ?? 0
-      expect(status, `Email link returned ${status}: ${email.confirmationLink}`).not.toBe(404)
+      // `?? 0` plus `not.toBe(404)` passed on every 5xx AND on a null response (a same-document
+      // navigation), so a login link that served nothing was scored as good.
+      expect(
+        status >= 200 && status < 400,
+        `Email link returned ${status || 'no response'}: ${email.confirmationLink}`,
+      ).toBe(true)
     }
 
     // 5. Verify OTP code was present (basic sanity)
