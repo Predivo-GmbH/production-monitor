@@ -138,9 +138,48 @@ export function currentFailures(runs) {
     const prev = newestByLane.get(laneKey)
     if (!prev || new Date(r.created_at) > new Date(prev.created_at)) newestByLane.set(laneKey, r)
   }
-  return [...newestByLane.values()].filter(
+  const reds = [...newestByLane.values()].filter(
     (r) => r.conclusion === 'failure' || r.conclusion === 'startup_failure',
   )
+
+  // A BROKEN FILE IS CLEARED BY ANY LATER SUCCESS OF THAT FILE, IN EITHER LANE.
+  //
+  // classifyFailure already treats the zero-job shape as global - `production: true`, "nothing can
+  // be deployed from this repo at all" - because GitHub refused the file before reading a trigger.
+  // Recovery has to be just as global, and this is the case that proves it. ScoutCopilot's
+  // deploy.yml is workflow_dispatch-only; its ONLY push-event runs are the three GitHub
+  // manufactured on 2026-08-31 BECAUSE the file was unparseable. Fixing the file (9060158) means
+  // no push can ever create a deploy.yml run again, so the newest push run stays that failure for
+  // good and the staging lane reports red every hour with nothing anyone can do to clear it.
+  //
+  // Keeping the lane split intact: this ONLY forgives the broken-file shape. A genuine red staging
+  // push still survives a later green production dispatch, which is the erasure bug the lanes were
+  // added to stop.
+  const newestSuccessByPath = new Map()
+  for (const r of runs || []) {
+    if (!isDeployWorkflow(r.path) || r.status !== 'completed' || r.conclusion !== 'success') continue
+    const prev = newestSuccessByPath.get(r.path)
+    if (!prev || new Date(r.created_at) > new Date(prev.created_at)) newestSuccessByPath.set(r.path, r)
+  }
+  return reds.filter((r) => {
+    if (!isUnreadableFile(r)) return true
+    const ok = newestSuccessByPath.get(r.path)
+    return !(ok && new Date(ok.created_at) > new Date(r.created_at))
+  })
+}
+
+/**
+ * Did GitHub refuse to read this workflow file? Run metadata only, because currentFailures is pure.
+ *
+ * `startup_failure` is the documented conclusion, but the shape this fleet actually produced on
+ * 2026-08-31 reported plain `failure` with zero jobs. The tell in the metadata is the NAME: GitHub
+ * falls back to the file PATH when it cannot parse the file well enough to read its `name:` key,
+ * which is why those runs are titled ".github/workflows/deploy.yml" while every good run of the
+ * same file is titled "Deploy to Production". Checked 2026-09-01: all 93 workflow files in the
+ * fleet declare a `name:`, so path-as-name is not something a healthy workflow here produces.
+ */
+export function isUnreadableFile(run) {
+  return run.conclusion === 'startup_failure' || (!!run.name && run.name === run.path)
 }
 
 /**

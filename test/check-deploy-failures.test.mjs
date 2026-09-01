@@ -10,7 +10,7 @@
  */
 import assert from 'node:assert'
 import {
-  isDeployWorkflow, isProductionWorkflow, currentFailures, classifyFailure, isAlarm,
+  isDeployWorkflow, isProductionWorkflow, currentFailures, classifyFailure, isAlarm, isUnreadableFile,
   signalFor, planSignals, recoveredKeys, ROLLUP_KEY, ROLLUP_THRESHOLD,
 } from '../scripts/check-deploy-failures.mjs'
 
@@ -215,6 +215,50 @@ t('a green staging PUSH does not erase a red production DISPATCH of the same dep
   assert.equal(red.length, 1)
   assert.equal(red[0].id, 8)
   assert.equal(red[0].event, 'workflow_dispatch')
+})
+
+t('a run GitHub could not parse is recognised from its metadata alone', () => {
+  // GitHub titles a run by the file PATH when it cannot read the file's `name:` key.
+  assert.equal(isUnreadableFile(run({ name: '.github/workflows/deploy.yml' })), true)
+  assert.equal(isUnreadableFile(run({ conclusion: 'startup_failure', name: 'Deploy to Production' })), true)
+  assert.equal(isUnreadableFile(run({ name: 'Deploy to Production' })), false)
+})
+
+t('a fixed deploy FILE stops being red once any lane of it goes green again', () => {
+  // ScoutCopilot, live 2026-09-01. deploy.yml is workflow_dispatch-only, so the only push runs are
+  // the ones GitHub manufactured because the file was unparseable. Once the file is fixed no push
+  // can ever create a deploy.yml run again, so without this the staging lane is red forever.
+  const red = currentFailures([
+    run({ id: 9, event: 'workflow_dispatch', conclusion: 'success', name: 'Deploy to Production',
+          created_at: '2026-09-01T14:51:49Z' }),
+    run({ id: 8, event: 'push', conclusion: 'failure', name: '.github/workflows/deploy.yml',
+          created_at: '2026-08-31T12:33:30Z' }),
+  ])
+  assert.equal(red.length, 0)
+})
+
+t('an OLDER success does not forgive a NEWER broken file', () => {
+  const red = currentFailures([
+    run({ id: 9, event: 'workflow_dispatch', conclusion: 'success', name: 'Deploy to Production',
+          created_at: '2026-08-27T13:29:27Z' }),
+    run({ id: 8, event: 'push', conclusion: 'failure', name: '.github/workflows/deploy.yml',
+          created_at: '2026-08-31T12:33:30Z' }),
+  ])
+  assert.equal(red.length, 1)
+  assert.equal(red[0].id, 8)
+})
+
+t('the broken-file carve-out does NOT reopen the lane-erasure bug', () => {
+  // Same shape as the lane test above, but with a REAL staging failure (readable file, so it has a
+  // proper workflow name). A later green production dispatch must NOT clear it.
+  const red = currentFailures([
+    run({ id: 9, event: 'workflow_dispatch', conclusion: 'success', name: 'Deploy to Production',
+          created_at: '2026-09-01T15:00:00Z' }),
+    run({ id: 8, event: 'push', conclusion: 'failure', name: 'Deploy to Production',
+          created_at: '2026-09-01T14:00:00Z' }),
+  ])
+  assert.equal(red.length, 1)
+  assert.equal(red[0].id, 8)
 })
 
 t('every other failure IS an alarm', () => {
