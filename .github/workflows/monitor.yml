@@ -202,13 +202,10 @@ jobs:
           # project silently, which is exactly how 111,117 abandoned sessions accumulated across
           # seven projects and alarmed Supabase on Disk IO (2026-08-29).
           #
-          # JASSTOUR_TEST_PASSWORD IS NOT SET YET, so tests/jass-tour/user-password-login.spec.ts
-          # skips and the Fleet health card reports login as not-tested rather than green. Listing
-          # it here now is deliberate: the day the secret is created the test starts running with
-          # no workflow edit. DO NOT set it before Cockpit/sql/084 widens
-          # product_check_run_login_method_chk to accept 'user-password' — publish-check-results
-          # posts every product's row in one request, so one rejected row costs the whole fleet
-          # that hour.
+          # JASSTOUR_TEST_PASSWORD is SET as of 2026-09-01, and Cockpit sql/084 taught the database the
+          # 'user-password' method it emits, in that order on purpose: the writer posts every product's
+          # row in one request, so a method the database does not know would have cost the whole fleet
+          # its hour rather than one product. The writer now also falls back to one row per request.
           JASSTOUR_URL: https://beize-jass-tour.mueller.ro
           JASSTOUR_SUPABASE_URL: ${{ secrets.JASSTOUR_SUPABASE_URL }}
           JASSTOUR_ANON_KEY: ${{ secrets.JASSTOUR_ANON_KEY }}

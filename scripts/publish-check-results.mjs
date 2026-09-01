@@ -385,8 +385,8 @@ export function loadResults(path) {
   }
 }
 
-async function insertRows(secret, rows) {
-  const res = await fetch(`${BO_BASE}/rest/v1/product_check_run`, {
+async function postRows(secret, rows) {
+  return fetch(`${BO_BASE}/rest/v1/product_check_run`, {
     method: 'POST',
     headers: {
       apikey: secret,
@@ -397,7 +397,47 @@ async function insertRows(secret, rows) {
     },
     body: JSON.stringify(rows),
   })
-  if (!res.ok) throw new Error(`product_check_run insert -> HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`)
+}
+
+/**
+ * ONE BAD ROW MUST NOT COST THE WHOLE FLEET ITS HOUR.
+ *
+ * The batch is posted in a single request, which is right when it works: one round trip, and all
+ * twelve products share a timestamp. But PostgREST rejects the whole array if ANY row violates a
+ * constraint, so a single unexpected value - a `login_method` the database has not been taught
+ * yet is the obvious one, and it nearly happened - would have taken every other product's evidence
+ * down with it. The page would then show the entire fleet ageing into grey, and the cause would be
+ * one product.
+ *
+ * So: try the batch, and only if it fails fall back to one request per row. The failure is then
+ * confined to the row that caused it, and that row is NAMED. Still fire-and-forget overall: the
+ * caller catches, logs and exits 0, because a dashboard write can never be allowed to red a
+ * monitoring run.
+ */
+async function insertRows(secret, rows) {
+  const res = await postRows(secret, rows)
+  if (res.ok) return { written: rows.length, rejected: [] }
+
+  const batchError = `HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`
+  console.log(
+    `publish-check-results: the batch of ${rows.length} was rejected (${batchError}). ` +
+      'Retrying one row at a time so one bad product cannot cost the others their hour.',
+  )
+
+  let written = 0
+  const rejected = []
+  for (const row of rows) {
+    try {
+      const one = await postRows(secret, [row])
+      if (one.ok) written++
+      else rejected.push(`${row.slug} -> HTTP ${one.status}: ${(await one.text()).slice(0, 160)}`)
+    } catch (err) {
+      rejected.push(`${row.slug} -> ${err.message}`)
+    }
+  }
+  if (written === 0) throw new Error(`product_check_run insert -> every row rejected. First: ${rejected[0] ?? batchError}`)
+  for (const r of rejected) console.log(`publish-check-results: REJECTED ${r}`)
+  return { written, rejected }
 }
 
 export function parseArgs(argv = []) {
@@ -428,9 +468,13 @@ export async function publish({ dry = false, resultsFile = DEFAULT_RESULTS_FILE,
     return 0
   }
 
-  await insertRows(readBoSecret(env), rows)
-  console.log(`publish-check-results: wrote ${rows.length} row(s) to product_check_run.`)
-  return rows.length
+  // COUNT WHAT WAS WRITTEN, NOT WHAT WAS SENT. This line used to print `rows.length` whatever the
+  // database did with them, which is the fleet's most expensive habit in miniature: a job that
+  // reports success for work it did not do. The number below is the number the database accepted.
+  const { written, rejected } = await insertRows(readBoSecret(env), rows)
+  const note = rejected.length ? ` ${rejected.length} row(s) were REJECTED and are named above.` : ''
+  console.log(`publish-check-results: wrote ${written} of ${rows.length} row(s) to product_check_run.${note}`)
+  return written
 }
 
 async function main() {

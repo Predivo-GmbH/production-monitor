@@ -141,10 +141,33 @@ test.describe('Valrano — Production Monitor', () => {
     // session moves it to /dashboard; ProtectedRoute sends anyone without one back to /login. A
     // user who has not finished the wizard is forwarded on by OnboardingGuard to /onboarding —
     // also behind ProtectedRoute, so either destination proves the session is real.
-    await page.waitForURL(/\/(dashboard|onboarding)/, { timeout: 20_000 })
+    // ROOT CAUSE OF THE FIRST LIVE FAILURE (2026-09-01), recorded because the symptom lied.
+    // This line read as a dashboard-or-onboarding route followed by a word-boundary escape and held a literal 0x08
+    // BACKSPACE byte on disk where that word-boundary escape should have been - the same class of corruption as
+    // the BEL byte that silently broke all eight agent-run wrappers on 2026-08-31. The regex
+    // therefore demanded a control character after the route name, could never match any URL,
+    // and timed out twice for 20s while the login was working perfectly: the failure artifact
+    // shows the onboarding wizard rendered, which only exists behind ProtectedRoute.
+    //
+    // So the assertion no longer hangs on a URL at all. It waits for something a signed-in
+    // person can SEE, then reads the session back out of the browser. A URL is a symptom of
+    // being logged in; the session is the claim.
+    await expect(
+      page.getByRole('button', { name: /skip setup/i })
+        .or(page.getByRole('heading', { level: 1 }))
+        .first(),
+      'a signed-in session must render something behind ProtectedRoute',
+    ).toBeVisible({ timeout: 20_000 })
     await page.waitForLoadState('networkidle')
+
+    const hasSession = await page.evaluate(() =>
+      Object.keys(localStorage).some(
+        (k) => k.startsWith('sb-') && k.endsWith('-auth-token') && !!localStorage.getItem(k),
+      ),
+    )
+    expect(hasSession, 'a real Supabase session must exist after the magic link').toBe(true)
     const url = page.url()
-    expect(url, 'a signed-in session must not be sitting on an auth route').not.toMatch(/\/(login|signup|auth)/)
+    expect(url, 'a signed-in session must not be sitting on an auth route').not.toMatch(/\/(login|signup|auth)(?![a-z])/)
   })
 
   // ── Login form rendering — NOT a login (see the test above for that) ─────
