@@ -130,6 +130,37 @@ until the following Monday. It is a handful of read-only API calls, so it is now
 guard stays weekly on purpose: it currently has a real open finding, and a daily mail about a
 finding already on the board is the kind of noise that trains an alarm away.
 
+### F12 — A third guard promised an alert it did not have, and then could not send it · FIXED
+`check-gate-coverage.mjs` labels its findings *"enrolled but gates red -> exit 1 + alert"* and contained
+no mail code at all (grep for sendMail/SMTP returned 0), while `gate-coverage-check.yml` carried neither
+an alert step nor a heartbeat. Fixed in `0e5ed8e`. The first dispatched run then failed with
+`alert email failed: Cannot find package 'nodemailer'` because that workflow never installed
+dependencies, and I wrongly reported the mail as sent, having read a grep window instead of counting
+the error across the whole log. A parallel session added the dependency install (`f2b5b85`). Re-proven
+on run 33509893706: the finding is reported and the full log contains **zero** occurrences of
+`alert email failed`, `NOT EMAILED` or the nodemailer error.
+
+### F13 — Two checks were skipped by the failure of the check before them · FIXED
+The hourly monitor's layer-2 watchdog ("CI runner watchdog is still alive") inherited GitHub's default
+`if: success()`, so it was skipped on every hour an earlier step failed, which is the hour it matters.
+Proven on run 33483510991 (2026-09-01 07:43Z): that step reports `skipped` while the products-down
+sensor, which carries `if: always()`, ran; and because a skipped step's outcome is `skipped` and never
+`failure`, its own dedicated email could not fire either. The same defect skipped the deploy-pipeline
+conformance check in `drift-check.yml` whenever the schema-drift check above it failed. Both fixed in
+`262e718`. This is the same shape as the outage that opened this audit, where a fixture failure hid the
+test that would have named the cause.
+
+### F14 — Distribution-OS was releasing without its release checks, and F12 is why nobody knew · RESOLVED
+The gate-coverage guard reported `*** FAIL *** Distribution-OS — staging-gates enrolled but latest run =
+failure (broken gates)`. Cause of that failure, read from run 33366376127 of 2026-08-31: the gate spec's
+Supabase Management API call returned `mgmt query 401: Unauthorized`, i.e. a dead management token, the
+same class of dead credential replaced across the fleet that morning. The gates went green again on run
+33510229696 at 2026-09-01 12:54:01Z. Verified after that: gate-coverage run 33514677706 reports
+`Coverage: 7/10 required apps enrolled + green, 3 pending, 0 broken` and `All ENROLLED gate harnesses
+green`. The finding is closed; what made it dangerous was not the token but F12, which meant a product
+released unchecked for a day with the only trace a red weekly run nobody watches.
+
+
 ---
 
 ## What is built correctly, and should not be changed while fixing the above
