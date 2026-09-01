@@ -65,6 +65,71 @@ const SEVERITY_RANK = { critical: 3, warning: 2, info: 1 }
 const THRESHOLD = (process.env.BOARD_DRAINER_THRESHOLD || 'warning').toLowerCase()
 const THRESHOLD_RANK = SEVERITY_RANK[THRESHOLD] ?? SEVERITY_RANK.warning
 
+/**
+ * MOVING A FINDING TO THE WORK BOARD IS NOT THE SAME AS TELLING ANYBODY.
+ *
+ * -- THE MEASUREMENT (production xoecpzfsskalvjrtcbbl, 2026-09-01) ---------------------------
+ *
+ * In the whole recorded history of the signals board, TWENTY-FOUR signals have ever asked to
+ * ring Roger's phone -- `needs_human = true` AND `severity = 'critical'`, the only combination
+ * upsert_signal will arm. TWENTY-ONE of them never rang. EIGHTEEN of those twenty-one carry
+ * `page_suppressed_reason = 'routed-to-work-board'` with `paged_at IS NULL`: written by this
+ * function, one hop before delivery.
+ *
+ * Among the eighteen, verbatim titles:
+ *   "SignalScore production mailer silent >168h"                     -- a week of dead customer mail
+ *   "Five products' Supabase management tokens are dead ..."
+ *   "One dev branch with no upstream switched off all 24 scheduled jobs for 9.5 hours"
+ *   "BackOffice share-link returns every column of project_access_requests to a token holder"
+ *   "All 25 guard hooks are silently switched off on this laptop ..."
+ *
+ * -- HOW IT HAPPENED -------------------------------------------------------------------------
+ *
+ * upsert_signal does not deliver a page, it SCHEDULES one: `page_due_at = now() + 15 minutes`.
+ * That delay is the self-heal window, and it is the rule that removed 235 of 236 alerts from
+ * Roger's life. A separate 5-minute sweep delivers whatever has come due.
+ *
+ * The drainer runs hourly and routes findings to the work board. Routing PATCHed
+ * `page_due_at = null` unconditionally. So any page still inside its own 15-minute window when
+ * the drainer arrived was cancelled by us, before the sweep ever looked at it. The self-heal
+ * window designed to absorb false alarms was being consumed by our own robot instead.
+ *
+ * The old header said so and thought it was fine: "upsert_signal treats both as closed for
+ * paging, so the pending page is cancelled either way". The premise underneath that sentence is
+ * that the work board is where Roger finds out. IT IS NOT. The work board is a PAGE HE HAS TO
+ * OPEN, exactly like /signals. Both are PULL. The page was the only PUSH in the system, and the
+ * hand-off deleted it, then recorded a reason that reads like a successful delivery.
+ *
+ * -- THE RULE ---------------------------------------------------------------------------------
+ *
+ *     A HAND-OFF CHANGES WHERE THE WORK LIVES. IT NEVER DECIDES THAT HE WAS TOLD.
+ *
+ * So: cancel the page only once it has actually been DELIVERED. "Delivered" is the same test the
+ * sweep itself uses (migration 128): a page is still outstanding when `paged_at IS NULL` or when
+ * `paged_at < page_due_at`, i.e. re-armed by something newer than the last send. Anything else,
+ * and a signal that pages once could never page again -- the dead-code cooldown bug 128 fixed.
+ *
+ * Nothing is re-armed here and no new page is created: a row that was never armed
+ * (`page_due_at` null -- the 47 warnings that were never eligible) is untouched and stays
+ * unreachable. This closes the leak; it does not widen the alarm.
+ *
+ * @param {{page_due_at?: string|null, paged_at?: string|null}} row  the live signal
+ * @returns {{page_due_at: string|null, page_suppressed_reason: string, kept: boolean}}
+ */
+export function pageFieldsOnSupersede(row) {
+  const due = row?.page_due_at ?? null
+  const paged = row?.paged_at ?? null
+  const outstanding = due !== null && (paged === null || new Date(paged) < new Date(due))
+  if (outstanding) {
+    // Keep the schedule exactly as it stands. Not `now()`, not a fresh delay: the self-heal
+    // window belongs to the producer that armed it, and re-stamping it here would push every
+    // page 15 more minutes into the future on every hourly drainer run — a page that is always
+    // about to be sent and never is.
+    return { page_due_at: due, page_suppressed_reason: 'routed-to-work-board-page-still-due', kept: true }
+  }
+  return { page_due_at: null, page_suppressed_reason: 'routed-to-work-board', kept: false }
+}
+
 /** True when an incident is at or above the configured severity threshold.
  *  An UNKNOWN/absent severity is treated as ABOVE the bar, never below: a row we cannot
  *  grade is a row we must not silently skip. */
@@ -1327,26 +1392,29 @@ export function workBoardDeps(secret, base = BO_BASE) {
     /**
      * `superseded`, never `resolved`. Resolved means the problem is gone; this problem is very
      * much still here, it simply lives on the work board now. The distinction is not cosmetic:
-     * upsert_signal treats both as closed for paging, so the pending page is cancelled either
-     * way, but a person reading /signals can tell "fixed" from "handed over".
+     * a person reading /signals can tell "fixed" from "handed over".
      *
      * Written as a direct PATCH rather than through upsert_incident because writing the INCIDENT
      * row fires the mirror trigger, which maps `blocked` back to `open` and would un-supersede the
      * signal on the same tick.
+     *
+     * THE PAGE IS NOT CANCELLED HERE ANY MORE — see pageFieldsOnSupersede.
      */
     async supersedeSignal(inc, slug) {
       const filter = `source=eq.${encodeURIComponent(inc.source)}&key=eq.${encodeURIComponent(inc.key)}`
-      const cur = await fetch(`${base}/rest/v1/fleet_signals?select=id,state,detail&${filter}`, { headers: H })
+      const cur = await fetch(`${base}/rest/v1/fleet_signals?select=id,state,detail,page_due_at,paged_at&${filter}`, { headers: H })
       if (!cur.ok) throw new Error(`signal read HTTP ${cur.status}`)
       const rows = await cur.json()
       if (!rows.length) { log(`    signal ${inc.source}/${inc.key} not found — nothing superseded`); return false }
+      const page = pageFieldsOnSupersede(rows[0])
+      if (page.kept) log(`    page for ${inc.source}/${inc.key} was still undelivered — LEFT ARMED, the hand-off does not silence it`)
       const res = await fetchWithTransportRetry(`${base}/rest/v1/fleet_signals?${filter}`, {
         method: 'PATCH', headers: { ...H, Prefer: 'return=minimal' },
         body: JSON.stringify({
           state: 'superseded',
           resolved_at: new Date().toISOString(),
-          page_due_at: null,
-          page_suppressed_reason: 'routed-to-work-board',
+          page_due_at: page.page_due_at,
+          page_suppressed_reason: page.page_suppressed_reason,
           detail: {
             ...(rows[0].detail || {}),
             ...parkedFields(null),

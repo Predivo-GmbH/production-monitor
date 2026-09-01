@@ -459,6 +459,28 @@ jobs:
         env:
           BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
 
+      # CAN THE ALARMS REACH ANYBODY AT ALL? (2026-09-01)
+      #
+      # Every other step in this file asks whether the thing it watches is healthy. None of them
+      # asked whether, having found something, they could TELL anyone — and the audit that
+      # followed the twenty-hour login outage found that of the 24 signals which ever asked to
+      # ring Roger's phone, 21 never rang. Not one alarm noticed; a person found it by reading
+      # the database.
+      #
+      # Two faults, both measured live before this step was written: a source with no row in
+      # signal_page_policy is muted absolutely (17 of 23 sources, six of which had already filed
+      # something page-worthy), and a signal marked critical while carrying needs_human=false is
+      # a contradiction the paging rule simply refuses.
+      #
+      # It files its finding under `production-monitor`, which is ARMED — never under the source
+      # it is reporting on. An alarm about a mute source, filed into that mute source, is silent
+      # by construction, and that sentence is the whole reason this step exists.
+      - name: Can the alarms still reach a human
+        if: always()  # independent sensor — must run even if a step above failed. Exits 0 on a filed alarm; only a failed read reds the job, so this cannot double-red one event.
+        run: node scripts/check-alarm-reachability.mjs
+        env:
+          BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
+
       # A dead automation must ALERT, not merely be visible. healthchecks.io knows within
       # minutes that a scheduled job stopped checking in, but until 2026-08-25 that fact only
       # ever appeared on a screen: the jobs grid renders the check grey and nobody is told, so

@@ -18,10 +18,41 @@
  *                 for DRAINER_STALL_HOURS. That is the 30-hour failure, stated as an invariant.
  *   3. DISABLED — the run was skipped by the kill switch or the wired-but-off gate (runStats.skipped
  *                 set). A switch left on looks byte-identical to a clean board; it is not-ok.
+ *   4. GIVEN UP  — the drainer has PARKED most of the board. Parked means it tried, hit the
+ *                 attempt ceiling, and will never pick that item up again. See below.
  *
- * A parked item is NOT dispatchable and never counts: parking is a deliberate suppression the
- * drainer announces every run. The alarm fires on work the drainer is allowed to take and is
- * not taking.
+ * -- ASSERTION 4, AND WHY THE FIRST THREE WERE NOT ENOUGH (2026-09-01) -----------------------
+ *
+ * This file used to say, in this exact spot:
+ *
+ *     "A parked item is NOT dispatchable and never counts: parking is a deliberate suppression
+ *      the drainer announces every run. The alarm fires on work the drainer is allowed to take
+ *      and is not taking."
+ *
+ * That sentence let the drainer mark its own homework. `dispatchable` is a number the DRAINER
+ * computes, after removing everything it has decided to stop trying. So the drainer could give
+ * up on the entire board and this alarm would read green, because a board with nothing left to
+ * dispatch and a board that is genuinely clean produce identical numbers.
+ *
+ * It was not hypothetical. Fed the LIVE heartbeat of 2026-09-01 18:08 —
+ *     considered 38, dispatchable 1, dispatched 1, PARKED 36
+ * — judgeDrainer returned `ok`, "The fleet auto-fixer is working". Thirty-six findings that no
+ * machine will ever work again, and every alarm we owned said fine.
+ *
+ * This is the 2026-08-24 incident in its second costume. Then, three permanently-stuck items ate
+ * the whole per-run budget and 34 incidents sat untouched behind them; the fix taught this script
+ * to ask "is dispatchable work being dispatched?". The drainer now parks the stuck ones instead
+ * of retrying them forever — which is the right behaviour — and the same 34 incidents sit
+ * untouched on the other side of the same green alarm. The outcome never changed: incidents pile
+ * up, the alarm reads green, Roger finds it by reading the board himself.
+ *
+ * PARKING IS NOT WRONG. Giving up QUIETLY is. A parked item is precisely an item the machine has
+ * declared it cannot fix, so it is the one class that most needs a person told — and parked items
+ * carry needs_human=false, so nothing pages and nothing reaches the work board either. They exist
+ * only on a web page, and a web page is PULL.
+ *
+ * The threshold is a SHARE, not a count, so it scales with the board and cannot be tuned away by
+ * a quiet week: parking is normal, parking most of the board is the fixer having stopped.
  *
  * Read-only against the board; the alarm itself is filed through signal-intake, so the page
  * policy, the self-heal window and the dedup all apply to it like any other signal.
@@ -42,6 +73,11 @@ const ALARM_KEY = 'stalled'
 
 const STALE_MIN = Number(process.env.DRAINER_STALE_MIN || 180)
 const STALL_HOURS = Number(process.env.DRAINER_STALL_HOURS || 6)
+// Both must hold before "given up" fires. The FLOOR stops a two-item board reading as a crisis
+// (1 of 2 parked is 50% and means nothing); the SHARE is what makes the rule un-tunable by a
+// quiet week. At the 2026-09-01 measurement, 36 of 38 = 95%.
+const PARK_FLOOR = Number(process.env.DRAINER_PARK_FLOOR || 5)
+const PARK_SHARE = Number(process.env.DRAINER_PARK_SHARE || 0.5)
 
 function readBoSecret() {
   // In CI this is the repo secret BACKOFFICE_SERVICE_ROLE_KEY (the same one factory-heartbeat
@@ -61,7 +97,10 @@ const minsSince = (iso, now) => (iso ? Math.round((now - new Date(iso).getTime()
  * The whole decision, pure and testable. `heartbeat` is the fleet_signals row (or null when the
  * drainer has never reported). Never returns 'ok' for an input it could not interpret.
  */
-export function judgeDrainer({ heartbeat, now = Date.now(), staleMin = STALE_MIN, stallHours = STALL_HOURS }) {
+export function judgeDrainer({
+  heartbeat, now = Date.now(), staleMin = STALE_MIN, stallHours = STALL_HOURS,
+  parkFloor = PARK_FLOOR, parkShare = PARK_SHARE,
+}) {
   if (!heartbeat) {
     return {
       verdict: 'stopped',
@@ -131,11 +170,41 @@ export function judgeDrainer({ heartbeat, now = Date.now(), staleMin = STALE_MIN
     }
   }
 
+  // GIVEN UP. Deliberately AFTER the stall test, so a drainer that is both stalled and parked-out
+  // reports the stall — that is the more actionable of the two. Read from the drainer's own
+  // `parked` counter, which it publishes every run; an ABSENT counter is not read as zero,
+  // because "the drainer stopped reporting how much it abandoned" is not evidence that it
+  // abandoned nothing. That is the could-not-tell-reported-as-fine shape this file exists to
+  // avoid, so it is graded as unknown below rather than folded into ok.
+  const considered = Number(detail.considered || 0)
+  const parkedRaw = detail.parked
+  if (parkedRaw === undefined || parkedRaw === null) {
+    if (considered > 0) {
+      return {
+        verdict: 'unknown',
+        severity: 'warning',
+        title: 'The fleet auto-fixer stopped saying how much it has given up on',
+        summary: `The last run considered ${considered} incident(s) but published no parked count, so how much of the board has been abandoned cannot be established. Unknown is not healthy.`,
+      }
+    }
+  } else {
+    const parked = Number(parkedRaw)
+    if (parked >= parkFloor && considered > 0 && parked / considered >= parkShare) {
+      const pct = Math.round((parked / considered) * 100)
+      return {
+        verdict: 'given-up',
+        severity: 'critical',
+        title: 'The fleet auto-fixer has given up on most of the board',
+        summary: `${parked} of ${considered} incidents (${pct}%) are PARKED: the auto-fixer tried them, hit its attempt ceiling and will not pick them up again. Parked findings carry needs_human=false, so nothing alerts on them and they never reach the work board either — they exist only on the /signals page. These need a person, and until now the alarm reported "the fleet auto-fixer is working" because parked items were excluded from the count the alarm looked at.`,
+      }
+    }
+  }
+
   return {
     verdict: 'ok',
     severity: 'info',
     title: 'The fleet auto-fixer is working',
-    summary: `Last run ${age}m ago; ${dispatchable} dispatchable, last dispatch ${sinceDispatch === null ? 'never' : `${sinceDispatch}m ago`}.`,
+    summary: `Last run ${age}m ago; ${dispatchable} dispatchable, last dispatch ${sinceDispatch === null ? 'never' : `${sinceDispatch}m ago`}; ${Number(parkedRaw || 0)} of ${considered} parked.`,
   }
 }
 
