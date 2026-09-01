@@ -15,7 +15,7 @@
 import assert from 'node:assert'
 import fs2 from 'node:fs'
 import { spawnSync } from 'node:child_process'
-import { metricValue, exitDecision, discover, blindSignal } from '../scripts/check-supabase-machine-health.mjs'
+import { metricValue, exitDecision, discover, blindSignal, coverageGaps, missingFindings, productionOnly, loadBaseline } from '../scripts/check-supabase-machine-health.mjs'
 
 let passed = 0
 let failed = 0
@@ -227,16 +227,119 @@ check('blindSignal names every blind machine and asks for a human', () => {
 // This one deliberately runs the REAL CLI in a subprocess. A function-level test is exactly
 // what let the bug through: exitDecision() was green-tested all along while the CLI had
 // stopped calling it, so the wiring — not the policy — is what needs pinning here.
-check('CLI: discovering ZERO machines exits non-zero (the unwired exitDecision guard)', () => {
-  const clean = {}
+//
+// Its assertion changed with the coverage-floor fix below: the real baseline file lists 20
+// projects, so a run with every *_SUPABASE_URL/key stripped now fails via the NAMED coverage
+// path (blind.length > 0 -> process.exit(1) naming all 20) rather than the old generic
+// "no Supabase machines were discovered" message — strictly more informative, since it now
+// says WHICH projects went dark instead of only that the run learned nothing.
+check('CLI: discovering ZERO machines exits non-zero and names what the baseline expected', () => {
+  const clean = { BOARD_SUPABASE_SECRET: 'not-a-real-secret-this-test-must-not-file' }
   for (const [k, v] of Object.entries(process.env)) {
     if (!k.endsWith('_SUPABASE_URL') && !k.endsWith('_SERVICE_ROLE_KEY') && !k.endsWith('_SECRET_KEY')) clean[k] = v
   }
   const r = spawnSync(process.execPath, ['scripts/check-supabase-machine-health.mjs'],
-    { env: clean, encoding: 'utf-8', timeout: 60_000 })
+    { env: clean, encoding: 'utf-8', timeout: 60_000, cwd: new URL('..', import.meta.url) })
   assert.notEqual(r.status, 0, 'a run that checked nothing at all must never read as all-clear')
-  assert.match(String(r.stderr), /no Supabase machines were discovered/,
+  assert.match(String(r.stdout), /coverage: 0\/\d+ expected projects watched/,
+    'the shipped script must report coverage, not just count what it happened to see')
+  assert.match(String(r.stderr), /could not be read/,
     'and it must say WHY it failed, not just exit 1')
+})
+
+// ---------------------------------------------------------------------------------------
+// COVERAGE FLOOR — 2026-09-01 board item: "Nothing watches the Jass-Tour database's disk
+// usage — the alarm has the wrong key." discover() is driven ENTIRELY by which *_SUPABASE_URL
+// env vars exist this run. A product whose secret was never wired into monitor.yml's env
+// block for THIS step, or whose secret name was renamed/dropped, produces no target and no
+// finding — it is not 'unreadable', it is invisible, and invisible reads as fine. This is a
+// DIFFERENT defect from the 2026-09-01 BOM bug in lib/credentials.mjs (a key that existed but
+// was unusable, honestly reported as 'unreadable'): this is a key that never reached the
+// process at all, reported as nothing whatsoever.
+// ---------------------------------------------------------------------------------------
+
+const JASSTOUR_BASELINE = { projects: [
+  { ref: 'dkxdlovwzsxnepoteebk', product: 'Beize Jass Tour' },
+  { ref: 'aaaaaaaaaaaaaaaaaaaa', product: 'Other Product' },
+] }
+
+check('DEFECT, proven by injection: a baseline project with NO *_SUPABASE_URL anywhere in env leaves discover() with zero trace of it', () => {
+  // Simulates the fleet's actual state 2026-08-30 through 2026-09-01: every OTHER product is
+  // present and healthy, but Jass-Tour's secret was never wired into this env at all.
+  const env = { OTHER_SUPABASE_URL: 'https://aaaaaaaaaaaaaaaaaaaa.supabase.co', OTHER_SERVICE_ROLE_KEY: 'sb_secret_x' }
+  const discovered = discover(env)
+  assert.equal(discovered.length, 1, 'only the wired product is discovered')
+  assert.ok(!discovered.some((d) => d.ref === 'dkxdlovwzsxnepoteebk'), 'Jass-Tour never appears — not even as a reasoned/unreadable row')
+
+  // What the CLI computed BEFORE this fix: findings straight from discover(), nothing else.
+  const preFixFindings = discovered.map((t) => (t.reason ? { product: t.product, level: 'unreadable', detail: t.reason } : { product: t.product, level: 'ok' }))
+  const dec = exitDecision(preFixFindings)
+  assert.equal(dec.code, 0, 'THE BUG: the missing product left no trace, so the pre-fix run reads as a clean, fully-covered fleet')
+})
+
+check('FIX: coverageGaps() catches the same missing product, and folding it in makes the run fail and name it', () => {
+  const env = { OTHER_SUPABASE_URL: 'https://aaaaaaaaaaaaaaaaaaaa.supabase.co', OTHER_SERVICE_ROLE_KEY: 'sb_secret_x' }
+  const discovered = discover(env)
+  const gaps = coverageGaps(discovered, JASSTOUR_BASELINE)
+  assert.equal(gaps.length, 1)
+  assert.equal(gaps[0].product, 'Beize Jass Tour')
+  assert.equal(gaps[0].ref, 'dkxdlovwzsxnepoteebk')
+
+  const findings = [...discovered.map((t) => ({ product: t.product, level: 'ok' })), ...missingFindings(gaps)]
+  const dec = exitDecision(findings)
+  assert.equal(dec.code, 1, 'a product with no env presence at all must now fail the run, exactly like a rotated key does')
+  assert.match(dec.message, /Beize Jass Tour/, 'the alert must name the specific product that has no watchdog, not just say "something is missing"')
+})
+
+check('missingFindings: a gap becomes a named, actionable finding, not a bare count', () => {
+  const [f] = missingFindings([{ ref: 'dkxdlovwzsxnepoteebk', product: 'Beize Jass Tour' }])
+  assert.equal(f.level, 'unreadable')
+  assert.equal(f.product, 'Beize Jass Tour')
+  assert.match(f.detail, /dkxdlovwzsxnepoteebk/, 'the ref must be in the text — that is what a person needs to go look it up')
+  assert.equal(missingFindings(null).length, 0, 'unproven coverage (no baseline) invents no findings')
+  assert.equal(missingFindings(undefined).length, 0)
+})
+
+// ---------------------------------------------------------------------------------------
+// STAGING EXCLUSION — the shared baseline is the WHOLE fleet (20 projects, 9 of them
+// staging). This step of monitor.yml has never wired a *_STAGING_SUPABASE_URL secret, so
+// comparing raw against the full baseline would report all 9 staging projects as a gap on
+// EVERY run — a false alarm the fix itself would manufacture. productionOnly() must strip
+// them before coverageGaps() ever sees the baseline.
+// ---------------------------------------------------------------------------------------
+
+check('DEFECT, proven by injection: the UNFILTERED shared baseline manufactures a false alarm for every staging project', () => {
+  const real = loadBaseline()
+  assert.ok(real && real.projects.length >= 15, 'sanity: the real fleet baseline loaded and is not suspiciously small')
+  const stagingCount = real.projects.filter((p) => /staging/i.test(p.product)).length
+  assert.ok(stagingCount > 0, 'sanity: the real baseline does contain staging projects')
+  // discover() sees only what THIS step actually wires — no staging secret among them, by design.
+  const prodEnv = { JASSTOUR_SUPABASE_URL: 'https://dkxdlovwzsxnepoteebk.supabase.co', JASSTOUR_SERVICE_ROLE_KEY: 'sb_secret_x' }
+  const gapsAgainstRawBaseline = coverageGaps(discover(prodEnv), real)
+  assert.ok(gapsAgainstRawBaseline.length >= stagingCount,
+    'THE BUG: comparing against the unfiltered fleet baseline reports every staging project as missing, every single run, forever')
+})
+
+check('FIX: productionOnly() strips every staging entry, so coverage compares against what this step actually wires', () => {
+  const real = loadBaseline()
+  const prod = productionOnly(real)
+  assert.ok(!prod.projects.some((p) => /staging/i.test(p.product)), 'no staging product name may survive the filter')
+  assert.equal(prod.projects.some((p) => p.product === 'Beize Jass Tour'), true, 'Jass-Tour itself is production and must survive the filter')
+  assert.ok(prod.projects.length < real.projects.length, 'the filter must actually remove something')
+})
+
+check('productionOnly() is a no-op on null/empty baselines (unproven coverage stays unproven)', () => {
+  assert.equal(productionOnly(null), null)
+  assert.equal(productionOnly({ projects: [] }).projects.length, 0)
+})
+
+check('a fully-covered run has zero gaps and stays green on coverage alone', () => {
+  const env = {
+    JASSTOUR_SUPABASE_URL: 'https://dkxdlovwzsxnepoteebk.supabase.co', JASSTOUR_SERVICE_ROLE_KEY: 'sb_secret_x',
+    OTHER_SUPABASE_URL: 'https://aaaaaaaaaaaaaaaaaaaa.supabase.co', OTHER_SERVICE_ROLE_KEY: 'sb_secret_y',
+  }
+  const gaps = coverageGaps(discover(env), JASSTOUR_BASELINE)
+  assert.deepEqual(gaps, [], 'both baseline projects are wired — coverage is PROVEN complete, not merely quiet')
 })
 
 console.log(`\n${passed} passed, ${failed} failed`)

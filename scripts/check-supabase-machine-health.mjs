@@ -20,6 +20,45 @@
 
 import { boardSecret, fileSignal, signal } from "./lib/fleet-signal.mjs"
 import { sanitizeEnvAndReport } from "./lib/credentials.mjs"
+// The coverage-floor half of the fix, in the house style of check-supabase-build-currency.mjs
+// and expire-stale-sessions.mjs (scripts/lib/supabase-coverage.mjs, extracted 2026-08-30 when
+// build-currency and the session sweep hit the identical hole on the same day). This file did
+// NOT have it: discover() is driven entirely by which *_SUPABASE_URL env vars exist THIS run,
+// so a product whose secret was never wired into monitor.yml's env block for this step, or
+// whose secret name was renamed/deleted, does not produce a finding at all — not 'unreadable',
+// not counted, not printed. It is simply absent, and absent reads as fine: "N-1 machines
+// checked, 0 over the line, 0 unreadable" is indistinguishable from a clean fleet. Board item
+// 2026-09-01 "Nothing watches the Jass-Tour database's disk usage — the alarm has the wrong
+// key": Jass-Tour's disk secret only entered this step's env block on 2026-08-30 and only got
+// a real value on 2026-09-01 — for the ten days between, discover() never once produced a
+// JASSTOUR row, and nothing said so. That is a DIFFERENT defect from the 2026-09-01 BOM bug in
+// lib/credentials.mjs (a key that existed but was unusable, reported honestly as 'unreadable');
+// this is a key that never reached the process at all, reported as nothing.
+import { coverageGaps, coverageLine, loadBaseline } from './lib/supabase-coverage.mjs'
+
+export { coverageGaps, loadBaseline }
+
+/**
+ * This check currently watches PRODUCTION disk usage only: monitor.yml's "Supabase machine
+ * health" step has never wired a single *_STAGING_SUPABASE_URL secret into its env block (11
+ * production prefixes plus YTMIGRATION, no staging ones — see the same workflow's other steps,
+ * which DO carry staging secrets for other purposes). scripts/lib/supabase-projects-baseline.json
+ * is the WHOLE fleet's inventory, staging included (9 of its 20 entries have "Staging" in the
+ * name), because that is what expire-stale-sessions.mjs and check-supabase-build-currency.mjs
+ * are each responsible for. Comparing this check's coverage against the unfiltered baseline
+ * would report all 9 staging projects as a permanent gap on every single run — a self-inflicted
+ * false alarm manufactured by the fix itself, not a genuine finding, and exactly the kind of
+ * noise the open board signal "supabase-disk-pressure-rotates-across-projects" is already
+ * complaining about. Filtered here, not forked into a second file, so there is still exactly
+ * one written-down inventory; "staging is out of scope for this particular watchdog" is a fact
+ * about what monitor.yml wires, not a fact about the fleet, so it does not belong in the shared
+ * baseline itself. That staging disk usage is unwatched at all is real and is NOT this fix —
+ * see the handover note filed alongside this change.
+ */
+export function productionOnly(baseline) {
+  if (!baseline?.projects?.length) return baseline
+  return { ...baseline, projects: baseline.projects.filter((p) => !/staging/i.test(p.product)) }
+}
 
 const WARN_MB_S = Number(process.env.DISK_WARN_MB_S || 2.0)   // sustained OS-disk traffic; the quiet fleet sits at 0.06-0.5
 const FAIL_MB_S = Number(process.env.DISK_FAIL_MB_S || 4.0)   // ScoutCopilot was 7.74 when Supabase complained
@@ -153,6 +192,26 @@ export function exitDecision(findings) {
 }
 
 /**
+ * Coverage gaps rendered as ordinary unreadable findings, so the ONE blindness path
+ * (blindSignal + exitDecision's unreadable branch) reports a totally-missing product exactly
+ * like a rotated/empty key. From the fleet's point of view there is no difference between the
+ * two: nobody is watching that project's disk either way, and a person fixing this needs the
+ * same board row and the same non-zero exit regardless of which one happened.
+ *
+ * `ref` travels on the finding so the alert names something a person can look up even though
+ * discover() itself never saw this product this run — it has no `product` env-var-prefix to
+ * report because no *_SUPABASE_URL for it existed in this run's environment at all.
+ */
+export function missingFindings(gaps) {
+  return (gaps ?? []).map((p) => ({
+    ref: p.ref,
+    product: p.product,
+    level: 'unreadable',
+    detail: `no *_SUPABASE_URL/key pair in this run's environment resolves to project ${p.ref} — it is expected by scripts/lib/supabase-projects-baseline.json but discover() never produced a row for it, so its disk-IO watchdog has been dark, not merely unreadable`,
+  }))
+}
+
+/**
  * The board row for a watchdog that has gone BLIND, as opposed to one that found something.
  *
  * 986d205 routed the "we found something" path onto the signals board, because a bare exit(1)
@@ -190,11 +249,19 @@ if (process.argv[1] && process.argv[1].endsWith('check-supabase-machine-health.m
   // import. main() reads process.env after this line, so the repair still reaches it.
   sanitizeEnvAndReport()
 
-  const findings = await checkMachines()
+  // Coverage floor: what discover() actually saw this run, compared against the written-down
+  // expectation. A product with no *_SUPABASE_URL/key in this run's environment at all never
+  // reaches checkMachines() — it has no target to sample — so without this comparison it leaves
+  // no trace whatsoever, which is the exact "Jass-Tour" gap the 2026-09-01 board item names.
+  const baseline = productionOnly(loadBaseline())
+  const gaps = coverageGaps(discover(), baseline)
+
+  const findings = [...await checkMachines(), ...missingFindings(gaps)]
   for (const f of findings) console.log(`${String(f.level).toUpperCase().padEnd(11)} ${String(f.product).padEnd(20)} ${f.detail}`)
   const loud = findings.filter((f) => f.level === 'fail' || f.level === 'warn')
   const blind = findings.filter((f) => f.level === 'unreadable')
   console.log(`${findings.length} machines checked, ${loud.length} over the line, ${blind.length} unreadable`)
+  console.log(coverageLine(gaps, baseline, 'watched'))
 
   // The finding goes on the board Roger actually opens, not only into a red workflow run.
   // send-alert.mjs reads Playwright's results.json, so a bare exit(1) here would have sent an
