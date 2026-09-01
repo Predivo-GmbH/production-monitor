@@ -196,6 +196,11 @@ function main() {
   // not in scope in the `catch` that reads it, and a ReferenceError there would turn a
   // deliberate off into a crash - the loudest possible way to fail at being quiet.
   const SWITCHED_OFF = 76
+  // 77 = BOTH ENGINES OUT OF CAPACITY AT ONCE (added 2026-09-01). Same family as 76 and
+  // treated identically everywhere below: a deliberate skip, never a failure. A caller that
+  // knew 76 and not 77 would turn an outage into a red run and an alarm mail - the exact
+  // outcome the skip exists to prevent.
+  const NO_CAPACITY = 77
   try {
     // Headless Claude Code via execFileSync (args ARRAY, no shell) — passing the multi-line
     // system prompt through a shell string mangles it on Windows (cmd/PowerShell parse the policy
@@ -242,7 +247,7 @@ function main() {
     // A DELIBERATE OFF IS NOT AN ERROR, and must not be logged as one. Checked FIRST, because
     // everything below treats a non-zero exit as a fault and would file this as "Claude run
     // errored" - a false failure of exactly the kind this fleet exists to catch.
-    if (e && e.status === SWITCHED_OFF) {
+    if (e && (e.status === SWITCHED_OFF || e.status === NO_CAPACITY)) {
       console.log('agent-triage: the automations are switched off in the cockpit, so no agent was run. This is deliberate and not a failure.')
       return
     }

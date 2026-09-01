@@ -111,6 +111,11 @@ const AGENT_RUN_JOB = 'board-drainer'
 // Exit 76 = Roger switched the automations off in the cockpit. A deliberate off, never a failure
 // (contract section 7): no [ALERT] mail, no failure written back to the board, no ping, exit 0.
 const SWITCHED_OFF_EXIT = 76
+// 77 = BOTH ENGINES OUT OF CAPACITY AT ONCE (added 2026-09-01). Same family as 76 and
+// treated identically everywhere below: a deliberate skip, never a failure. A caller that
+// knew 76 and not 77 would turn an outage into a red run and an alarm mail - the exact
+// outcome the skip exists to prevent.
+const NO_CAPACITY = 77
 let switchedOff = false
 
 // ── logging ─────────────────────────────────────────────────────────────────────────────
@@ -1470,7 +1475,7 @@ function dispatchAgent(inc, mode) {
     // execFileSync THROWS on a non-zero exit; the code is on err.status. 76 is not an error at
     // all: the cockpit switch is off, so nothing was spawned. Return the sentinel and let the
     // caller stop the run - do NOT fall through to the timeout bookkeeping below.
-    if (e?.status === SWITCHED_OFF_EXIT) {
+    if ((e?.status === SWITCHED_OFF_EXIT || e?.status === NO_CAPACITY)) {
       log('  automations are switched off in the cockpit - no agent dispatched (a deliberate off, not a failure)')
       return AGENT_SWITCHED_OFF
     }

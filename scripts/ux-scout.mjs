@@ -61,6 +61,11 @@ const AGENT_RUN_JOB = 'ux-scout'
 // Exit 76 = Roger switched the automations off in the cockpit. A deliberate off, never a failure
 // (contract section 7): one log line, no [ALERT] mail, nothing written, nothing emailed, exit 0.
 const SWITCHED_OFF_EXIT = 76
+// 77 = BOTH ENGINES OUT OF CAPACITY AT ONCE (added 2026-09-01). Same family as 76 and
+// treated identically everywhere below: a deliberate skip, never a failure. A caller that
+// knew 76 and not 77 would turn an outage into a red run and an alarm mail - the exact
+// outcome the skip exists to prevent.
+const NO_CAPACITY = 77
 let switchedOff = false
 
 /**
@@ -439,7 +444,7 @@ function narrate(product, rows) {
   })
   // spawnSync does NOT throw on a non-zero exit; the code is on res.status. 76 is not a failed
   // narration - it is the cockpit switch being off, which stops the whole scout run below.
-  if (res.status === SWITCHED_OFF_EXIT) {
+  if ((res.status === SWITCHED_OFF_EXIT || res.status === NO_CAPACITY)) {
     switchedOff = true
     log('  automations are switched off in the cockpit - UX Scout run skipped (a deliberate off, not a failure)')
     return {}

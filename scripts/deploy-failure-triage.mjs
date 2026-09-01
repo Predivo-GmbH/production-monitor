@@ -90,6 +90,11 @@ const AGENT_RUN_JOB = 'deploy-triage'
 // exemption that is only true by assumption is not a guarantee, so it is handled: one log line,
 // no alert mail, no verdict written, no dedup record, no healthcheck ping, exit 0 (contract s7).
 const SWITCHED_OFF_EXIT = 76
+// 77 = BOTH ENGINES OUT OF CAPACITY AT ONCE (added 2026-09-01). Same family as 76 and
+// treated identically everywhere below: a deliberate skip, never a failure. A caller that
+// knew 76 and not 77 would turn an outage into a red run and an alarm mail - the exact
+// outcome the skip exists to prevent.
+const NO_CAPACITY = 77
 let switchedOff = false
 
 function sh(cmd, opts = {}) {
@@ -299,7 +304,7 @@ function runAgent(c, workdir, dryRun) {
     })
   } catch (e) {
     // execFileSync THROWS on a non-zero exit; the code is on err.status.
-    if (e?.status === SWITCHED_OFF_EXIT) {
+    if ((e?.status === SWITCHED_OFF_EXIT || e?.status === NO_CAPACITY)) {
       switchedOff = true
       log('  automations are switched off in the cockpit - deploy triage skipped (a deliberate off, not a failure). Deploy Triage is exempt, so seeing this means the exemption is not holding.')
       return []

@@ -47,6 +47,11 @@ const AGENT_RUN_JOB = 'agent-triage'
 // Exit 76 = Roger switched the automations off in the cockpit. A deliberate off, never a failure
 // (contract section 7): log one line, no alert, no failure outcome, no healthcheck ping, exit 0.
 const SWITCHED_OFF_EXIT = 76
+// 77 = BOTH ENGINES OUT OF CAPACITY AT ONCE (added 2026-09-01). Same family as 76 and
+// treated identically everywhere below: a deliberate skip, never a failure. A caller that
+// knew 76 and not 77 would turn an outage into a red run and an alarm mail - the exact
+// outcome the skip exists to prevent.
+const NO_CAPACITY = 77
 let switchedOff = false
 
 function sh(cmd, opts = {}) {
@@ -189,7 +194,7 @@ function triageOneGuard(state, wf, run) {
     ], { stdio: ['ignore', 'inherit', 'inherit'], timeout: 10 * 60_000, maxBuffer: 64 * 1024 * 1024, cwd: WORKDIR, env })
   } catch (e) {
     // execFileSync THROWS on a non-zero exit; the code is on err.status.
-    if (e?.status === SWITCHED_OFF_EXIT) {
+    if ((e?.status === SWITCHED_OFF_EXIT || e?.status === NO_CAPACITY)) {
       switchedOff = true
       log('automations are switched off in the cockpit - guard triage skipped (a deliberate off, not a failure)')
       return   // BEFORE the handledGuards write below: a guard run nothing looked at is not handled
