@@ -1,4 +1,20 @@
 import { defineConfig } from '@playwright/test'
+import { sanitizeEnvAndReport } from './scripts/lib/credentials.mjs'
+
+// A CREDENTIAL SECRET WITH AN INVISIBLE CHARACTER IN IT BREAKS EVERY SPEC THAT TOUCHES IT, and
+// the error names undici's header encoder rather than the secret (2026-09-01: a UTF-8 BOM on
+// JASSTOUR_SERVICE_ROLE_KEY reported itself as "Failed to create test user: Cannot convert
+// argument to a ByteString"). See scripts/lib/credentials.mjs for the whole incident.
+//
+// HERE, at config module scope, rather than in globalSetup: Playwright loads this config in the
+// main process AND again in every worker process, so the repair reaches the specs no matter how
+// Playwright chooses to spawn them, and it happens before any spec's module-level
+// `process.env.X_KEY || ''` has been evaluated. globalSetup runs in one process only and would
+// have to rely on env inheritance surviving the fork.
+//
+// Reported once, from the main process only, so one bad secret is one line and not four. The
+// value is never logged; the report names the variable and the code point.
+sanitizeEnvAndReport(process.env, process.env.TEST_WORKER_INDEX === undefined ? console.warn : () => {})
 
 export default defineConfig({
   testDir: './tests',
