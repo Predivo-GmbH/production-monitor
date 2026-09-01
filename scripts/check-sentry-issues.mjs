@@ -277,13 +277,77 @@ export function reconcile(liveIssues, boardRows) {
 
 // ── the network edges, kept thin so the decision above stays testable ─────────────────────────
 
-async function sentryGet(token, path) {
-  const res = await fetch(`${SENTRY_API}${path}`, {
-    headers: { Authorization: `Bearer ${token}`, 'User-Agent': NON_BROWSER_UA },
-  })
-  if (!res.ok) throw new Error(`Sentry GET ${path} -> HTTP ${res.status}`)
+/**
+ * HTTP statuses that are the upstream having a bad second, not an answer about our fleet.
+ * A 401/403/404 is deliberately NOT here: a dead token or a moved endpoint is a real finding and
+ * must red the hour on the first try, not three tries later.
+ */
+const TRANSIENT_STATUS = new Set([408, 425, 429, 500, 502, 503, 504])
+
+/** A read is re-tried this many times before "could not run" is believed. */
+export const READ_ATTEMPTS = 3
+/** How long between those attempts. Long enough to outlast a blip, short enough for an hourly run. */
+export const READ_GAP_MS = 5_000
+
+/**
+ * Retry a READ that failed transiently, and only a read.
+ *
+ * WHY (run 33539154299, 2026-09-01 17:51 UTC). Sentry answered ONE request with HTTP 500 and the
+ * whole hourly monitor went red; the identical request returned 200 minutes later, and the 9 live
+ * issues it lists were unchanged. A monitor that reports somebody else's bad second as our
+ * emergency teaches Roger to ignore it, which is the same failure `check-products-down.mjs`
+ * already solved for product probes ("one TLS reset or one cold start is not an outage. All
+ * attempts must fail"). This is that rule, applied to the upstreams this check reads.
+ *
+ * It stays a READ-only rule on purpose. `signal-intake` is a POST, and a POST that answered 503
+ * may still have committed, so retrying it could file a row twice; a duplicated board row is a
+ * worse outcome than a red hour, so that path keeps failing on the first error.
+ */
+export async function readWithRetry(doRead, label, {
+  attempts = READ_ATTEMPTS,
+  gapMs = READ_GAP_MS,
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  log = console.log,
+} = {}) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await doRead()
+    } catch (e) {
+      if (!e.transient || attempt >= attempts) {
+        if (e.transient) e.message = `${e.message} (${attempts} attempts, all transient failures)`
+        throw e
+      }
+      log(`  ${label}: ${e.message} - retrying (attempt ${attempt} of ${attempts})`)
+      await sleep(gapMs)
+    }
+  }
+}
+
+/** Tag an error as "the upstream hiccupped" so `readWithRetry` knows it is worth another try. */
+function transient(message) {
+  const e = new Error(message)
+  e.transient = true
+  return e
+}
+
+async function sentryGetOnce(token, path) {
+  let res
+  try {
+    res = await fetch(`${SENTRY_API}${path}`, {
+      headers: { Authorization: `Bearer ${token}`, 'User-Agent': NON_BROWSER_UA },
+    })
+  } catch (e) {
+    // No HTTP answer at all (DNS, TLS, socket). Same class as a 502: try again before believing it.
+    throw transient(`Sentry GET ${path} -> ${e.message}`)
+  }
+  if (!res.ok) {
+    const msg = `Sentry GET ${path} -> HTTP ${res.status}`
+    throw TRANSIENT_STATUS.has(res.status) ? transient(msg) : new Error(msg)
+  }
   return res.json()
 }
+
+const sentryGet = (token, path) => readWithRetry(() => sentryGetOnce(token, path), 'sentry')
 
 const mapIssue = (i) => ({
   id: String(i.id),
@@ -334,13 +398,23 @@ function boBase() {
   return (process.env.BOARD_SUPABASE_URL || BO_PROD).replace(/\/+$/, '')
 }
 
-async function boGet(secret, path) {
-  const res = await fetch(`${boBase()}/rest/v1/${path}`, {
-    headers: { apikey: secret, Authorization: `Bearer ${secret}`, 'User-Agent': NON_BROWSER_UA },
-  })
-  if (!res.ok) throw new Error(`GET ${path} -> HTTP ${res.status}`)
+async function boGetOnce(secret, path) {
+  let res
+  try {
+    res = await fetch(`${boBase()}/rest/v1/${path}`, {
+      headers: { apikey: secret, Authorization: `Bearer ${secret}`, 'User-Agent': NON_BROWSER_UA },
+    })
+  } catch (e) {
+    throw transient(`GET ${path} -> ${e.message}`)
+  }
+  if (!res.ok) {
+    const msg = `GET ${path} -> HTTP ${res.status}`
+    throw TRANSIENT_STATUS.has(res.status) ? transient(msg) : new Error(msg)
+  }
   return res.json()
 }
+
+const boGet = (secret, path) => readWithRetry(() => boGetOnce(secret, path), 'board')
 
 async function fileSignal(secret, body) {
   const res = await fetch(`${boBase()}/functions/v1/signal-intake`, {

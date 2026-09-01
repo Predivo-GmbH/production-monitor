@@ -12,11 +12,12 @@
 import assert from 'node:assert'
 import {
   isLiveEnvironment, liveEnvironments, candidateKeys, keyFor, severityFor, signalFor, reconcile,
-  FILED_BY,
+  readWithRetry, READ_ATTEMPTS, FILED_BY,
 } from '../scripts/check-sentry-issues.mjs'
 
 let n = 0
 const t = (name, fn) => { fn(); n++; console.log(`  ok - ${name}`) }
+const ta = async (name, fn) => { await fn(); n++; console.log(`  ok - ${name}`) }
 
 // ── the live org, 2026-08-27 ──────────────────────────────────────────────────
 const ORG_ENVIRONMENTS = [
@@ -227,6 +228,54 @@ t('a one-off error reads as one, not as "Seen 1 times"', () => {
 t('every environment the issue was seen in is on the row, so nobody has to guess', () => {
   assert.match(signalFor(CM2, 'k').summary, /in production, staging/)
   assert.deepEqual(signalFor(CM2, 'k').detail.environments, ['production', 'staging'])
+})
+
+// ── one bad second upstream is not our emergency (run 33539154299, 2026-09-01) ────────
+
+/** A read that fails `failures` times with the given error, then succeeds. */
+const flaky = (failures, err) => {
+  let calls = 0
+  const read = async () => {
+    calls++
+    if (calls <= failures) throw err()
+    return { ok: calls }
+  }
+  return { read, calls: () => calls }
+}
+const transientErr = () => {
+  const e = new Error('Sentry GET /x -> HTTP 500'); e.transient = true; return e
+}
+const noWait = { sleep: async () => {}, log: () => {} }
+
+await ta('a single Sentry 500 is retried, not reported as an outage', async () => {
+  const f = flaky(1, transientErr)
+  assert.deepEqual(await readWithRetry(f.read, 'sentry', noWait), { ok: 2 })
+  assert.equal(f.calls(), 2)
+})
+
+await ta('a 500 on every attempt still fails the run, and says it was every attempt', async () => {
+  const f = flaky(99, transientErr)
+  await assert.rejects(
+    () => readWithRetry(f.read, 'sentry', noWait),
+    (e) => e.message.endsWith('HTTP 500 (3 attempts, all transient failures)'),
+  )
+  assert.equal(f.calls(), READ_ATTEMPTS)
+})
+
+await ta('a dead token fails on the FIRST try - a 401 is an answer, not a hiccup', async () => {
+  const f = flaky(99, () => new Error('Sentry GET /x -> HTTP 401'))
+  await assert.rejects(
+    () => readWithRetry(f.read, 'sentry', noWait),
+    (e) => e.message === 'Sentry GET /x -> HTTP 401',
+  )
+  assert.equal(f.calls(), 1, 'a real credential failure must not be retried into a slow red')
+})
+
+await ta('the retry waits between attempts instead of hammering the upstream', async () => {
+  const waits = []
+  const f = flaky(2, transientErr)
+  await readWithRetry(f.read, 'sentry', { sleep: async (ms) => { waits.push(ms) }, log: () => {} })
+  assert.deepEqual(waits, [5000, 5000])
 })
 
 console.log(`\n${n} tests passed.`)
