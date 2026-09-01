@@ -372,6 +372,14 @@ const mapIssue = (i) => ({
  * which environments are live, and a producer that guesses "production only" at that moment would
  * quietly file nothing and leave a green tile over a burning product.
  */
+/** A 200 whose body is not an issue list means the read failed, never that the environment is clean. */
+export function issuesFrom(raw, env) {
+  if (!Array.isArray(raw)) {
+    throw new Error(`Sentry answered 200 for environment "${env}" with no issue list, so nothing could be judged`)
+  }
+  return raw
+}
+
 export async function fetchLiveIssues(token) {
   const envNames = liveEnvironments(await sentryGet(token, `/organizations/${SENTRY_ORG}/environments/`))
   if (!envNames.length) throw new Error('Sentry reports no live environment at all, which cannot be right')
@@ -383,7 +391,12 @@ export async function fetchLiveIssues(token) {
       `/organizations/${SENTRY_ORG}/issues/?query=is:unresolved&statsPeriod=${STATS_PERIOD}` +
       `&limit=100&environment=${encodeURIComponent(env)}`,
     )
-    for (const i of Array.isArray(raw) ? raw : []) {
+    // A 200 THAT IS NOT A LIST OF ISSUES IS A FAILED READ (2026-09-01 audit). `: []` turned any
+    // body that was not an array into "this environment has no unresolved issues", and zero
+    // issues is not neutral here: reconcile() auto-resolves every row this producer filed and did
+    // not re-cover, posting "Sentry no longer lists this as an unresolved error" over live
+    // production errors. Same defect checksFrom() closed in check-healthchecks-down.mjs today.
+    for (const i of issuesFrom(raw, env)) {
       const existing = found.get(String(i.id))
       if (existing) { existing.environments.push(env); continue }
       const issue = mapIssue(i)

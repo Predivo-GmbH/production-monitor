@@ -53,7 +53,14 @@ async function boGet(secret, path) {
  */
 export function judge(newest, now = Date.now(), staleHours = STALE_HOURS) {
   if (!newest) return { stale: true, hours: null, reason: 'the scan has never run' }
-  const hours = Math.round((now - new Date(newest).getTime()) / 3_600_000)
+  // AN UNREADABLE TIMESTAMP IS NOT A FRESH ONE (2026-09-01 audit). `hours` came out NaN for any
+  // value this could not parse, and `NaN > 36` is false, so the page reported itself up to date.
+  // That is the exact failure this guard exists to close, reproduced inside the guard.
+  const t = new Date(newest).getTime()
+  if (!Number.isFinite(t)) {
+    return { stale: true, hours: null, reason: `the newest scan timestamp is unreadable (${String(newest)}), so freshness cannot be established` }
+  }
+  const hours = Math.round((now - t) / 3_600_000)
   return { stale: hours > staleHours, hours, reason: `last scan wrote ${hours} h ago` }
 }
 
@@ -84,7 +91,35 @@ async function main() {
   const v = judge(newest)
   console.log(`external tools: ${rows.length} live tool(s), ${neverScanned} never scanned, ${v.reason}`)
 
-  if (!v.stale) { console.log('fresh — nothing to raise.'); return 0 }
+  // THE COUNT USED TO BE PRINTED AND THEN DROPPED (2026-09-01 audit). `neverScanned` was computed
+  // and logged, and this line returned before anything could raise it - so on every healthy run
+  // the number reached nobody. Measured the day this was fixed: 48 live tools, 17 of them never
+  // scanned once. One row for the whole set, warning and needs_human false, because it is a
+  // wiring gap and not an outage: the scan IS running, it is simply not reaching these entries.
+  if (!v.stale && !neverScanned) { console.log('fresh, and every tool has been scanned - nothing to raise.'); return 0 }
+  if (!v.stale) {
+    console.log(`::warning::${neverScanned} of ${rows.length} external tool(s) have never been scanned`)
+    if (dry) { console.log('--dry: nothing written.'); return 0 }
+    const res = await fetch(`${BO_BASE}/functions/v1/signal-intake`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${secret}`, 'Content-Type': 'application/json', 'User-Agent': UA },
+      body: JSON.stringify({
+        source: SOURCE,
+        key: 'external-tools-never-scanned',
+        kind: 'incident',
+        severity: 'warning',
+        state: 'open',
+        needs_human: false,
+        title: `${neverScanned} external tool(s) have never been scanned`,
+        summary: `${neverScanned} of ${rows.length} live entries carry no scan timestamp at all, so the page cannot say whether anything still uses them. The scan is running and reaching the others; it is not reaching these. A wiring gap, not an outage.`,
+        detail: { never_scanned: neverScanned, total: rows.length },
+        link: 'https://cockpit.predivo.ch/external-tools',
+      }),
+    })
+    if (!res.ok) throw new Error(`signal-intake -> HTTP ${res.status}: ${(await res.text()).slice(0, 160)}`)
+    console.log('signal filed: external-tools-never-scanned.')
+    return 0
+  }
   console.log(`::warning::the external-tools scan is stale (> ${STALE_HOURS}h)`)
   if (dry) { console.log('--dry: nothing written.'); return 0 }
 

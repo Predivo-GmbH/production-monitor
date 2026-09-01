@@ -64,8 +64,18 @@ if (!runs.length) {
     return 1
   }
 
+// A QUEUED RUN IS NOT A HEARTBEAT (2026-09-01 audit). `completed[0] || runs[0]` fell through to
+// the newest run of ANY status and measured `created_at`, the moment GitHub ENQUEUED it. The
+// failure this file exists to catch is the watchdog wedging, and a wedged watchdog is exactly one
+// whose runs pile up queued: with the newest page all queued, their fresh timestamps report
+// "last run 3 min ago" while not a line of it has executed for hours.
 const completed = runs.filter((x) => x.status === 'completed')
-const newest = completed[0] || runs[0]
+if (!completed.length) {
+  const statuses = [...new Set(runs.map((x) => x.status))].join('/')
+  console.error(`::error::not one of the last ${runs.length} runs has actually run - they are all ${statuses}. The CI runner watchdog is queued but not executing, so nobody is checking whether the build machine takes jobs.`)
+  process.exit(1)
+}
+const newest = completed[0]
 const ageMin = Math.round((Date.now() - new Date(newest.created_at)) / 60000)
 
 console.log(`CI watchdog last run : ${newest.created_at} (${ageMin} min ago, ${newest.conclusion || newest.status})`)
