@@ -18,6 +18,7 @@
 import assert from 'node:assert'
 import {
   httpDeliveryVerdict, scheduleIntervalMs, RESPONSE_RETENTION_MS, PERSISTENT_FAILURES,
+  jobVerdict, allowanceMs,
 } from '../scripts/check-cron-heartbeats.mjs'
 
 let n = 0
@@ -198,6 +199,93 @@ t('the healthy case says what the number counts, and does not claim to be per-jo
   assert.equal(v.verdict, 'ok')
   assert.match(v.detail, /this database dispatched/)
   assert.match(v.detail, /184/)
+})
+
+// -- layer 1: what the DEAD line is allowed to leave out -------------------------------
+//
+// Added 2026-09-01 after heartbeat run 33555239704 went red with three findings and the
+// run log could not tell any of them apart. The old console line was exactly:
+//
+//   DEAD <job> [<schedule>] last success <age> ago > allowed <allow>
+//
+// Reconstructed here as OLD_line and asserted against the same rows the new code sees.
+// The point of each case is not that jobVerdict runs; it is that the old sentence was the
+// SAME sentence for two problems with opposite owners.
+
+const OLD_line = (age, allow) => `last success ${age == null ? 'never' : age} ago > allowed ${allow}`
+
+/** ReplyFlow, the night this was written: pg_cron DID attempt it, and it did not succeed. */
+const ATTEMPTED_AND_FAILED = {
+  jobname: 'affiliate-monitor-daily',
+  schedule: '0 7 * * *',
+  last_success: '2026-08-31T07:00:00Z',
+  last_run: '2026-09-01T07:00:00.101Z',
+  last_result: 'failed: ERROR:  permission denied for table decrypted_secrets',
+}
+
+/** BackOffice, the same night: scheduled that afternoon, first tick (03:17) not yet due. */
+const NEVER_ATTEMPTED = {
+  jobname: 'product-check-run-prune-daily',
+  schedule: '17 3 * * *',
+  last_success: null,
+  last_run: null,
+  last_result: null,
+}
+
+t("a job that RAN and failed puts the database's own error message in the log", () => {
+  const v = jobVerdict(ATTEMPTED_AND_FAILED, NOW)
+  assert.equal(v.verdict, 'dead')
+  assert.equal(v.neverRan, false)
+  // The three facts that decide who owns this, none of which the old line carried.
+  assert.match(v.detail, /last run 2026-09-01T07:00:00\.101Z/)
+  assert.match(v.detail, /permission denied for table decrypted_secrets/)
+  assert.match(v.detail, /allowed 26\.0h/)
+  assert.doesNotMatch(OLD_line('37.4h', '26.0h'), /permission denied/)
+})
+
+t('a job pg_cron NEVER attempted is not reported as one that has been failing forever', () => {
+  const v = jobVerdict(NEVER_ATTEMPTED, NOW)
+  assert.equal(v.verdict, 'dead')          // still a finding: unproven is never healthy
+  assert.equal(v.neverRan, true)
+  assert.match(v.detail, /NEVER RUN/)
+  assert.match(v.detail, /no attempt at all/)
+  // "last success never ago" was the old sentence, and it is the same sentence a job dead
+  // since July would print. It must not survive.
+  assert.doesNotMatch(v.detail, /never ago/)
+  assert.match(OLD_line(null, '26.0h'), /never ago/)   // ...which is what it used to say
+})
+
+t('never-ran and ran-and-failed do not produce the same line', () => {
+  // The old pair differed only in two numbers, and said nothing about which of pg_cron,
+  // the job, or the schedule was the thing to go and look at.
+  assert.notEqual(jobVerdict(NEVER_ATTEMPTED, NOW).detail, jobVerdict(ATTEMPTED_AND_FAILED, NOW).detail)
+})
+
+t('a healthy job is unchanged: the verdict is ok and the line stays short', () => {
+  const v = jobVerdict({
+    jobname: 'refresh-tokens-hourly', schedule: '0 * * * *',
+    last_success: agoMin(26), last_run: agoMin(26), last_result: 'succeeded',
+  }, NOW)
+  assert.equal(v.verdict, 'ok')
+  assert.equal(v.detail, 'last success 26min ago')
+})
+
+t("the allowance is still derived from the job's own schedule, not a constant", () => {
+  // Guards the refactor: allowanceMs moved from private to exported, and a silent
+  // regression to "26h for everything" would make every fast job unfailable.
+  assert.equal(allowanceMs('0 7 * * *'), 26 * 3600_000)        // daily
+  assert.equal(allowanceMs('*/5 * * * *'), 90 * 60_000)        // */5 -> 90min floor
+  assert.equal(allowanceMs('0 * * * *'), 3 * 3600_000)         // hourly at a fixed minute
+  assert.equal(allowanceMs('0 9 1 * *'), 33 * 24 * 3600_000)   // monthly
+})
+
+t('last_success decides the verdict; last_run is evidence and never overrules it', () => {
+  const v = jobVerdict({
+    jobname: 'send-weekly-digest-monday-8am', schedule: '0 8 * * 1',
+    last_success: '2026-08-20T08:00:00Z', last_run: agoMin(10), last_result: 'failed: boom',
+  }, NOW)
+  assert.equal(v.verdict, 'dead')
+  assert.match(v.detail, /failed: boom/)
 })
 
 console.log(`\n${n} assertions passed.`)
