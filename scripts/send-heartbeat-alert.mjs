@@ -43,7 +43,7 @@ const html = `
   <div style="font-family:system-ui,sans-serif;max-width:760px;margin:0 auto">
     <div style="background:#dc2626;color:white;padding:16px 24px;border-radius:8px 8px 0 0">
       <h2 style="margin:0;font-size:18px">Fleet Cron Heartbeat — scheduled job(s) look dead</h2>
-      <p style="margin:4px 0 0;font-size:14px;opacity:0.9">${findings.length} finding(s). A job is only listed after missing ~3× its own interval — this is persistent, not a blip.</p>
+      <p style="margin:4px 0 0;font-size:14px;opacity:0.9">${findings.length} finding(s). Nothing here is a blip: a job is listed only after missing ~3× its own interval, or after its dispatched HTTP calls were refused (a dead credential, which never recovers on its own) or failed persistently.</p>
     </div>
     <div style="padding:24px;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 8px 8px">
       <table style="width:100%;border-collapse:collapse;font-size:13px">
@@ -58,8 +58,13 @@ const html = `
         <tbody>${rows}</tbody>
       </table>
       <p style="margin-top:16px;font-size:12px;color:#6b7280">
-        Where to look: the product's <code>cron.job_run_details</code> (and <code>cron.job</code>) via the Supabase dashboard.
-        "dead" = pg_cron stopped producing successful runs; "unverifiable" = this check could not reach the project (fix the PAT/API first — a silent watchdog is worse than none).
+        Where to look depends on which of the two layers found it.
+        A row naming ONE cron job is layer 1: look in the product's <code>cron.job_run_details</code> (and <code>cron.job</code>).
+        A row whose job column reads "(N http_post cron job(s))" is layer 2, and for that one <code>cron.job_run_details</code> is the WRONG table —
+        it reports 'succeeded' the moment a call is enqueued, whatever the call returns, which is how four jobs 401'd for weeks unseen.
+        Look in <code>net._http_response</code> instead; it is the only table that knows, and it is pruned after about six hours, so read it soon.
+        "dead" = pg_cron stopped producing successful runs, or the dispatched HTTP calls are being refused / persistently failing;
+        "unverifiable" = this check could not reach the project or could not read the response table (fix that first — a silent watchdog is worse than none).
         Healing stays product-local; this layer only watches the watchers.
       </p>
       ${GITHUB_RUN_URL ? `<p style="margin-top:8px"><a href="${GITHUB_RUN_URL}" style="color:#2563eb">View full run logs</a></p>` : ''}
