@@ -517,6 +517,19 @@ jobs:
       #
       # It fails the step rather than reporting zero when `fleet_projects` comes back empty: a
       # registry read that returned nothing is not a fleet with nothing wrong.
+      # WHO WATCHES WHETHER THE WATCHERS RAN. Twelve workflows in this repo are on a cron and
+      # only four ping healthchecks, so the other eight could stop being scheduled - GitHub
+      # disables schedules on its own, a cron can be dropped in an edit, a workflow can be
+      # disabled by hand - and produce no red run, because they produce no run. Found by the
+      # 2026-09-01 monitoring audit. `if: always()` for the same reason the sensor below has
+      # it: this must run on the hours the monitor itself is failing.
+      - name: Every scheduled guard must have actually run
+        if: always()
+        run: node scripts/check-workflow-cadence.mjs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+
       - name: A product a customer cannot use must say so
         if: always()  # THE FIX: a product being down is exactly what fails the monitor step above, and default if:success() then SKIPS this sensor — the alarm was armed to never fire. Matches the canary at :154. check-products-down.mjs exits 0 on a filed alarm (only a failed read reds the job), so this cannot double-red one event.
         run: node scripts/check-products-down.mjs
