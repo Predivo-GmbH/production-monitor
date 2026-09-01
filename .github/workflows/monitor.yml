@@ -155,7 +155,6 @@ jobs:
           YTMIGRATION_SUPABASE_URL: ${{ secrets.YTMIGRATION_SUPABASE_URL }}
           YTMIGRATION_SERVICE_ROLE_KEY: ${{ secrets.YTMIGRATION_SERVICE_ROLE_KEY }}
           YTMIGRATION_ANON_KEY: ${{ secrets.YTMIGRATION_ANON_KEY }}
-          YTMIGRATION_SUPABASE_ACCESS_TOKEN: ${{ secrets.YTMIGRATION_SUPABASE_ACCESS_TOKEN }}
           # ReplyFlow
           REPLYFLOW_URL: https://replyflow.help
           REPLYFLOW_SUPABASE_URL: ${{ secrets.REPLYFLOW_SUPABASE_URL }}
@@ -327,7 +326,6 @@ jobs:
           REPLYFLOW_SUPABASE_ACCESS_TOKEN: ${{ secrets.REPLYFLOW_SUPABASE_ACCESS_TOKEN }}
           SIGNALSCORE_SUPABASE_ACCESS_TOKEN: ${{ secrets.SIGNALSCORE_SUPABASE_ACCESS_TOKEN }}
           VALRANO_SUPABASE_ACCESS_TOKEN: ${{ secrets.VALRANO_SUPABASE_ACCESS_TOKEN }}
-          YTMIGRATION_SUPABASE_ACCESS_TOKEN: ${{ secrets.YTMIGRATION_SUPABASE_ACCESS_TOKEN }}
 
       - name: Supabase build currency (how far behind each project is)
         if: always()
@@ -349,7 +347,6 @@ jobs:
           REPLYFLOW_SUPABASE_ACCESS_TOKEN: ${{ secrets.REPLYFLOW_SUPABASE_ACCESS_TOKEN }}
           SIGNALSCORE_SUPABASE_ACCESS_TOKEN: ${{ secrets.SIGNALSCORE_SUPABASE_ACCESS_TOKEN }}
           VALRANO_SUPABASE_ACCESS_TOKEN: ${{ secrets.VALRANO_SUPABASE_ACCESS_TOKEN }}
-          YTMIGRATION_SUPABASE_ACCESS_TOKEN: ${{ secrets.YTMIGRATION_SUPABASE_ACCESS_TOKEN }}
 
       # Out-of-band canaries: dead/rotated secrets and vendor retirements never
       # enter git, so only a live-credential probe can catch them (the class

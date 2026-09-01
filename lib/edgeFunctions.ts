@@ -9,7 +9,7 @@
  * spec edit, no drift.
  */
 
-import { findTokenForProject, managementTokenKeys } from './supabaseToken'
+import { findTokenForProject, managementTokenKeys, pinnedTokenNote } from './supabaseToken'
 
 /** Extract the Supabase project ref from its URL (https://<ref>.supabase.co). */
 export function projectRefFromUrl(supabaseUrl: string): string {
@@ -61,8 +61,12 @@ export async function listDeployedFunctions(
       )
     }
     console.warn(
-      `[supabase] ${projectRef}: ${pinnedKey ?? 'the pinned token'} is no longer accepted ` +
-        `for this project; used ${fallback.key} instead. The pinned name should be repaired.`,
+      pinnedTokenNote({
+        projectRef,
+        pinnedKey,
+        hadToken: Boolean(accessToken),
+        fallbackKey: fallback.key,
+      }),
     )
     res = await fetchFunctions(projectRef, fallback.token)
   }

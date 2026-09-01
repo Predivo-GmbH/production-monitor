@@ -89,3 +89,44 @@ export async function findTokenForProject(
   }
   return null
 }
+
+/**
+ * What the log says when the PINNED name did not work and a fallback did.
+ *
+ * WHY THIS IS A FUNCTION AND NOT A TEMPLATE LITERAL (2026-09-01 audit). The line used to be
+ * inline in edgeFunctions.ts and read, unconditionally:
+ *
+ *   "<key> is no longer accepted for this project; used <fallback> instead."
+ *
+ * It said that even when NO TOKEN HAD BEEN SUPPLIED AT ALL, because the fallback branch is
+ * entered both when the pinned token is REFUSED and when there was never a token to send. Those
+ * are different faults with different owners, and conflating them cost two days:
+ *
+ *   YTMIGRATION_SUPABASE_ACCESS_TOKEN was DELETED from the repo's secrets on 2026-08-30, so
+ *   `${{ secrets.YTMIGRATION_SUPABASE_ACCESS_TOKEN }}` expanded to an empty string. The check
+ *   read that as "the token was refused", printed "no longer accepted", and the board, two night
+ *   shifts and three sessions concluded a live token had died and that only Roger could mint a
+ *   replacement. Nothing had died. The name simply pointed at nothing, and a working token for
+ *   the same project was sitting in the same environment the whole time.
+ *
+ * A REFUSED credential may need a person. A MISSING one is a name in our own repo, and this
+ * process can see which. The message now names which of the two it is.
+ *
+ * Twin of pinnedTokenNote in scripts/lib/supabase-token.mjs, where it is unit-tested.
+ */
+export function pinnedTokenNote({
+  projectRef,
+  pinnedKey,
+  hadToken,
+  fallbackKey,
+}: {
+  projectRef: string
+  pinnedKey?: string
+  hadToken: boolean
+  fallbackKey: string
+}): string {
+  const cause = hadToken
+    ? `${pinnedKey ?? 'the token this check was handed'} was REFUSED for this project`
+    : `NO management token was supplied for this project — the pinned secret name resolves to nothing, so no credential was ever sent`
+  return `[supabase] ${projectRef}: ${cause}; used ${fallbackKey} instead. The pinned name should be repaired.`
+}

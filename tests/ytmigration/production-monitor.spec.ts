@@ -321,7 +321,17 @@ test.describe('ChannelMover — Production Monitor', () => {
   })
 
   test.describe('Edge Functions Reachable', () => {
-    const ACCESS_TOKEN = process.env.YTMIGRATION_SUPABASE_ACCESS_TOKEN
+    // SUPABASE_TOKEN_CHANNELMOVER, not YTMIGRATION_SUPABASE_ACCESS_TOKEN (2026-09-01 audit).
+    // The old name stopped resolving to anything at all: the secret was DELETED from the repo on
+    // 2026-08-30, so `${{ secrets.YTMIGRATION_SUPABASE_ACCESS_TOKEN }}` expanded to an empty
+    // string and this const has been `''` on every run since. The check still passed, because
+    // listDeployedFunctions falls back to any token that can see the ref - and it printed
+    // "the pinned token is no longer accepted" into a 30,000-line log every hour for two days,
+    // where it was read as evidence of a DEAD TOKEN ONLY ROGER COULD REPLACE. Measured
+    // 2026-09-01: SUPABASE_TOKEN_CHANNELMOVER is the token that actually owns project
+    // qswluvqunswggfmesdcs, it is already in this repo's secrets and already in this step's env,
+    // and the run log names it as the one the fallback reached for.
+    const ACCESS_TOKEN = process.env.SUPABASE_TOKEN_CHANNELMOVER
 
     // Auto-discovered, not hardcoded: ask Supabase what is ACTUALLY deployed and
     // verify each function responds. Add/remove a function and this test follows
