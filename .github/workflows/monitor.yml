@@ -422,6 +422,12 @@ jobs:
       # that cries wolf gets ignored - which is worse than no alarm.
       - name: CI runner watchdog is still alive
         id: ci_watchdog_alive
+        # if: always() - 2026-09-01 audit. Without it this step inherited the default if:success()
+        # and was SKIPPED on every hour where an earlier step failed, which is exactly the hour a
+        # dark watchdog matters. Proven on run 33483510991 (2026-09-01 07:43Z): this step
+        # 'skipped' while the sensor below, which carries if: always(), ran. A skipped step has
+        # outcome 'skipped', not 'failure', so its dedicated email below could never fire either.
+        if: always()
         # continue-on-error so a silent-watchdog result does NOT put the job in failure(): its own
         # dedicated email below is the alert. Without this, the generic "Send alert on failure" step
         # would ALSO fire (send-alert.mjs surfaces "Run failed - no per-test detail" over an all-green
@@ -468,6 +474,28 @@ jobs:
         env:
           HEALTHCHECKS_API_KEYS: ${{ secrets.HEALTHCHECKS_API_KEYS }}
           BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
+
+      # A RED DEPLOY MUST REACH ROGER (2026-09-01). The step above gave dead scheduled jobs a wire
+      # into /signals; a red deploy PIPELINE never had one. Nineteen checks in this repo and not
+      # one asked whether a product could still ship, so the only place a red deploy existed was
+      # the Deploy Status page — pull, not push. Roger, looking at that page: "I'm not informed
+      # when ScoutCopilot's last run failed. That keeps happening over and over again."
+      #
+      # It reads RUNS, not jobs, and that is the whole point. ScoutCopilot run 33392350776 sat red
+      # for 23 hours with `jobs.total_count: 0` — the deploy FILE was broken so GitHub started
+      # nothing, and a watcher walking jobs for a failed step would have found nothing wrong.
+      # Rolls up at three so one bad fleet-wide commit is one alert, not five; staging red is
+      # filed but never pages; a promotion the staging gate refused is not a failure at all.
+      - name: A product that cannot deploy must say so
+        if: always()  # independent sensor — must run even if the steps above failed. check-deploy-failures.mjs exits 0 on a filed alarm (only an unreadable repo reds the job), so this cannot double-red one event.
+        run: node scripts/check-deploy-failures.mjs
+        env:
+          # classic PAT with actions:read across the Arivioo org, same secret the drift and
+          # gate-coverage guards use to read the fleet's repos.
+          GH_TOKEN: ${{ secrets.FLEET_READ_TOKEN || secrets.DASHBOARD_PAT }}
+          BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
+          BACKOFFICE_SUPABASE_URL: ${{ secrets.BACKOFFICE_SUPABASE_URL }}
+          BACKOFFICE_SERVICE_ROLE_KEY: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
 
       # Sentry must reach the BOARD, not an inbox. The step above gave scheduled jobs a direct
       # wire into /signals in August; Sentry never had one. Its only route to Roger ran through

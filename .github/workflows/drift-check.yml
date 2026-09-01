@@ -44,6 +44,12 @@ jobs:
       # back to the fragile shape that caused the 2026-07-15 prod-promotion failures.
       # Skips cleanly until FLEET_READ_TOKEN (classic PAT, repo:read) is set.
       - name: Check deploy-pipeline drift (deploy.yml conformance)
+        # if: always() - 2026-09-01 audit. Without it this step inherits the default if:success(),
+        # so ANY schema drift found by the step above SKIPPED this one entirely and a deploy
+        # pipeline could regress unseen behind an unrelated failure. Same defect the hourly
+        # monitor documents at its own sensor steps, and the same shape as the outage that
+        # started this audit, where one failure hid the tests that would have named the cause.
+        if: always()
         run: node scripts/check-pipeline-drift.mjs
         env:
           # Reuse DASHBOARD_PAT — the existing fleet-wide token this repo already uses to
