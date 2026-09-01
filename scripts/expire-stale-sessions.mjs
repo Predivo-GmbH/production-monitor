@@ -6,14 +6,27 @@
  * accumulated 113,284 abandoned sessions before anyone noticed. Supabase does expose both
  * settings, but they are gated: PATCH /config/auth answers
  *   402 "User sessions can only be configured on Pro Plans and up."
- * and only 2 of 21 projects are on Pro (ReplyFlow, SignalScore — both set natively to the
- * same policy below). Buying Pro for the other 19 to get one setting is not a sane trade,
- * so this reproduces the behaviour with a scheduled sweep instead.
+ * and only 2 of 21 projects are on Pro (ReplyFlow, SignalScore). Buying Pro for the other 19
+ * to get one setting is not a sane trade, so this reproduces the behaviour with a scheduled
+ * sweep instead.
+ *
+ * DO NOT SET THESE NATIVELY. On 2026-08-30 the policy below was also written natively onto
+ * the two Pro projects as sessions_timebox=15552000 / sessions_inactivity_timeout=2592000
+ * (the seconds in 180 and 30 days). The platform renders that value into GoTrue as
+ * GOTRUE_SESSIONS_TIMEBOX="15552000h", which is past Go's maximum duration (~2562047h), so
+ * auth died on its next restart with
+ *   fatal: Failed to load configuration: ... time: invalid duration "15552000h"
+ * and stayed dead. Customer logins on both products were down from 2026-08-31 ~00:00 UTC to
+ * 2026-09-01 08:25 UTC. Nothing else on either project was affected, which is why it read
+ * like a platform incident; ten project restarts could not fix it, because a service that
+ * cannot parse its config crash-loops on every boot. Reverting both fields to 0 brought auth
+ * back in under a minute. Both fields are 0 again on the two Pro projects, and only those
+ * two can be set at all, so this sweep is the fleet's only session expiry — as designed.
  *
  * POLICY, one rule for the whole fleet so it can be reasoned about:
  *   idle     30 days  — a login not used for a month stops working
  *   absolute 180 days — no login survives longer than six months, used or not
- * These match what modern SaaS does and what is now set natively on the two Pro projects.
+ * These match what modern SaaS does. They are enforced ONLY by this sweep, never natively.
  * The short-lived part of the chain is already correct everywhere and is NOT touched here:
  * a 1-hour access token with refresh-token rotation and a 10-second reuse window, which is
  * Supabase's documented recommendation ("most applications should use the default").
