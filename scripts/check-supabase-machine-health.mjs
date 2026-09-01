@@ -33,9 +33,20 @@ const SAMPLE_GAP_MS = 180_000  // Supabase refreshes these counters on its own s
 // braces and \s MUST be regex-escaped — a single-quoted JS literal '\{' is just '{' and '\s'
 // is a bare 's', which silently compiles to a pattern that matches nothing (the 2026-08-29
 // bug where every machine read as 'unreadable' and the check went green forever).
+//
+// SUMS ALL matching series. node_disk_read/written_bytes_total appear ONCE PER BLOCK DEVICE —
+// a machine with two NVMe volumes emits node_disk_read_bytes_total{device="nvme0n1"} AND
+// {device="nvme1n1"}. A non-global .match() returned only the FIRST device, silently dropping
+// the rest of the machine's disk traffic (2026-08-30: 88% of ReplyFlow's writes lived on the
+// second device, so every published figure and the spend decision built on it were wrong).
+// For the unlabelled scalars (majfault, MemTotal) there is exactly one series, so the sum is
+// just that value — behaviour is unchanged for them. Returns null only when NO series matches,
+// preserving the 'unreadable' detection the exit policy depends on.
 export const metricValue = (text, name) => {
-  const m = text.match(new RegExp('^' + name + '(\\{[^}]*\\})?\\s+([0-9.e+-]+)', 'm'))
-  return m ? Number(m[2]) : null
+  const re = new RegExp('^' + name + '(\\{[^}]*\\})?\\s+([0-9.e+-]+)', 'mg')
+  let sum = null
+  for (const m of text.matchAll(re)) sum = (sum ?? 0) + Number(m[2])
+  return sum
 }
 
 async function sample(ref, key) {

@@ -63,6 +63,39 @@ check('a genuinely absent metric still returns null', () => {
   assert.equal(metricValue(SAMPLE, 'node_no_such_metric'), null)
 })
 
+// 2026-08-30: node_disk_read/written_bytes_total carry a {device=...} label and appear ONCE
+// PER BLOCK DEVICE. A non-global .match() took only the FIRST device, so a machine with two
+// NVMe volumes had the whole second device silently dropped — 88% of ReplyFlow's writes lived
+// on nvme1n1, so every published MB/s figure (and the spend decision built on it) undercounted.
+// metricValue now SUMS every matching series.
+const TWO_DEVICE = [
+  'node_disk_read_bytes_total{device="nvme0n1"} 1000000000',
+  'node_disk_read_bytes_total{device="nvme1n1"} 250000000',
+  'node_disk_written_bytes_total{device="nvme0n1"} 30000000',
+  'node_disk_written_bytes_total{device="nvme1n1"} 170000000',
+  'node_vmstat_pgmajfault 42',
+  '',
+].join('\n')
+
+check('sums ALL device series for a labelled disk metric (the dropped-second-device bug)', () => {
+  assert.equal(metricValue(TWO_DEVICE, 'node_disk_read_bytes_total'), 1250000000)
+  assert.equal(metricValue(TWO_DEVICE, 'node_disk_written_bytes_total'), 200000000)
+})
+
+check('device order does not change the sum (non-deterministic which device is listed first)', () => {
+  const reordered = [
+    'node_disk_written_bytes_total{device="nvme1n1"} 170000000',
+    'node_disk_written_bytes_total{device="nvme0n1"} 30000000',
+    '',
+  ].join('\n')
+  assert.equal(metricValue(reordered, 'node_disk_written_bytes_total'), 200000000)
+})
+
+check('an unlabelled single-series scalar is unchanged by summing (majfault, MemTotal)', () => {
+  assert.equal(metricValue(TWO_DEVICE, 'node_vmstat_pgmajfault'), 42)
+  assert.equal(metricValue('node_memory_MemTotal_bytes 4.14e+09\n', 'node_memory_MemTotal_bytes'), 4.14e+09)
+})
+
 check('anchors to line start: a prefix collision does not mis-read', () => {
   const s = 'x_node_vmstat_pgmajfault 999\nnode_vmstat_pgmajfault 7\n'
   assert.equal(metricValue(s, 'node_vmstat_pgmajfault'), 7)
