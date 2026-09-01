@@ -762,8 +762,12 @@ test.describe('BackOffice — Production Monitor', () => {
       }
     )
     const status = response.status()
+    // ANY 5xx, not only 500. A gateway that cannot reach the function answers 502/503/504,
+    // and `status !== 500` passed every one of those - the same defect that let the 2026-09-01
+    // auth outage read as healthy for twenty hours (see lib/edgeFunctions.ts, which got this
+    // right, and BackOffice health-monitor/verdict.ts otpWorkingFrom).
     expect(
-      status !== 404 && status !== 500,
+      status !== 404 && status < 500,
       `send-auth-email returned ${status} — not deployed or crashed`
     ).toBe(true)
   })
