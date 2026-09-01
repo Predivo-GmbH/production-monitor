@@ -193,10 +193,27 @@ async function probeOnce(supabaseUrl: string, slug: string): Promise<ProbeAttemp
  * healthy, yet they reddened the monitor on 2026-08-20). Only the platform's
  * NOT_FOUND body proves a function is missing, so that is what we key on.
  */
+/**
+ * `exercised` added 2026-09-01 by the monitoring audit. A 401/403 means the GATEWAY answered and
+ * the function was never invoked, so its boot health is unknown - the same distinction that let a
+ * keyless /auth/v1/health probe report a dead auth service as healthy for twenty hours that day.
+ *
+ * Measured across the fleet before adding this: nearly every function declares `verify_jwt = false`
+ * in its project's supabase/config.toml (ReplyFlow 41 of 41, ChannelMover 35, Valrano 41,
+ * ScoutCopilot 16, BackOffice 37), so the keyless probe really does reach them and a crash really
+ * does surface as 5xx. The exception is Distribution-OS, where stripe-checkout, stripe-portal,
+ * call-ai and save-api-key default to verify_jwt = true. Measured on that project: stripe-portal
+ * answers 401 both keyless AND with the publishable key, while send-auth-email (verify_jwt=false)
+ * answers 400 either way. So sending a key does NOT fix it; only a real JWT would, and the monitor
+ * deliberately does not hold credentials that would let it invoke a payment endpoint for real.
+ *
+ * So this reports the truth instead of hiding it: those functions are not counted as failures,
+ * because nothing is known to be wrong, and they are not counted as proven either.
+ */
 export async function isFunctionReachable(
   supabaseUrl: string,
   slug: string,
-): Promise<{ slug: string; status: number; reachable: boolean; detail?: string }> {
+): Promise<{ slug: string; status: number; reachable: boolean; exercised: boolean; detail?: string }> {
   let last: ProbeAttempt = { status: 0, body: 'no attempt made' }
   let made = 0
 
@@ -213,12 +230,24 @@ export async function isFunctionReachable(
 
     // Anything that is not a 5xx and not a failed request is a definitive answer.
     if (last.status !== 0 && last.status < 500) {
-      if (last.status !== 404) return { slug, status: last.status, reachable: true }
-      if (!isPlatformNotFound(last.body)) return { slug, status: 404, reachable: true }
+      if (last.status !== 404) {
+        const gatewayRejected = last.status === 401 || last.status === 403
+        return {
+          slug,
+          status: last.status,
+          reachable: true,
+          exercised: !gatewayRejected,
+          ...(gatewayRejected
+            ? { detail: 'the gateway rejected the probe before the function ran, so its boot health is unknown' }
+            : {}),
+        }
+      }
+      if (!isPlatformNotFound(last.body)) return { slug, status: 404, reachable: true, exercised: true }
       return {
         slug,
         status: 404,
         reachable: false,
+        exercised: false,
         detail: 'no deployment for this slug (platform NOT_FOUND)',
       }
     }
@@ -229,6 +258,7 @@ export async function isFunctionReachable(
   // reported bare "503" and cost a full diagnosis round to establish which it was.
   return {
     slug,
+    exercised: true,
     status: last.status,
     reachable: false,
     detail: `${made}x ${last.status || 'request failed'}, last body: ${last.body.slice(0, 200) || '(empty)'}`,

@@ -429,6 +429,13 @@ test.describe('SignalScore — Production Monitor', () => {
       const results = await Promise.all(
         deployed.map((slug) => isFunctionReachable(SUPABASE_URL, slug)),
       )
+      // A 401/403 means the gateway answered and the function never ran, so its boot health is
+      // unknown. Not a failure - nothing is known to be wrong - but not proof either, and the run
+      // says which ones rather than letting them pass as verified (2026-09-01 audit).
+      const unexercised = results.filter((r) => r.reachable && r.exercised === false)
+      if (unexercised.length) {
+        console.log(`  NOT EXERCISED (gateway rejected the probe, boot health unknown): ${unexercised.map((r) => r.slug).join(', ')}`)
+      }
       const unreachable = results.filter((r) => !r.reachable)
       expect(
         unreachable,
