@@ -119,6 +119,15 @@ const ACCOUNTS = {
         'set_signal_state',         // client-called as authenticated (Cockpit useFleetSignals supabase.rpc); acks/snoozes a fleet signal. anon+PUBLIC revoked in 130.
         'set_page_policy',          // client-called as authenticated (Cockpit useFleetSignals supabase.rpc); per-source paging prefs. anon+PUBLIC revoked in 130.
         'register_push_device',     // client-called as authenticated (Cockpit lib/push.ts supabase.rpc); upserts THIS browser's push endpoint. anon+PUBLIC revoked in 132.
+        // Work-board action RPCs (the Cockpit's "act on the board itself" buttons — Cockpit repo
+        // sql/070 + sql/071, applied to this DB). Roger clicks these in the Cockpit UI as
+        // `authenticated`, so service_role-only would break the board. Each one gates on is_staff()
+        // internally, touches exactly the columns its verb owns, and writes a work_evidence audit
+        // row naming the signed-in user. anon+PUBLIC are revoked at creation; the guard-run acl
+        // ({postgres,authenticated,service_role}) matches that exactly.
+        'work_hand_to_worker',      // marks an item for the worker; is_staff()-gated; writes handed_to_worker_* only. anon+PUBLIC revoked in sql/070.
+        'work_question_answered',   // releases an answered question from Roger's lane; is_staff()-gated; clears blocked_question/owner only. anon+PUBLIC revoked in sql/071.
+        'work_release',             // his-word sign-off click; is_staff()-gated; sets done + signed_off_* only and requires documentation_ref. anon+PUBLIC revoked in sql/070.
       ],
     } },
     { ref: 'vvgqkwiqauafcflshsec', name: 'BackOffice Staging', exempt: STAGING },
