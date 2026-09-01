@@ -72,13 +72,23 @@
  * in-run reconfirmation and the two-run escalation are all for — and it is why this ships on a
  * branch. Merging it to `master` is what arms it, and that is Roger's to do.
  *
- * ── WHAT IT DOES NOT WATCH, and this is a real hole ─────────────────────────────────────────
+ * ── COVERAGE: the hole described here is CLOSED (re-measured 2026-09-01) ─────────────────────
  *
- * `fleet_projects` has 12 active rows and only 7 carry `in_health = true`. arivioo, Predivo,
- * BoatBuddy, Distribution-OS and Jass-Tour are checked by nothing — including predivo.ch, the
- * company's own site. This script reports that count in its log every run rather than quietly
- * covering 7 and calling it the fleet. Widening `in_health` is a decision about which of those
- * are live products, not a code change, so it is not made here.
+ * This block used to read: "`fleet_projects` has 12 active rows and only 7 carry `in_health =
+ * true`. arivioo, Predivo, BoatBuddy, Distribution-OS and Jass-Tour are checked by nothing."
+ * That was true when written and is now FALSE. Read from production on 2026-09-01: 12 active
+ * rows, 12 with `in_health = true` — all five named products included, predivo.ch among them.
+ * Roger's ruling of 2026-08-28 was "every product needs to be watched all the time", and the
+ * seeding was corrected to match it.
+ *
+ * The old text is kept above deliberately, because it nearly caused the same wrong answer twice:
+ * a session checking this coverage question read this comment, found it agreeing with the board
+ * row, and almost confirmed a gap that no longer existed. A COMMENT IS A RECORD OF WHAT WAS TRUE
+ * WHEN SOMEBODY TYPED IT. The table is the system. Re-read `fleet_projects` before believing any
+ * sentence in this file about coverage, including this one.
+ *
+ * The run-time count is still logged every run, so a real regression shows up as a number rather
+ * than as prose nobody re-checks.
  *
  * Contract:  node scripts/check-products-down.mjs [--dry]
  *   env: BOARD_SUPABASE_SECRET or BACKOFFICE_SERVICE_ROLE_KEY  (reads fleet_projects, files the
