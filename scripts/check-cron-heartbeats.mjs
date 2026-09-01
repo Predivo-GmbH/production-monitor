@@ -215,7 +215,7 @@ export function httpDeliveryVerdict({ stats, queryError, httpPostSchedules }) {
 
 /** Max tolerated age of the last SUCCESSFUL run, derived from the cron schedule.
  *  3× the interval (with floors) = several consecutive misses, never one blip. */
-function allowanceMs(schedule) {
+export function allowanceMs(schedule) {
   const parts = String(schedule).trim().split(/\s+/)
   if (parts.length !== 5) return 26 * 3600_000 // unrecognized → treat as daily
   const [min, hour, dom, , dow] = parts
@@ -235,6 +235,61 @@ function fmtAge(ms) {
   const h = ms / 3600_000
   if (h < 1) return `${Math.round(ms / 60_000)}min`
   return h < 48 ? `${h.toFixed(1)}h` : `${(h / 24).toFixed(1)}d`
+}
+
+/**
+ * LAYER 1, made explicit and testable: is this job's last SUCCESS recent enough for its
+ * own schedule — and, when it is not, WHY.
+ *
+ * WHY THIS IS A FUNCTION AND NOT THREE LINES INSIDE THE LOOP (2026-09-01). The console
+ * line stopped at `DEAD affiliate-monitor-daily [0 7 * * *] last success 37.4h ago >
+ * allowed 26.0h`. The two fields that answer the only question that follows — did pg_cron
+ * ATTEMPT it, and what did the attempt say — were already being read by HEARTBEAT_SQL,
+ * folded into the finding, and then left the machine by email and nowhere else. The
+ * runbook's first diagnostic step is "download the failed run's logs", so the evidence was
+ * missing from the first place anyone looks. Measured that night on run 33555239704: three
+ * findings, and the log could not tell any of them apart.
+ *
+ * `last_run` is the field that separates the two very different failures that both arrive
+ * as "no recent success":
+ *   * a run happened and did not succeed  → pg_cron is fine, the JOB is broken, and
+ *     `last_result` carries the database's own error message.
+ *   * no run was ever recorded            → pg_cron never attempted it. On a database
+ *     whose other jobs are ticking, that means the job is younger than its first tick,
+ *     not that it has been dead for weeks — a distinction the old line erased, and the
+ *     reason BackOffice's freshly scheduled `product-check-run-prune-daily` read exactly
+ *     like a job that had been failing since July.
+ *
+ * Pure: no clock, no network. `nowMs` is passed in so a test can place the facts in time.
+ *
+ * @param {{jobname: string, schedule: string, last_success: string|null, last_run: string|null, last_result: string|null}} row
+ * @param {number} nowMs
+ * @returns {{verdict: 'ok'|'dead', neverRan: boolean, detail: string}}
+ */
+export function jobVerdict(row, nowMs) {
+  const allow = allowanceMs(row.schedule)
+  const lastSuccess = row.last_success ? new Date(row.last_success).getTime() : null
+  const age = lastSuccess == null ? null : nowMs - lastSuccess
+
+  if (age != null && age <= allow) {
+    return { verdict: 'ok', neverRan: false, detail: `last success ${fmtAge(age)} ago` }
+  }
+
+  // Never attempted. Say that, rather than "last success never ago", which reads as a
+  // job that has been failing forever and is the same sentence for a job added an hour ago.
+  if (!row.last_run) {
+    return {
+      verdict: 'dead',
+      neverRan: true,
+      detail: `NEVER RUN — cron.job_run_details holds no attempt at all for this job (allowed ${fmtAge(allow)} between successes). Either it was scheduled after its most recent tick was due — check whether the previous heartbeat run knew this job at all — or pg_cron is not firing it.`,
+    }
+  }
+
+  return {
+    verdict: 'dead',
+    neverRan: false,
+    detail: `last success ${fmtAge(age)} ago (allowed ${fmtAge(allow)}); last run ${row.last_run}; last result: ${row.last_result ?? 'none in 35d'}`,
+  }
 }
 
 /** Management API query with retries — api.supabase.com intermittently 502s
@@ -288,20 +343,14 @@ async function main() {
       continue
     }
     for (const r of rows) {
-      const allow = allowanceMs(r.schedule)
-      const lastSuccess = r.last_success ? new Date(r.last_success).getTime() : null
-      const age = lastSuccess ? now - lastSuccess : null
-      if (lastSuccess && age <= allow) {
-        console.log(`  OK   ${r.jobname} [${r.schedule}] last success ${fmtAge(age)} ago${r.uses_http_post ? ' (dispatches HTTP — see delivery line below)' : ''}`)
+      const v = jobVerdict(r, now)
+      if (v.verdict === 'ok') {
+        console.log(`  OK   ${r.jobname} [${r.schedule}] ${v.detail}${r.uses_http_post ? ' (dispatches HTTP — see delivery line below)' : ''}`)
       } else {
-        findings.push({
-          product: name,
-          job: r.jobname,
-          schedule: r.schedule,
-          problem: 'dead',
-          detail: `last success ${fmtAge(age)} ago (allowed ${fmtAge(allow)}); last run ${r.last_run ?? 'never'}; last result: ${r.last_result ?? 'none in 35d'}`,
-        })
-        console.error(`  DEAD ${r.jobname} [${r.schedule}] last success ${fmtAge(age)} ago > allowed ${fmtAge(allow)}`)
+        findings.push({ product: name, job: r.jobname, schedule: r.schedule, problem: 'dead', detail: v.detail })
+        // The SAME detail that goes in the email goes in the log. An alert whose evidence
+        // only exists in someone's inbox is an alert nobody can act on from the run page.
+        console.error(`  DEAD ${r.jobname} [${r.schedule}] ${v.detail}`)
       }
     }
 
