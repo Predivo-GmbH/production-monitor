@@ -239,8 +239,75 @@ t('the reported method is ranked by LOGIN_METHOD_STRENGTH, not by rule order', (
   // today, and that the strength list holds every method the rules can produce.
   const declared = CLASSIFIER_RULES.filter((r) => r.field === 'login').map((r) => r.loginMethod)
   assert.deepEqual(declared, LOGIN_METHOD_STRENGTH, 'login rules are listed strongest-first')
-  assert.deepEqual(LOGIN_METHOD_STRENGTH, ['magic-link-browser', 'otp-email', 'site-password'])
+  assert.deepEqual(LOGIN_METHOD_STRENGTH, ['magic-link-browser', 'otp-email', 'user-password', 'site-password'])
   assert.equal(new Set(LOGIN_METHOD_STRENGTH).size, LOGIN_METHOD_STRENGTH.length)
+})
+
+t('a real account signing in with its own password reports login "ok" via user-password', () => {
+  // Jass-Tour, added 2026-09-01. Its Auth.tsx offers no magic link at all and its Supabase
+  // project does not allow its production domain as a redirect target, so the fleet's usual
+  // route cannot reach it — email + password through the product's own form IS the sign-in a
+  // real person performs here, and it is a per-user identity check, not a shared door.
+  const rows = buildRows(report(dirSuite('jass-tour', [
+    passed('full password login works and dashboard loads'),
+    passed('wrong site password is refused'),
+    passed('landing page loads'),
+  ])))
+  const r = rowFor(rows, 'jass-tour')
+  assert.equal(r.login, OK)
+  assert.equal(r.login_method, 'user-password')
+  assert.equal(r.checks_total, 3)
+  assert.equal(r.checks_passed, 3)
+})
+
+t('user-password is a login method and never a site check, and is distinct from site-password', () => {
+  // The two titles differ by one word. If 'full password login works' also matched the
+  // site-password rule — or the loose site rule — one product's sign-in would be filed as
+  // another kind of proof entirely, which is the whole reason these methods are named.
+  assert.deepEqual(classify('full password login works and dashboard loads').map((r) => r.field), ['login'])
+  assert.deepEqual(
+    classify('full password login works and dashboard loads').map((r) => r.loginMethod),
+    ['user-password'],
+  )
+  assert.deepEqual(
+    classify('full site password login works and the app opens').map((r) => r.loginMethod),
+    ['site-password'],
+    'the shared-gate title must not be swallowed by the user-password rule',
+  )
+  assert.deepEqual(classify('full login works and dashboard loads').map((r) => r.loginMethod), ['magic-link-browser'])
+})
+
+t('user-password outranks a shared gate but yields to a magic link', () => {
+  const gateToo = buildRows(report(dirSuite('jass-tour', [
+    passed('full site password login works and the app opens'),
+    passed('full password login works and dashboard loads'),
+  ])))
+  assert.equal(rowFor(gateToo, 'jass-tour').login_method, 'user-password',
+    'a per-user sign-in must never be understated as a shared door')
+
+  const magicToo = buildRows(report(dirSuite('jass-tour', [
+    passed('full password login works and dashboard loads'),
+    passed('full login works and dashboard loads'),
+  ])))
+  assert.equal(rowFor(magicToo, 'jass-tour').login_method, 'magic-link-browser')
+})
+
+t('a SKIPPED user-password test leaves login "not-tested" and never "ok"', () => {
+  // test.skip fires whenever JASSTOUR_TEST_PASSWORD (or the service-role key) is missing, which
+  // is the state on the day this rule was written: the secret does not exist yet. Grey, not green.
+  const rows = buildRows(report(dirSuite('jass-tour', [
+    skipped('full password login works and dashboard loads'),
+    passed('wrong site password is refused'),
+    passed('landing page loads'),
+    passed('site identity — title contains Beize Jass Tour'),
+  ])))
+  const r = rowFor(rows, 'jass-tour')
+  assert.equal(r.login, NOT_TESTED)
+  assert.equal(r.login_method, 'none')
+  assert.equal(r.site, OK)
+  assert.equal(r.identity, OK)
+  assert.equal(r.checks_total, 3, 'the skipped test counts in neither total nor passed')
+  assert.equal(r.checks_passed, 3)
 })
 
 t('site-password is a login method and never a site check', () => {
@@ -352,7 +419,13 @@ t('EVERY directory under tests/ is either mapped to a slug or explicitly not a p
   // until someone decides, in writing, which of the two tables the new directory belongs in.
   const dirs = readdirSync(join(REPO, 'tests'), { withFileTypes: true })
     .filter((e) => e.isDirectory()).map((e) => e.name)
-  assert.ok(dirs.length >= 16, `expected the full tests/ tree, saw ${dirs.length}`)
+  assert.ok(dirs.length >= 17, `expected the full tests/ tree, saw ${dirs.length}`)
+  // tests/jass-tour was the twelfth and last active product to get a directory (2026-09-01).
+  // Named explicitly so that deleting the mapping fails HERE, with a sentence, rather than
+  // silently turning the product's card blank again.
+  assert.ok(dirs.includes('jass-tour'), 'tests/jass-tour must exist — it is a real product directory')
+  assert.equal(TEST_DIR_TO_SLUG['jass-tour'], 'jass-tour', 'tests/jass-tour maps to fleet_projects.slug "jass-tour"')
+  assert.ok(!NON_PRODUCT_DIRS.includes('jass-tour'))
   for (const dir of dirs) {
     const mapped = Object.prototype.hasOwnProperty.call(TEST_DIR_TO_SLUG, dir)
     const excluded = NON_PRODUCT_DIRS.includes(dir)

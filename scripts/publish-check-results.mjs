@@ -69,8 +69,11 @@ export const FIELDS = ['login', 'mail_delivery', 'site', 'identity', 'backend']
 
 /**
  * tests/<dir> -> fleet_projects.slug. Verified against the live registry on 2026-09-01: all
- * eleven slugs below exist and are active. `ytmigration` is the pre-rename directory for
- * ChannelMover — the same mismatch monitor.yml already carries for its anon-key secret.
+ * twelve slugs below exist and are active — and twelve is now the WHOLE registry, because
+ * `jass-tour` was added that day and was the last active product with no test directory at all,
+ * so its Fleet health card read "no run has ever filed a result for this product".
+ * `ytmigration` is the pre-rename directory for ChannelMover — the same mismatch monitor.yml
+ * already carries for its anon-key secret.
  */
 export const TEST_DIR_TO_SLUG = {
   backoffice: 'backoffice',
@@ -84,6 +87,7 @@ export const TEST_DIR_TO_SLUG = {
   'distribution-os': 'distributionos',
   boatbuddy: 'boatbuddy',
   predivo: 'predivo',
+  'jass-tour': 'jass-tour',
 }
 
 /**
@@ -110,7 +114,9 @@ export const NON_PRODUCT_DIRS = ['self', 'ci-health', 'api-health', 'keepalive',
  * The counts these rules produce were checked against the independent tally in 082's header:
  * 8 products with a real magic-link browser login, 5 with a real mailbox round trip. They agree.
  * Valrano became the NINTH magic-link login on 2026-09-01 (it had a form-rendering check and an
- * IMAP delivery check but had never once signed in), and BoatBuddy the first 'site-password'.
+ * IMAP delivery check but had never once signed in), BoatBuddy the first 'site-password', and
+ * Jass-Tour the first 'user-password' — the last of which is dormant until Cockpit/sql/084
+ * widens the constraint and JASSTOUR_TEST_PASSWORD is set (see the rule itself).
  *
  * WHAT IS DELIBERATELY NOT A LOGIN RULE, and this is the important part: "login page has form"
  * and "login form: fields accept input and opacity > 0" render the sign-in UI without ever
@@ -139,6 +145,13 @@ export const NON_PRODUCT_DIRS = ['self', 'ci-health', 'api-health', 'keepalive',
  *                        mailbox. It ranks BELOW the magic link only because it is the flow that
  *                        skips on a rate-limit cooldown, so it is the less reliable evidence of
  *                        the two, not the weaker one in principle.
+ *   user-password      — a real account signs in with its own email and password through the
+ *                        product's own form (Jass-Tour, added 2026-09-01). It is a genuine
+ *                        per-user identity check, so it belongs with the two above rather than
+ *                        with the shared gate below. It ranks third because it proves nothing
+ *                        about the mail path and mints no per-request token: a stored credential
+ *                        is checked, which is a smaller claim than a link that had to be
+ *                        generated, delivered and verified.
  *   site-password      — one shared secret opens the whole site (BoatBuddy's PasswordGate). It
  *                        proves the door opens; it proves NOTHING about user identity, because
  *                        the product has no users. It is real access control and worth reporting,
@@ -148,13 +161,25 @@ export const NON_PRODUCT_DIRS = ['self', 'ci-health', 'api-health', 'keepalive',
  * 'site-password' for such a product would understate what was actually proven, and reporting it
  * ABOVE a magic link would overstate a shared password as an identity check.
  */
-export const LOGIN_METHOD_STRENGTH = ['magic-link-browser', 'otp-email', 'site-password']
+export const LOGIN_METHOD_STRENGTH = ['magic-link-browser', 'otp-email', 'user-password', 'site-password']
 
 export const CLASSIFIER_RULES = [
   // ── login: only tests that actually SIGN IN. Listed strongest-first to match
   //    LOGIN_METHOD_STRENGTH, which is what actually decides the reported method. ──
   { field: 'login', pattern: /^full login works/i, loginMethod: 'magic-link-browser' },
   { field: 'login', pattern: /^E2E OTP:.*enter code/i, loginMethod: 'otp-email' },
+  // Jass-Tour's only per-user sign-in is its own email+password form: the product ships no
+  // magic link at all, and its Supabase project does not allow its production domain as a
+  // redirect target, so the fleet's usual route cannot even reach it (measured 2026-09-01 —
+  // see tests/jass-tour/user-password-login.spec.ts for the probe and its calibration).
+  //
+  // ⚠ 'user-password' NEEDS Cockpit/sql/084 FIRST. product_check_run_login_method_chk (082,
+  // extended by 083) currently allows only magic-link-browser / otp-email / site-password /
+  // none, and insertRows() posts every product's row in ONE request — so a rejected jass-tour
+  // row loses the whole fleet's hour, not just its own. The test that produces this method is
+  // gated on JASSTOUR_TEST_PASSWORD, a secret that does not exist yet, so it skips and this
+  // rule stays dormant until both the constraint and the secret are in place.
+  { field: 'login', pattern: /^full password login works/i, loginMethod: 'user-password' },
   // BoatBuddy has no user accounts at all: its PasswordGate is the only sign-in a person performs.
   // The NEGATIVE case ('wrong site password is refused') is deliberately NOT a login rule — it
   // proves the gate REJECTS, which is not the same claim as "login works", and it reds the run on
