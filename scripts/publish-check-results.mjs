@@ -20,8 +20,9 @@
  * EVERY OUTCOME IS THREE-VALUED: 'ok' | 'failed' | 'not-tested'. A check that did not run is
  * 'not-tested'. Never 'ok'. Never 'failed'. Concretely, in this file:
  *
- *   * a field with NO test matching its classifier stays 'not-tested' — BoatBuddy, Predivo and
- *     Valrano have no sign-in test at all, and their `login` must read grey, not green;
+ *   * a field with NO test matching its classifier stays 'not-tested' — predivo.ch is a company
+ *     website with no sign-in of any kind, so its `login` must read grey, not green, forever;
+ *     Valrano and BoatBuddy were in that list until 2026-09-01 and are now genuinely tested;
  *   * a SKIPPED test is not an outcome. `test.skip(!IMAP_PASS, …)` and `test.skip(!SUPABASE_URL,
  *     …)` fire routinely (arivioo's Supabase project has been paused; the OTP tests skip on a
  *     rate-limit cooldown). A skipped test counts in neither `checks_total` nor `checks_passed`
@@ -108,6 +109,8 @@ export const NON_PRODUCT_DIRS = ['self', 'ci-health', 'api-health', 'keepalive',
  *
  * The counts these rules produce were checked against the independent tally in 082's header:
  * 8 products with a real magic-link browser login, 5 with a real mailbox round trip. They agree.
+ * Valrano became the NINTH magic-link login on 2026-09-01 (it had a form-rendering check and an
+ * IMAP delivery check but had never once signed in), and BoatBuddy the first 'site-password'.
  *
  * WHAT IS DELIBERATELY NOT A LOGIN RULE, and this is the important part: "login page has form"
  * and "login form: fields accept input and opacity > 0" render the sign-in UI without ever
@@ -115,15 +118,48 @@ export const NON_PRODUCT_DIRS = ['self', 'ci-health', 'api-health', 'keepalive',
  * "login works" on the strength of a form being visible, which is a smaller version of exactly
  * the /auth/v1/otp probe this replaces. They classify as `site` (a page rendered) or not at all.
  *
- * `loginMethod` is taken from the highest-priority login rule matched by a test THAT RAN, so a
- * run where the magic-link test was skipped and only the OTP sign-in executed reports 'otp-email'
- * rather than a method nothing exercised. Every spec matched by the first rule imports
- * loginViaMagicLink from lib/auth.ts (verified 2026-09-01, all 8).
+ * `loginMethod` is taken from the STRONGEST login rule matched by a test THAT RAN, so a run where
+ * the magic-link test was skipped and only the OTP sign-in executed reports 'otp-email' rather
+ * than a method nothing exercised. Every spec matched by the magic-link rule imports
+ * loginViaMagicLink from lib/auth.ts (verified 2026-09-01, all 9).
  */
+
+/**
+ * HOW STRONG EACH PROOF OF SIGN-IN IS, strongest first. Stated here as its own list rather than
+ * left implicit in the order of CLASSIFIER_RULES, because it is a JUDGEMENT and it decides what
+ * one word on the Fleet health page means. Reordering the rules below for readability must not
+ * silently downgrade what a product reports.
+ *
+ * WHY THIS ORDER:
+ *
+ *   magic-link-browser — a real per-user token is minted, verified by GoTrue, and the app then
+ *                        admits that specific user. It proves the whole pipeline AND that the
+ *                        product can tell one person from another.
+ *   otp-email          — the same, and it additionally proves a real message reached a real
+ *                        mailbox. It ranks BELOW the magic link only because it is the flow that
+ *                        skips on a rate-limit cooldown, so it is the less reliable evidence of
+ *                        the two, not the weaker one in principle.
+ *   site-password      — one shared secret opens the whole site (BoatBuddy's PasswordGate). It
+ *                        proves the door opens; it proves NOTHING about user identity, because
+ *                        the product has no users. It is real access control and worth reporting,
+ *                        but it must never outrank a per-user sign-in on a product that has both.
+ *
+ * A product with BOTH a user sign-in and a gate therefore reports the user sign-in: reporting
+ * 'site-password' for such a product would understate what was actually proven, and reporting it
+ * ABOVE a magic link would overstate a shared password as an identity check.
+ */
+export const LOGIN_METHOD_STRENGTH = ['magic-link-browser', 'otp-email', 'site-password']
+
 export const CLASSIFIER_RULES = [
-  // ── login: only tests that actually SIGN IN. ──
+  // ── login: only tests that actually SIGN IN. Listed strongest-first to match
+  //    LOGIN_METHOD_STRENGTH, which is what actually decides the reported method. ──
   { field: 'login', pattern: /^full login works/i, loginMethod: 'magic-link-browser' },
   { field: 'login', pattern: /^E2E OTP:.*enter code/i, loginMethod: 'otp-email' },
+  // BoatBuddy has no user accounts at all: its PasswordGate is the only sign-in a person performs.
+  // The NEGATIVE case ('wrong site password is refused') is deliberately NOT a login rule — it
+  // proves the gate REJECTS, which is not the same claim as "login works", and it reds the run on
+  // its own when it fails.
+  { field: 'login', pattern: /^full site password login works/i, loginMethod: 'site-password' },
 
   // ── mail_delivery: a real message, fetched back out of a real mailbox over IMAP. ──
   { field: 'mail_delivery', pattern: /^E2E OTP:/i },
@@ -249,8 +285,9 @@ export function buildRows(results, { runUrl = null, source = SOURCE } = {}) {
         identity: NOT_TESTED,
         backend: NOT_TESTED,
         failures: [],
-        // Rule order of the best login rule seen on a test that RAN. -1 = none yet.
-        _loginRule: -1,
+        // LOGIN_METHOD_STRENGTH index of the strongest login proof seen on a test that RAN.
+        // -1 = none yet.
+        _loginRank: -1,
       })
     }
     const row = byslug.get(check.slug)
@@ -267,10 +304,12 @@ export function buildRows(results, { runUrl = null, source = SOURCE } = {}) {
       // regardless of how many siblings passed.
       if (row[rule.field] !== FAILED) row[rule.field] = check.outcome === 'failed' ? FAILED : OK
       if (rule.field === 'login') {
-        const idx = CLASSIFIER_RULES.indexOf(rule)
-        if (row._loginRule === -1 || idx < row._loginRule) {
-          row._loginRule = idx
-          row.login_method = rule.loginMethod || 'none'
+        // Ranked by LOGIN_METHOD_STRENGTH, NOT by position in CLASSIFIER_RULES. Reordering the
+        // rules must not be able to change what a product reports about its own sign-in.
+        const rank = LOGIN_METHOD_STRENGTH.indexOf(rule.loginMethod)
+        if (rank >= 0 && (row._loginRank === -1 || rank < row._loginRank)) {
+          row._loginRank = rank
+          row.login_method = rule.loginMethod
         }
       }
     }
@@ -278,7 +317,7 @@ export function buildRows(results, { runUrl = null, source = SOURCE } = {}) {
 
   return [...byslug.values()]
     .sort((a, b) => a.slug.localeCompare(b.slug))
-    .map(({ _loginRule, ...row }) => row)
+    .map(({ _loginRank, ...row }) => row)
 }
 
 /** The run these numbers came from, so anything on the page can be opened and checked. */

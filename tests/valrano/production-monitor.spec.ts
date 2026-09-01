@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test'
-import { ensureTestUser } from '../../lib/auth'
+import { loginViaMagicLink, ensureTestUser } from '../../lib/auth'
 import { waitForOtpEmail } from '../../lib/imap'
 import { createClient } from '@supabase/supabase-js'
 import {
@@ -30,7 +30,11 @@ const IMAP_OPTS = {
 
 test.describe('Valrano — Production Monitor', () => {
   test.beforeAll(async () => {
-    if (OTP_TEST_EMAIL) {
+    // The monitor's own sign-in identity. Seeded here for the same reason every other product
+    // seeds it: the login test must establish its own precondition rather than depend on
+    // whatever the production auth table happens to hold this hour.
+    await ensureTestUser(SUPABASE_URL, SERVICE_ROLE_KEY, TEST_EMAIL)
+    if (OTP_TEST_EMAIL && OTP_TEST_EMAIL !== TEST_EMAIL) {
       await ensureTestUser(SUPABASE_URL, SERVICE_ROLE_KEY, OTP_TEST_EMAIL)
     }
   })
@@ -112,12 +116,44 @@ test.describe('Valrano — Production Monitor', () => {
     })
   })
 
-  // ── Real Login Form Interaction (not magic link bypass) ─────────────
+  // ── Real sign-in, in a real browser ─────────────────────────────
+
+  test('full login works and dashboard loads', async ({ page }) => {
+    await loginViaMagicLink(page, {
+      supabaseUrl: SUPABASE_URL,
+      serviceRoleKey: SERVICE_ROLE_KEY,
+      anonKey: ANON_KEY,
+      testEmail: TEST_EMAIL,
+      siteUrl: SITE_URL,
+    })
+
+    // WHY THIS WAITS FOR A ROUTE INSTEAD OF ONLY ASSERTING not.toContain('/auth').
+    //
+    // Every other product's login test ends on `expect(url).not.toContain('/auth')`. On Valrano
+    // that assertion proves NOTHING: this app signs in at /login, and the magic link redirects to
+    // '/', which is the public landing page. A run where the session was never established
+    // therefore sits on 'https://valrano.com/' — a URL containing neither '/auth' nor '/login'
+    // — and the assertion passes with nobody logged in. That is the same shape of defect as the
+    // /auth/v1/otp probe this monitoring exists to replace.
+    //
+    // What actually proves a session here is that the app ADMITTED us. '/' wraps the landing page
+    // in RedirectIfAuthenticated (src/components/auth/RedirectIfAuthenticated.tsx), so a real
+    // session moves it to /dashboard; ProtectedRoute sends anyone without one back to /login. A
+    // user who has not finished the wizard is forwarded on by OnboardingGuard to /onboarding —
+    // also behind ProtectedRoute, so either destination proves the session is real.
+    await page.waitForURL(/\/(dashboard|onboarding)/, { timeout: 20_000 })
+    await page.waitForLoadState('networkidle')
+    const url = page.url()
+    expect(url, 'a signed-in session must not be sitting on an auth route').not.toMatch(/\/(login|signup|auth)/)
+  })
+
+  // ── Login form rendering — NOT a login (see the test above for that) ─────
 
   test('login form: fields accept input and opacity > 0', async ({ page }) => {
-    // Bypass PasswordGate (Valrano uses localStorage key 'bs_unlocked')
-    await page.goto(SITE_URL, { waitUntil: 'commit' })
-    await page.evaluate(() => localStorage.setItem('bs_unlocked', 'true'))
+    // NO PASSWORD GATE. This test used to set localStorage 'bs_unlocked' to "bypass Valrano's
+    // PasswordGate". That component no longer exists: `grep -rn PasswordGate` over the Valrano
+    // repo finds it only in legacy e2e specs and pre-2026-08 docs, and docs/FEATURES.md records
+    // it as removed in favour of Supabase auth. The bypass was writing a key nothing reads.
     // Reload-retry: a deploy-in-progress (Metanet FTP file swap) can briefly
     // serve a partial SPA with no login form. Reload a few times before failing,
     // so a transient mid-deploy moment self-heals instead of alerting. A

@@ -205,6 +205,10 @@ jobs:
           VALRANO_STAGING_ANON_KEY: ${{ secrets.VALRANO_STAGING_ANON_KEY }}
           BOATBUDDY_SUPABASE_URL: ${{ secrets.BOATBUDDY_SUPABASE_URL }}
           BOATBUDDY_ANON_KEY: ${{ secrets.BOATBUDDY_ANON_KEY }}
+          # The shared site password. BoatBuddy has no user accounts — typing this into
+          # PasswordGate IS its login, so without it tests/boatbuddy skips the sign-in and the
+          # Fleet health page correctly reports login as not-tested rather than green.
+          BOATBUDDY_GATE_PASSWORD: ${{ secrets.BOATBUDDY_GATE_PASSWORD }}
           BOATBUDDY_STAGING_SUPABASE_URL: ${{ secrets.BOATBUDDY_STAGING_SUPABASE_URL }}
           BOATBUDDY_STAGING_ANON_KEY: ${{ secrets.BOATBUDDY_STAGING_ANON_KEY }}
           # Workflow presence check

@@ -21,7 +21,7 @@ import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  TEST_DIR_TO_SLUG, NON_PRODUCT_DIRS, CLASSIFIER_RULES, FIELDS,
+  TEST_DIR_TO_SLUG, NON_PRODUCT_DIRS, CLASSIFIER_RULES, FIELDS, LOGIN_METHOD_STRENGTH,
   buildRows, collectChecks, classify, slugForFile, outcomeOf, messageOf,
   loadResults, runUrlFrom, parseArgs, describeRow,
   NOT_TESTED, OK, FAILED, SOURCE, MAX_MESSAGE,
@@ -58,10 +58,12 @@ const rowFor = (rows, slug) => rows.find((r) => r.slug === slug)
 // ── THE ONE THAT MATTERS: an unrun check is never a pass ─────────────────────────────────────
 
 t('a product with NO login test reports login "not-tested" — never "ok"', () => {
-  // BoatBuddy, Predivo and Valrano really do have no sign-in test. This is the whole reason the
-  // schema has three values and no booleans. A default of 'ok' passes every other test in this
-  // file and reproduces the "Login OK" that was rendered for a product that could not send a
-  // login email at all.
+  // predivo.ch really has no sign-in of any kind, and BoatBuddy's own suite still reports
+  // not-tested whenever its gate password is unset. This is the whole reason the schema has three
+  // values and no booleans. A default of 'ok' passes every other test in this file and reproduces
+  // the "Login OK" that was rendered for a product that could not send a login email at all.
+  // (The fixture below is deliberately BoatBuddy's pre-2026-09-01 title list: those three titles
+  // prove a site, not a sign-in, and must still classify as no login at all.)
   const rows = buildRows(report(dirSuite('boatbuddy', [
     passed('landing page loads'),
     passed('site identity — title contains BoatBuddy'),
@@ -153,6 +155,99 @@ t('a login FORM rendering is not a login working', () => {
   assert.deepEqual(classify('login page has form').map((r) => r.field), ['site'])
   const rows = buildRows(report(dirSuite('valrano', [passed('login form: fields accept input and opacity > 0')])))
   assert.equal(rowFor(rows, 'valrano').login, NOT_TESTED)
+})
+
+t('the site password gate reports login "ok" with the site-password method', () => {
+  // BoatBuddy has no user accounts: typing the shared password into PasswordGate IS the sign-in a
+  // real person performs, so it is a login and must be reported as one — with a method that says
+  // plainly it was a shared secret and not an identity check.
+  const rows = buildRows(report(dirSuite('boatbuddy', [
+    passed('full site password login works and the app opens'),
+    passed('wrong site password is refused'),
+    passed('landing page loads'),
+  ])))
+  const r = rowFor(rows, 'boatbuddy')
+  assert.equal(r.login, OK)
+  assert.equal(r.login_method, 'site-password')
+  assert.equal(r.checks_total, 3)
+  assert.equal(r.checks_passed, 3)
+})
+
+t('the NEGATIVE gate test is not a login claim, but it still reds the run', () => {
+  // 'wrong site password is refused' proves the gate REJECTS. That is not the claim "login
+  // works", so it classifies to no field at all — but it still counts as a check, so a gate that
+  // has started accepting anything fails the run and fires the alert.
+  assert.deepEqual(classify('wrong site password is refused').map((r) => r.field), [])
+  const rows = buildRows(report(dirSuite('boatbuddy', [
+    passed('full site password login works and the app opens'),
+    failed('wrong site password is refused', 'A WRONG PASSWORD OPENED THE APP'),
+  ])))
+  const r = rowFor(rows, 'boatbuddy')
+  assert.equal(r.checks_total, 2)
+  assert.equal(r.checks_passed, 1)
+  assert.equal(r.failures.length, 1)
+  assert.match(r.failures[0].message, /A WRONG PASSWORD OPENED THE APP/)
+})
+
+t('a SKIPPED gate test leaves login "not-tested" and never "ok"', () => {
+  // test.skip(!GATE_PASSWORD) fires the moment the secret goes missing from monitor.yml. A
+  // missing secret must read grey, never green: that is the entire premise of this table.
+  const rows = buildRows(report(dirSuite('boatbuddy', [
+    skipped('full site password login works and the app opens'),
+    passed('wrong site password is refused'),
+    passed('landing page loads'),
+  ])))
+  const r = rowFor(rows, 'boatbuddy')
+  assert.equal(r.login, NOT_TESTED)
+  assert.notEqual(r.login, OK, 'a sign-in nobody performed must never read as a sign-in that works')
+  assert.equal(r.login_method, 'none')
+  assert.equal(r.checks_total, 2, 'the skipped test counts in neither total nor passed')
+  assert.equal(r.checks_passed, 2)
+})
+
+t('a product with BOTH a user sign-in and a gate reports the stronger method', () => {
+  // THE PRIORITY RULE. A shared site password proves the door opens; it proves nothing about who
+  // opened it. Reporting 'site-password' for a product that also has a per-user magic-link login
+  // would understate what the run actually proved.
+  const both = [
+    passed('full site password login works and the app opens'),
+    passed('full login works and dashboard loads'),
+  ]
+  assert.equal(rowFor(buildRows(report(dirSuite('valrano', both))), 'valrano').login_method, 'magic-link-browser')
+  // ...and in the other listing order, because the rank must not depend on which test ran first.
+  assert.equal(rowFor(buildRows(report(dirSuite('valrano', [...both].reverse()))), 'valrano').login_method, 'magic-link-browser')
+})
+
+t('otp-email outranks site-password, and a skipped stronger test yields to the weaker one', () => {
+  const rows = buildRows(report(dirSuite('boatbuddy', [
+    passed('full site password login works and the app opens'),
+    passed('E2E OTP: request code → email delivery → enter code → dashboard'),
+  ])))
+  assert.equal(rowFor(rows, 'boatbuddy').login_method, 'otp-email')
+
+  const stronger = buildRows(report(dirSuite('boatbuddy', [
+    skipped('full login works and dashboard loads'),
+    passed('full site password login works and the app opens'),
+  ])))
+  assert.equal(rowFor(stronger, 'boatbuddy').login_method, 'site-password',
+    'a skipped magic-link test proves no method, so the gate is what was actually proven')
+})
+
+t('the reported method is ranked by LOGIN_METHOD_STRENGTH, not by rule order', () => {
+  // The strength list exists as its own list precisely so a future readability edit to
+  // CLASSIFIER_RULES cannot silently downgrade what a product reports. This asserts the two agree
+  // today, and that the strength list holds every method the rules can produce.
+  const declared = CLASSIFIER_RULES.filter((r) => r.field === 'login').map((r) => r.loginMethod)
+  assert.deepEqual(declared, LOGIN_METHOD_STRENGTH, 'login rules are listed strongest-first')
+  assert.deepEqual(LOGIN_METHOD_STRENGTH, ['magic-link-browser', 'otp-email', 'site-password'])
+  assert.equal(new Set(LOGIN_METHOD_STRENGTH).size, LOGIN_METHOD_STRENGTH.length)
+})
+
+t('site-password is a login method and never a site check', () => {
+  // 'full site password login works and the app opens' contains the word "site", and the site
+  // rule is a loose regex. A login test that also counted as a page-load check would let a green
+  // `site` sit next to a red `login` for the same sentence.
+  assert.deepEqual(classify('full site password login works and the app opens').map((r) => r.field), ['login'])
 })
 
 // ── failures ─────────────────────────────────────────────────────────────────────────────────
@@ -274,18 +369,21 @@ t('EVERY directory under tests/ is either mapped to a slug or explicitly not a p
 
 // ── the classifier, held to the titles that actually exist ───────────────────────────────────
 
-t('the classifier reproduces the independently-counted 8 logins and 5 mailboxes', () => {
+t('the classifier reproduces the independently-counted logins and mailboxes', () => {
   // 082's header states, from a separate reading of the suite: "a real magic-link browser login
   // on 8 products ... and a real mailbox round trip on 5". Two methods agreeing is the point.
-  const logins = ['arivioo', 'backoffice', 'distribution-os', 'launchready', 'replyflow', 'scoutcopilot', 'signalscore', 'ytmigration']
+  // Valrano became the 9th magic-link login on 2026-09-01, so the tally is now 9 — plus
+  // BoatBuddy, whose sign-in is a site password and is counted separately below because it is a
+  // different KIND of proof, not a ninth copy of the same one.
+  const logins = ['arivioo', 'backoffice', 'distribution-os', 'launchready', 'replyflow', 'scoutcopilot', 'signalscore', 'valrano', 'ytmigration']
   const mail = ['backoffice', 'replyflow', 'signalscore', 'valrano', 'ytmigration']
-  assert.equal(logins.length, 8)
+  assert.equal(logins.length, 9)
   assert.equal(mail.length, 5)
   const rows = buildRows(report(
     ...logins.map((d) => dirSuite(d, [passed('full login works and dashboard loads')])),
     ...mail.map((d) => dirSuite(`${d}-x`, [])),
   ))
-  assert.equal(rows.filter((r) => r.login === OK).length, 8)
+  assert.equal(rows.filter((r) => r.login === OK).length, 9)
   for (const title of ['E2E OTP: trigger email → verify IMAP delivery → check OTP format', 'E2E OTP: email contains valid links (no 404)']) {
     assert.deepEqual(classify(title).map((r) => r.field), ['mail_delivery'])
   }
@@ -320,7 +418,7 @@ t('every classifier rule names a real column and a legal login method', () => {
   for (const rule of CLASSIFIER_RULES) {
     assert.ok(FIELDS.includes(rule.field), `${rule.field} is not a product_check_run column`)
     if (rule.field === 'login') {
-      assert.ok(['magic-link-browser', 'otp-email'].includes(rule.loginMethod), 'login rules must declare how login was proven')
+      assert.ok(LOGIN_METHOD_STRENGTH.includes(rule.loginMethod), 'login rules must declare how login was proven')
     } else {
       assert.equal(rule.loginMethod, undefined, 'only a login rule may declare a login method')
     }
@@ -341,7 +439,7 @@ t('a row carries only columns product_check_run has, with legal values', () => {
   assert.equal(r.source, SOURCE)
   assert.equal(r.run_url, 'https://github.example/o/r/actions/runs/1')
   for (const f of FIELDS) assert.ok([OK, FAILED, NOT_TESTED].includes(r[f]), `${f}=${r[f]} breaks the CHECK constraint`)
-  assert.ok(['magic-link-browser', 'otp-email', 'none'].includes(r.login_method))
+  assert.ok([...LOGIN_METHOD_STRENGTH, 'none'].includes(r.login_method))
   assert.ok(Array.isArray(r.failures))
   assert.ok(!('_loginRule' in r), 'internal bookkeeping must not reach the insert')
 })
