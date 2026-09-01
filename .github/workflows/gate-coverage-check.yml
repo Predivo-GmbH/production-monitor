@@ -24,6 +24,14 @@ jobs:
         env:
           # classic PAT with repo:read across the Arivioo org (same secret the drift check uses)
           GH_TOKEN: ${{ secrets.FLEET_READ_TOKEN || secrets.DASHBOARD_PAT }}
+          # The guard said "exit 1 + alert" and had no mail code, and this workflow had no alert
+          # step and no heartbeat, so its findings could only ever be a red run nobody watches
+          # (2026-09-01 audit). Same secrets monitor.yml sends its alert with.
+          ALERT_SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          ALERT_SMTP_PORT: '465'
+          ALERT_SMTP_USER: ${{ secrets.SMTP_USER }}
+          ALERT_SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          ALERT_TO: rogmueller1976@gmail.com
           # DB-backed fleet (getFleet). Optional: absent -> getFleet falls back to the hardcoded list.
           BACKOFFICE_SUPABASE_URL: ${{ secrets.BACKOFFICE_SUPABASE_URL }}
           BACKOFFICE_SERVICE_ROLE_KEY: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}

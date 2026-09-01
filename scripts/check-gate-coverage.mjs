@@ -107,6 +107,32 @@ const required = FLEET.filter((p) => p.gates === 'required').length
 console.log(`\nCoverage: ${okList.length}/${required} required apps enrolled + green · ${pending.length} pending · ${violations.length} broken.`)
 
 if (violations.length) {
+  // THE ALERT THIS FILE PROMISED AND NEVER HAD. Line 81 says "exit 1 + alert" and there was no
+  // mail code in this script at all (2026-09-01 audit: grep for sendMail/SMTP returned 0), while
+  // gate-coverage-check.yml carried neither an alert step nor a healthchecks heartbeat. So a real
+  // finding - on 2026-08-31 this guard caught BoatBuddy's staging gates broken - reached nobody
+  // but a red workflow run. Same shape as the RLS and auth-email guards fixed the same day.
+  if (!process.env.ALERT_SMTP_HOST) {
+    console.error('NOT EMAILED: ' + violations.length + ' project(s) with broken gates were found and ALERT_SMTP_HOST is unset, so nobody was told. Wire the mail secrets in this workflow.')
+  } else {
+    try {
+      const { createMailTransport } = await import('./lib/smtp.mjs')
+      const t = await createMailTransport({
+        host: process.env.ALERT_SMTP_HOST,
+        port: process.env.ALERT_SMTP_PORT,
+        user: process.env.ALERT_SMTP_USER,
+        pass: process.env.ALERT_SMTP_PASS,
+      })
+      await t.sendMail({
+        from: 'Gate Coverage Guard <' + process.env.ALERT_SMTP_USER + '>',
+        to: process.env.ALERT_TO,
+        subject: '[ALERT] ' + violations.length + ' product(s) with a broken staging-gate harness',
+        html: '<p>These products are enrolled in the v11 staging gates and their latest gate run is not green, so nothing is checking them before a release:</p><ul>' + violations.map((v) => '<li><b>' + v.name + '</b> - latest run ' + v.conclusion + '</li>').join('') + '</ul>',
+      })
+    } catch (e) {
+      console.error('alert email failed:', e.message)
+    }
+  }
   console.error(`\nFAIL: ${violations.length} enrolled project(s) with a broken v11 gate run.`)
   process.exit(1)
 }
