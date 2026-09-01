@@ -215,6 +215,23 @@ t('an empty who_must_act degrades to a safe, ownable action', () => {
   assert.equal(r.value, 'Claude - investigate manually')
 })
 
+t('a closer-written Roger owner is KEPT when no gate fires — never re-derived back to Claude', () => {
+  // The misroute behind board-drainer-human-hands-regex-matches-billing-nouns: a human-owned
+  // task with no hard gate ("enter the figures only Roger knows") was demoted to Claude on
+  // every stuck pass, so a write-enabled run kept grabbing work it could never finish.
+  const r = stuckWhoMustAct('Roger - open the recurring_costs registry in BackOffice and enter the amount + renewal date for the 4 UNVERIFIED rows.')
+  assert.equal(r.owner, 'Roger')
+  assert.match(r.value, /^Roger - open the /)
+})
+
+t('a Roger prefix the sentence itself DISOWNS still goes back to Claude', () => {
+  // Same split as classify(): "blocked only because that run had no write tools" is a fact
+  // about the RUN, never about the owner — the row re-queues to a write-enabled run.
+  const r = stuckWhoMustAct('Roger - re-dispatch to a write-authorized run — NOT a Roger gate: no decision/secret/payment/OAuth')
+  assert.equal(r.owner, 'Claude')
+  assert.match(r.value, /^Claude - re-dispatch/)
+})
+
 
 // ── a scout item must NEVER reach the incidents board ────────────────────────────────
 // monitoring_incidents.source CHECK allows only

@@ -1,5 +1,6 @@
-// send-automation-resolved.mjs — Emails when previously-escalated workflows (red >48h)
-// are green again. Reads /tmp/automation-resolved.json produced by automation-status.mjs
+// send-automation-resolved.mjs — Emails when previously-escalated workflows (red beyond
+// their cadence-relative escalation threshold) are green again. Reads
+// /tmp/automation-resolved.json produced by automation-status.mjs
 // (diff against the previously published report). Counterpart to send-automation-alert.mjs.
 //
 // The hourly local auto-fix re-dispatches dashboard-update.yml after fixing an

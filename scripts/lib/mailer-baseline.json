@@ -236,9 +236,9 @@
           "env": "production",
           "ref": "ogdpgufptemcgyszmjek",
           "config": "required",
-          "traffic": "postmark",
+          "traffic": "none",
           "postmarkServer": "SignalScore",
-          "maxSilenceHours": 168
+          "trafficNote": "Real-customer mail is event-driven (signup OTPs, invites, SHAB alerts for 2 watched companies) and organically silent for weeks: org signups 2026-07-21 -> 2026-08-17 -> 2026-08-24 (a 27d gap), and zero new orgs or credit checks since 2026-08-24 (PostgREST, re-read 2026-09-01). Test/OTP mail is deliberately routed via Metanet off Postmark (emailClient TEST_RECIPIENT_PATTERNS), so Postmark history moves only on real customer mail and the 168h budget false-fired on 2026-09-01 with zero intervening mail demand. Last real send 2026-08-24T21:14Z, ~1min after the signup that created its org at 21:13Z; the production-monitor E2E OTP probe (green 2026-08-31T13:47Z, run 33398398479) is the live send-proof. The config/transport legs of this guard still fail hard for this product."
         },
         {
           "env": "staging",

@@ -1386,7 +1386,7 @@ The guard enforces: hard-coded allowlist (ReplyFlow monitor-sync-health; BackOff
 ${DEPLOY_DENY_POLICY_NOTE.trim()}
 
 FINAL ACTION (required): use the Write tool to write ${VERDICT_PATH.replace(/\\/g, '/')} as JSON:
-{"class":"A-INFRA|B-PRODUCT-STAGED|C-CLOSED|D-ESCALATE","status":"fixed|self-healed|blocked|investigating","action":"what you did (commit sha / PR url / deploy run / none)","receipt":"the concrete verification that proves it (repro output / live check / green run id) — REQUIRED to set status=fixed/self-healed","who_must_act":"Roger - <one-line> (only if status=blocked, else null)","diagnosis":"1-3 sentences"}`
+{"class":"A-INFRA|B-PRODUCT-STAGED|C-CLOSED|D-ESCALATE","status":"fixed|self-healed|blocked|investigating","action":"what you did (commit sha / PR url / deploy run / none)","receipt":"the concrete verification that proves it (repro output / live check / green run id) — REQUIRED to set status=fixed/self-healed","who_must_act":"required when status=blocked, else null — and the OWNER PREFIX must name the real blocker: 'Roger - <one-line naming the human gate>' ONLY when a genuine human gate blocks it (prod-deploy-guard allowlist, payment, OAuth, a secret, a business decision); 'Claude - <the reason, named>' when the blocker is THIS RUN's missing tools or permissions (a capability block re-queues to a write-enabled run — it is never Roger's)","diagnosis":"1-3 sentences"}`
 
 function buildUserPrompt(inc) {
   return [
@@ -1428,7 +1428,7 @@ function dispatchAgent(inc, mode) {
   // FIX mode + LIVE gets write/deploy verbs; VERIFY mode is read-only (can only close-if-green or escalate).
   const canWrite = LIVE && mode === 'fix'
   const allowedTools = (canWrite ? [...READ_ONLY, ...WRITE] : READ_ONLY).join(',')
-  const VERIFY_NOTE = '\n\n🔎 VERIFY-ONLY mode: you may ONLY (C) confirm the source is GREEN now and CLOSE it (status=self-healed, with a real receipt), or (D) ESCALATE (status=blocked, who_must_act for Roger). You may NOT fix, edit, deploy, or open PRs — you have no write tools.'
+  const VERIFY_NOTE = '\n\n🔎 VERIFY-ONLY mode: you may ONLY (C) confirm the source is GREEN now and CLOSE it (status=self-healed, with a real receipt), or (D) ESCALATE (status=blocked). You may NOT fix, edit, deploy, or open PRs — you have no write tools. When you escalate, name the OWNER honestly: if the blocker is that THIS run lacks write tools, who_must_act is "Claude - <what a write-enabled run must do>" — a capability block re-queues to a write-enabled run, it is NOT a Roger gate. Only a genuine human gate (payment, OAuth, a secret, a decision, the prod-deploy-guard allowlist) earns "Roger - <which gate>".'
   const DRY_NOTE = '\n\n⚠️ DRY RUN: investigate READ-ONLY. Do NOT edit/commit/push/deploy/open PRs. Write ONLY the verdict file, and in "action" describe what you WOULD do, prefixed "[DRY-RUN would] ".'
   let policy = SYSTEM_POLICY
   if (mode === 'verify') policy += VERIFY_NOTE
@@ -1519,17 +1519,29 @@ function verdictToUpsert(inc, verdict, parkedBefore = null) {
 }
 
 /** Pure form of the stuck-escalation ownership decision, exported for tests.
- *  Strips any previous stuck prefix (so it can never compound) and keeps the original owner
- *  unless the remaining action genuinely needs Roger's hands. */
+ *  Strips any previous stuck prefix (so it can never compound) and then KEEPS a closer-written
+ *  owner prefix instead of re-deriving one — a human who wrote "Roger - …" meant it, and the
+ *  old re-derivation flipped those rows back to Claude on every stuck pass, so a write-enabled
+ *  run kept grabbing work it could never finish. Two exceptions, both mirroring classify():
+ *  a hard GATE always outranks any prefix (a secret rotation is Roger's no matter what the
+ *  prefix says — the old noun list re-owned "delete deploy.yml:864" to Roger every time an item
+ *  went stuck, which is how a one-line CI edit acquired a human owner), and a Roger prefix the
+ *  sentence itself DISOWNS ("…NOT a Roger gate: no decision/secret/payment/OAuth") means the
+ *  block was that RUN's missing write tools, so the row goes back to Claude. Only when there is
+ *  no explicit owner at all is one derived from the gates. */
 export function stuckWhoMustAct(whoMustAct) {
-  const priorAction = String(whoMustAct || 'investigate manually')
+  const stripped = String(whoMustAct || 'investigate manually')
     .replace(/^(?:Roger|Claude)\s*[-:]\s*board-drainer could not resolve after \d+ tries;\s*/gi, '')
     .replace(/^(?:Roger|Claude)\s*[-:]\s*auto-fix stuck[^;]*;\s*/gi, '')
-    .replace(/^(?:Roger|Claude)\s*[-:]\s*/i, '')   // strip the owner prefix; it is re-added below, so it must not double up
     .trim()
-  // Same gate as classify(), for the same reason: the old noun list re-owned "delete deploy.yml:864"
-  // to Roger every time an item went stuck, which is how a one-line CI edit acquired a human owner.
-  const owner = gateFor({ who_must_act: priorAction }) ? 'Roger' : 'Claude'
+  const pm = stripped.match(/^(Roger|Claude)\s*[-:]\s*/i)
+  const explicitOwner = pm ? pm[1][0].toUpperCase() + pm[1].slice(1).toLowerCase() : null
+  const priorAction = (pm ? stripped.slice(pm[0].length) : stripped).trim()
+  // Same gate as classify(), for the same reason.
+  const gate = gateFor({ who_must_act: priorAction })
+  const owner = gate ? 'Roger'
+    : explicitOwner === 'Roger' && CAPABILITY_REASON.test(priorAction) ? 'Claude'
+    : explicitOwner || 'Claude'
   return { owner, priorAction, value: `${owner} - ${priorAction}` }
 }
 
@@ -1933,7 +1945,10 @@ async function main() {
         await markScoutReport(secret, inc.scoutReportId, { state: 'real', state_reason: `auto-fix stuck after ${attempts} attempts: ${priorAction}`.slice(0, 500), worked_at: new Date().toISOString() })
       } else {
         await upsertIncident(secret, {
-          p_source: inc.source, p_key: inc.key, p_title: inc.title, p_severity: 'critical', p_status: 'blocked',
+          // Carry the incident's own severity through: being stuck is a fact about the FIX,
+          // not a promotion of the PROBLEM to critical — a warning item that could not be
+          // auto-fixed is still a warning.
+          p_source: inc.source, p_key: inc.key, p_title: inc.title, p_severity: inc.severity || 'warning', p_status: 'blocked',
           p_root_cause: `[board-drainer] auto-fix STUCK after ${attempts} attempts — the action below still stands, it just could not be applied automatically. It is retried automatically within ${PARKED_RETRY_INTERVAL_MS / 3600_000}h, or immediately with "Hand to Claude" on /signals.`,
           p_who_must_act: stuckWho,
           p_evidence: {
