@@ -27,6 +27,7 @@
  * it manufactures confidence.
  */
 import { writeFileSync } from 'node:fs'
+import { auditRunnerMachines, loadExpectedMachines } from './lib/runner-machines.mjs'
 
 const OWNER = process.env.CI_RUNNER_OWNER || 'Predivo-GmbH'
 const TOKEN = process.env.GH_TOKEN || process.env.GITHUB_TOKEN
@@ -128,10 +129,14 @@ if (!repos.length) {
 const flipped = []
 const alerts = []
 let migrated = 0
+// Kept so the per-MACHINE audit below can ask a question this loop structurally cannot: the loop
+// asks "does this repository have an online runner", and two machines share that one number.
+const perRepo = []
 
 for (const repo of repos) {
   const runners = await gh(`repos/${OWNER}/${repo}/actions/runners`)
   const list = runners?.runners || []
+  perRepo.push({ repo, runners: list })
   if (!list.length) continue // never migrated: nothing to watch, leave it alone
   migrated++
 
@@ -180,6 +185,19 @@ if (apiErrors) {
   bail(`${apiErrors} API call(s) failed - this run cannot certify the fleet`)
 }
 
+// PER MACHINE, not per repository. The check above is satisfied by ONE online runner in a repo,
+// and we run two machines whose runners share that number - so when all 24 of the office PC's
+// runners were deregistered on 2026-08-25, the laptop kept every repository above zero and this
+// watchdog reported PASS for a week with half the fleet's CI capacity gone. See
+// scripts/lib/runner-machines.mjs. Deliberately NOT wired to the RUNNER_LABEL flip: a missing
+// machine is a thing to tell Roger about, not a reason to start paying GitHub while the other
+// machine is working perfectly well.
+const machineAudit = auditRunnerMachines(perRepo, { expected: loadExpectedMachines() })
+alerts.push(...machineAudit.alerts)
+for (const [machine, coveredRepos] of Object.entries(machineAudit.machines)) {
+  console.log(`machine ${machine.padEnd(16)}: online in ${coveredRepos.length} repo(s)`)
+}
+
 console.log(`repos with runners : ${migrated}`)
 console.log(`variable flips     : ${flipped.length ? flipped.join(', ') : 'none'}`)
 console.log(`apply mode         : ${APPLY ? 'on (variables are changed)' : 'off (report only)'}`)
@@ -189,6 +207,7 @@ console.log(`apply mode         : ${APPLY ? 'on (variables are changed)' : 'off 
 writeFileSync('ci-runner-findings.json', JSON.stringify({
   generated_at: new Date().toISOString(),
   repos_with_runners: migrated,
+  machines: machineAudit.machines,
   flips: flipped,
   findings: alerts,
 }, null, 2))

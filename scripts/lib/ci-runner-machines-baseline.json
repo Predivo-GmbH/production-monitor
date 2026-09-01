@@ -1,0 +1,9 @@
+{
+  "_why": "The machines that are supposed to be running our CI. The runner watchdog counted online runners PER REPOSITORY and was satisfied by one, so when all 24 of the office PC's runners were deregistered on 2026-08-25 the laptop kept every repository's count above zero and nothing alarmed for a week. This file is what makes a whole machine's absence visible.",
+  "_naming": "Runners are registered as wsl-<MACHINE>-<repo>[-N]. The MACHINE here is the Windows machine name, exactly as it appears in that registration.",
+  "_adding_a_machine": "Add its name here in the same commit that registers its runners, otherwise the watchdog reports it as UNKNOWN MACHINE.",
+  "machines": [
+    "DESKTOP-124K6MV",
+    "LAPTOP-88N97BGG"
+  ]
+}
