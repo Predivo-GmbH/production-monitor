@@ -7,6 +7,7 @@ import assert from 'node:assert'
 import { fileURLToPath } from 'node:url'
 import {
   classifyChecks, signalFor, readHcKeys, planSignals, recoveredCheckKeys, ROLLUP_KEY, ROLLUP_THRESHOLD,
+  checksFrom,
 } from '../scripts/check-healthchecks-down.mjs'
 
 let n = 0
@@ -205,6 +206,31 @@ t('the rollup key is never resolved here even if it is somehow a known slug — 
     openKeys: set(ROLLUP_KEY), allCheckKeys: set(ROLLUP_KEY), downKeys: set(),
   })
   assert.deepEqual(keys, [])
+})
+
+
+// ── A 200 WITH NO CHECK LIST IS A FAILED READ (2026-09-01 audit) ─────────────────────────────
+// The old line was `return (body.checks || []).map(...)`. Zero checks means nothing is down,
+// which clears the rollup, and main() then files "Everything that was dark is checking in again".
+// A malformed response wrote a positive all-clear over a live outage. Each assertion below fails
+// against that version.
+
+t('a 200 whose body has no check list THROWS instead of reporting an empty fleet', () => {
+  assert.throws(() => checksFrom({}, 'primary'), /no check list/)
+  assert.throws(() => checksFrom({ checks: null }, 'primary'), /no check list/)
+  assert.throws(() => checksFrom({ result: [] }, 'primary'), /nothing could be judged/)
+  assert.throws(() => checksFrom(null, 'primary'), /no check list/)
+})
+
+t('a genuinely empty check list is still a read, not a throw', () => {
+  assert.deepEqual(checksFrom({ checks: [] }, 'primary'), [])
+})
+
+t('a real list is tagged with its account, unchanged', () => {
+  const out = checksFrom({ checks: [{ name: 'x', status: 'down' }] }, 'ci')
+  assert.equal(out.length, 1)
+  assert.equal(out[0].account, 'ci')
+  assert.equal(out[0].status, 'down')
 })
 
 console.log(`\n${n} tests passed.`)

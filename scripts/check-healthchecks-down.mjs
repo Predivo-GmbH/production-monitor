@@ -219,11 +219,31 @@ export function planSignals(down, now = Date.now()) {
   }
 }
 
+/**
+ * A 200 THAT CARRIES NO CHECK LIST IS A FAILED READ, NOT AN EMPTY FLEET (2026-09-01 audit).
+ *
+ * This used to end `return (body.checks || []).map(...)`, so any 200 whose body lacked a `checks`
+ * array - a renamed field, an error object, an HTML interstitial from a proxy - produced ZERO
+ * checks. Zero checks means nothing is down, which means the rollup is cleared, and main() then
+ * FILES a signal reading "The scheduled jobs are running again / Everything that was dark is
+ * checking in again". So a malformed response did not merely go quiet: it wrote a positive
+ * all-clear over a live outage and cancelled any page still inside its self-heal window.
+ *
+ * The file's own contract, stated in its header, is "Exit 1 = could not tell, which is never
+ * fine". `|| []` was the one place that contract did not hold. A throw here fails the run, which
+ * is the documented behaviour for an unreadable account.
+ */
+export function checksFrom(body, label) {
+  if (!body || !Array.isArray(body.checks)) {
+    throw new Error(`healthchecks account "${label}" answered 200 with no check list, so nothing could be judged`)
+  }
+  return body.checks.map((c) => ({ ...c, account: label }))
+}
+
 async function fetchChecks({ label, key }) {
   const res = await fetch(HC_API, { headers: { 'X-Api-Key': key, 'User-Agent': NON_BROWSER_UA } })
   if (!res.ok) throw new Error(`healthchecks account "${label}" -> HTTP ${res.status}`)
-  const body = await res.json()
-  return (body.checks || []).map((c) => ({ ...c, account: label }))
+  return checksFrom(await res.json(), label)
 }
 
 async function boGet(secret, path) {
