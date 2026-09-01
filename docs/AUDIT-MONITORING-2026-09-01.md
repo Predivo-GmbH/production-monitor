@@ -181,6 +181,103 @@ never catch a false GREEN. Fixed in BackOffice `1792873`, symmetric now, dead ro
 the decision block was run as a truth table: exit 0 with no marker returns 126 and pings failure
 (the case that was green before), exit 0 with marker 0, exit 1 with marker 0, exit 1 without 1.
 
+### F17 — Of the 24 alarms that ever asked to ring the phone, 21 never rang · FIXED
+
+Everything above audits SENSORS. This is the first measurement of the ARRIVAL path, and it is the
+answer to the question that opened this document. Read from production `fleet_signals`, not code:
+
+* **24** signals have EVER qualified to page — `needs_human = true` AND `severity = 'critical'`,
+  the only combination `upsert_signal` will arm.
+* **21 of the 24 never rang.**
+* **18** of those carry `page_suppressed_reason = 'routed-to-work-board'` with `paged_at IS NULL`.
+
+Verbatim titles from the 18: *"SignalScore production mailer silent >168h"* (a week of dead
+customer mail), *"Five products' Supabase management tokens are dead"*, *"One dev branch with no
+upstream switched off all 24 scheduled jobs for 9.5 hours"*, *"BackOffice share-link returns every
+column of project_access_requests to a token holder"*, *"All 25 guard hooks are silently switched
+off on this laptop"*.
+
+`upsert_signal` does not send a page, it SCHEDULES one at `now() + 15 min` — the self-heal window
+that removed 235 of 236 alerts from Roger's life — and a 5-minute sweep delivers it. The
+board-drainer runs HOURLY, and when it handed a finding to the work board it PATCHed
+`page_due_at = null` unconditionally, with no test for whether the page had ever been delivered.
+Any page still inside its own window was cancelled BY US, one hop before delivery, and stamped
+with a reason that reads like a successful hand-off. The old code said so and thought it was fine:
+*"upsert_signal treats both as closed for paging, so the pending page is cancelled either way."*
+
+The premise under that sentence is that the work board is where Roger finds out. It is not. The
+work board is a page he has to open, exactly like `/signals`. **Both are pull. The page was the
+only push in the system, and the hand-off deleted it.**
+
+> **A hand-off changes where the work lives. It never decides that he was told.**
+
+Fixed in `9915d75` (`pageFieldsOnSupersede`) — 9 assertions, 5 watched to fail against the old
+code. **The code fix alone does nothing**, and believing otherwise is how this gets "fixed" while
+staying broken: `due_pages()` filters `state in ('open','acknowledged')`, so a superseded row
+would keep a `page_due_at` no sweep ever looks at — armed-looking, forever, and silent, which is
+worse than the bug because it reads as green. The other half is BackOffice migration
+`156_a_handoff_is_not_a_delivery.sql`, which readmits exactly the one marker this path writes.
+Roger's own dismissals stay silent: he has already seen those.
+
+### F18 — The alarm on the auto-fixer called a 95%-abandoned board "working" · FIXED
+`check-drainer-progress.mjs` asserts three things and its own header excluded a fourth by design:
+*"A parked item is NOT dispatchable and never counts."* `dispatchable` is a number the DRAINER
+computes after removing everything it has decided to stop trying — so the drainer marked its own
+homework, and a board it had given up on entirely produced the same numbers as a clean one.
+
+Proven by injection with the LIVE heartbeat of 2026-09-01 18:08 (`considered 38, dispatchable 1,
+dispatched 1, parked 36`): the old `judgeDrainer` returned `ok` — *"The fleet auto-fixer is
+working"* — with 36 findings no machine will ever touch again. Parked items carry
+`needs_human=false`, so they cannot page and never reach the work board either; they exist only on
+`/signals`.
+
+This is the 2026-08-24 incident in a second costume. Then three stuck items ate the per-run budget
+and 34 incidents waited behind them; the fix taught this script to ask *"is dispatchable work being
+dispatched?"*. The drainer now PARKS stuck items instead of retrying them — correct behaviour — and
+the same incidents sit untouched on the other side of the same green alarm. Parking is not wrong;
+giving up **quietly** is. New `given-up` verdict on a SHARE rather than a count (so a quiet week
+cannot tune it away), plus `unknown` when the drainer stops publishing the number at all — an
+absent count is never read as zero. 7 new cases, each watched to fail.
+
+### F19 — Nothing ever asked whether an alarm could reach anybody · FIXED
+Every sensor in this repo asks whether the thing it watches is healthy. None asked whether, having
+found something, it could TELL anyone. That question has now failed three separate ways — F17, F7,
+and this — and every one was found by a person reading the database.
+
+`upsert_signal`'s first suppressor is `if pol.source is null or not pol.may_page then reason :=
+'policy-off'`. A source nobody added to `signal_page_policy` is muted absolutely, and the column
+then reads like a decision somebody made. Migration 155 found `healthchecks` in exactly this state
+— eleven scheduled jobs dark for two days, the phone never rang once — and wrote *"Not switched
+off: NEVER ADDED."* Measured across every signal ever filed: **17 of the 23 sources that have
+written to this board still have no row**, and six have already filed something page-worthy
+(rows / asked to page / stamped policy-off):
+
+| source | rows | asked to page | policy-off |
+|---|---|---|---|
+| `commit-review` | 132 | 3 | 70 |
+| `sentry` | 34 | 1 | 13 |
+| `cron` | 29 | 2 | 12 |
+| `monitoring-hygiene` | 18 | 0 | 18 |
+| `store-merge` | 4 | 3 | 4 |
+| `board-drainer` | 1 | 0 | 0 |
+
+`sentry` is the feed of errors real customers are hitting. It has never once been able to reach
+anybody.
+
+New hourly sensor `check-alarm-reachability.mjs` (11 assertions). It reports a source that has
+filed something critical needing a person while unarmed, and any OPEN critical carrying
+`needs_human=false` — a contradiction, not a threshold: the producer graded it the worst class of
+thing and simultaneously said nobody need be told. It files under `production-monitor`, which is
+armed, **never under the source it is reporting on**: an alarm about a mute source, filed into that
+mute source, is silent by construction. A read that fails exits non-zero; an empty board is
+`unknown`, never `ok`, because this board is never empty.
+
+**It arms nothing, deliberately.** What rings Roger's phone is his choice, made with the two
+buttons on `/signals` that call `set_page_policy`, and an agent arming sources on his behalf is the
+default-nobody-chose failure the design exists to prevent. The design assumed he would SEE the
+question; the finding of this audit is that he does not. So the question now arrives by push and he
+still decides.
+
 ---
 
 ## Open leads from the 2026-09-01 parallel sweep
@@ -231,9 +328,27 @@ UX scout, factory engine and commit review.
 
 ## Not yet audited
 
-11 of the 18 `scripts/check-*.mjs` sensors have not been examined one by one against the two
-questions (`check-auth-email-config`, `check-rls-grants` and `check-cron-heartbeats` were, and the
-first two are the subject of F9). Also outstanding: the 22 healthchecks.io checks mapped to what each actually proves;
-the remaining Cockpit tiles and their feeds; the alert-to-inbox path end to end (F6 is the finding
-that this path is the weak one, not the sensors); and whether any scheduled job's own failure can
-go unnoticed the way the monitor's did.
+**The alert-to-inbox path is no longer on this list.** F6 named it as the weak one and F17-F19
+measured it end to end; that was the right instinct and it was worse than F6 described. What
+remains:
+
+* **11 of the 18 `scripts/check-*.mjs` sensors** have not been put one by one against the two
+  questions. Audited so far: `check-products-down`, `check-auth-email-config`, `check-rls-grants`,
+  `check-cron-heartbeats`, `check-gate-coverage`, `check-workflow-cadence`,
+  `check-healthchecks-down`, `check-supabase-machine-health`, `check-drainer-progress`. The
+  parallel sweep produced ~22 unverified leads against the rest (see Open leads); **a lead is not
+  a finding.**
+* **The 22 healthchecks.io checks**, mapped to what each one actually proves.
+* **The remaining Cockpit tiles and their feeds.**
+* **Delivery itself** — that an armed page reaches Roger's phone and inbox — is proven WEEKLY by
+  `BackOffice/.github/workflows/alert-drill.yml`, not by anything here. Last scheduled run
+  2026-08-26 06:15Z, green, both channels. Note carefully why that drill passing every week did
+  not catch F17: the drill exercises the pipe using ONE source that is armed and never handed to
+  the work board. It proves the pipe. It proves nothing about whether the other 22 sources are
+  connected to it, which is exactly the gap `check-alarm-reachability.mjs` now covers.
+
+**The methodological finding, and the reason this document should be read before the next audit.**
+Every fixed item here was found by MEASURING a live system — a probe run against the real
+endpoint, a fixture built from a real heartbeat, a query against the production table. Every item
+still open was found by READING, and reading is how the three checks in F1-F3 passed review while
+being blind. The distance between the two lists is the distance between an opinion and a fact.
