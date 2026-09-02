@@ -16,8 +16,17 @@ import { test, expect } from '@playwright/test';
  * already owns alerting. (Health Monitor = on-demand LIVE-PROD health view; this = STAGING
  * regression alert — different target, complementary, not duplicative.)
  *
- * A red nightly means a real-login / integration / E2E gate regressed against staging:
- * do NOT promote that product to production until it is fixed.
+ * A red nightly means ONE OF THIS PRODUCT'S GATES FAILED, and this file does not know which until
+ * it asks. It used to say "a real-login / integration / E2E gate regressed against staging" here
+ * and in the alert text, for every red run whatever caused it. On 2026-09-02 that sentence was
+ * wrong on both products it fired for: Valrano run 33592350429 and ReplyFlow run 33592503987 had
+ * gate-e2e GREEN and only gate-security red, on a browserslist advisory that `npm audit fix`
+ * clears. The alert sent somebody to debug end-to-end tests that were passing, and it nearly
+ * stopped a release that had nothing wrong with it.
+ *
+ * So the alert NAMES THE JOB THAT FAILED and states no cause beyond that, and when the job list
+ * cannot be read it says so instead of guessing. An alarm that asserts the wrong cause with full
+ * confidence is worse than no alarm, because people act on it.
  *
  * Defensive by design: only a definitive 'failure'/'timed_out' conclusion alerts. A GitHub
  * API error, no-run-yet (first nightly hasn't fired), an in-progress run, or a 'cancelled'
@@ -112,21 +121,33 @@ for (const repo of TIERED_REPOS) {
     // 2026-09-02: gate-integration/edge-typecheck/e2e all green, only gate-security red).
     // Defensive: any error resolving the job list → fall back to a generic phrasing, never block
     // the alert or SKIP on it.
-    let failedGates = 'one or more gates';
+    // A FAILED READ IS SAID OUT LOUD, never smoothed into a plausible sentence. "one or more
+    // gates regressed against staging" reads like a finding; it is the absence of one.
+    let whatFailed = 'the failing job could not be read from GitHub, so this alert cannot say which gate it was';
     const jobsRes = await request.get(
       `https://api.github.com/repos/${repo}/actions/runs/${latest.id}/jobs?per_page=100`,
       { headers: { Authorization: `Bearer ${ghToken}`, Accept: 'application/vnd.github.v3+json' } },
     );
     if (jobsRes.ok()) {
-      const failed = ((await jobsRes.json()).jobs ?? [])
-        .filter((j: { conclusion: string }) => ['failure', 'timed_out'].includes(j.conclusion))
-        .map((j: { name: string }) => j.name);
-      if (failed.length) failedGates = `the ${failed.join(', ')} gate(s)`;
+      const jobs = (await jobsRes.json()).jobs ?? [];
+      const failed = jobs.filter((j: { conclusion: string }) => ['failure', 'timed_out'].includes(j.conclusion));
+      // The failing STEP is what a person needs; "gate-security" alone still sends them looking.
+      const named = failed.map((j: { name: string; steps?: Array<{ name: string; conclusion: string }> }) => {
+        const step = (j.steps ?? []).find((s) => ['failure', 'timed_out'].includes(s.conclusion));
+        return step ? `${j.name} (step "${step.name}")` : j.name;
+      });
+      if (named.length) {
+        whatFailed = `the job(s) that failed: ${named.join('; ')}`;
+      } else {
+        // The run is red and no job is. That is a real state (a workflow-level failure, a
+        // cancelled matrix) and it is not the same as "we did not look".
+        whatFailed = 'the run is red but no individual job reports a failure, so the fault is at the workflow level';
+      }
     }
 
     expect(
       isFail && persistent,
-      `${repo} NIGHTLY GAUNTLET PERSISTENTLY FAILING — ${failedGates} regressed against staging and the auto-retry did NOT recover it (attempt ${attempt}, ${ageHours.toFixed(1)}h, ${latest.html_url}). Do NOT promote ${repo} to production until fixed.`,
+      `${repo} NIGHTLY GAUNTLET PERSISTENTLY FAILING — ${whatFailed}. The auto-retry did not recover it (attempt ${attempt}, ${ageHours.toFixed(1)}h, ${latest.html_url}). Read that job before promoting ${repo} to production; whether it blocks the promotion depends on which gate it is.`,
     ).toBe(false);
   });
 }

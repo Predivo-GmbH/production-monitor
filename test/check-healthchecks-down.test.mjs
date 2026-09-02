@@ -7,6 +7,7 @@ import assert from 'node:assert'
 import { fileURLToPath } from 'node:url'
 import {
   classifyChecks, signalFor, readHcKeys, planSignals, recoveredCheckKeys, ROLLUP_KEY, ROLLUP_THRESHOLD,
+  idNote,
   checksFrom,
 } from '../scripts/check-healthchecks-down.mjs'
 

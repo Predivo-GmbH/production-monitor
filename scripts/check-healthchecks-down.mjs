@@ -134,6 +134,34 @@ export function classifyChecks(checks, now = Date.now()) {
   return { down, neverPinged, quiet }
 }
 
+/**
+ * A CHECK'S ID AT HEALTHCHECKS IS NOT ITS NAME, and on one check the two have nothing to do with
+ * each other. Measured across both accounts on 2026-09-02: 28 checks, 7 where the id does not
+ * follow the name. Six of those simply have no slug set, so everything here already falls back to
+ * the name and nothing is confusing. The seventh is the one that has cost time twice:
+ *
+ *     name "production-monitor (hourly)"  ->  slug "my-first-check"
+ *
+ * `my-first-check` is the name healthchecks.io gives the very first check on a new account. The
+ * check was renamed; the id was not. So the id of the fleet's central hourly monitor reads like a
+ * leftover demo, every key derived from it does too, and a session looking for a check called
+ * "production-monitor-hourly" finds nothing and concludes the alarm does not exist. That already
+ * happened to the CI Cost Guard, where a slug-keyed search missed a working alarm and a session
+ * paused it.
+ *
+ * Nothing here renames anything: the ping URL is what the job actually calls, and quietly changing
+ * an id to tidy a label is how a live dead-man switch gets switched off by accident. Instead every
+ * row this file writes carries BOTH, and says out loud when they disagree, so the id can never be
+ * read as evidence about what the check is.
+ */
+export function idNote(check) {
+  const slug = check.slug
+  if (!slug) return ''
+  const expected = String(check.name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+  if (slug === expected) return ''
+  return ` Its id at healthchecks is "${slug}", which is not its name - that is an old id, not a different check.`
+}
+
 /** What a DOWN check says on the cockpit, in words that name the consequence. */
 export function signalFor(check, now = Date.now()) {
   const silent = minsSince(check.last_ping, now)
@@ -150,8 +178,8 @@ export function signalFor(check, now = Date.now()) {
     state: 'open',
     needs_human: true,
     title: `Scheduled job stopped running: ${check.name}`,
-    summary: `${howLong} ${check.desc ? check.desc : 'Whatever this job does is not happening.'}`.trim(),
-    detail: { slug: check.slug, status: check.status, last_ping: check.last_ping, tags: check.tags || '' },
+    summary: `${howLong} ${check.desc ? check.desc : 'Whatever this job does is not happening.'}${idNote(check)}`.trim(),
+    detail: { name: check.name, slug: check.slug, status: check.status, last_ping: check.last_ping, tags: check.tags || '' },
     link: 'https://cockpit.predivo.ch/signals',
   }
 }
@@ -198,7 +226,12 @@ export function planSignals(down, now = Date.now()) {
   const summary = (gate
     ? `${GATE_CHECKS[gate]}. That is one fault, not ${down.length}, so this is the only alert for it. `
     : `They stopped inside the same window, so this is most likely one cause and not ${down.length}. `)
-    + `Dark right now: ${names.join(', ')}.`
+    // THE LIST HE READS IS A LIST OF NAMES. The line above says he should not have to know what a
+    // healthchecks slug is, and then this sentence printed slugs at him - including
+    // "my-first-check", which is the fleet's central hourly monitor wearing the id healthchecks
+    // hands the first check on a new account. Names here; the ids stay in `detail`, where a machine
+    // reads them.
+    + `Dark right now: ${down.map((c) => c.name || c.slug).join(', ')}.`
 
   return {
     rollup: {
