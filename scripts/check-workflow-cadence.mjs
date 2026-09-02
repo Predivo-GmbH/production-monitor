@@ -120,12 +120,95 @@ async function gh(pathname, token) {
   return res.json()
 }
 
+/**
+ * THE SAME QUESTION, ONE LAYER OUT: did the FLEET's scheduled workflows run? (added 2026-09-02)
+ *
+ * The per-repo half above reads this repo's cron files. It cannot help the rest of the fleet, and
+ * the rest of the fleet has the same hole: pull-engine's weekly technical-floor gate carries a
+ * heartbeat step guarded by `if [ -n "$HC_URL" ]` and the secret it reads, HC_PING_TECH_FLOOR,
+ * does not exist in that repo - enumerated its 11 secrets on 2026-09-02, not searched for a name.
+ * So that dead-man switch has never pinged anything, and if the gate stopped running nothing would
+ * say so.
+ *
+ * The cadence is MEASURED rather than parsed here, deliberately: reading every fleet repo's YAML
+ * would cost a content fetch per workflow and would still be a guess about what GitHub does with
+ * it. The gap between a workflow's own last few scheduled runs is what it actually does. Overdue
+ * is the same 3x rule the per-repo half uses, so one dropped tick is never an alarm.
+ *
+ * A workflow with fewer than three scheduled runs in its history is NOT judged - there is no
+ * observed cadence to judge it against, and inventing one is how a checker starts reporting on a
+ * window nobody chose.
+ */
+export function judgeObserved({ name, runs, now }) {
+  const scheduled = (runs || []).map((r) => Date.parse(r.created_at)).filter(Number.isFinite).sort((a, b) => b - a)
+  if (scheduled.length < 3) return null
+  const gaps = []
+  for (let i = 1; i < scheduled.length; i++) gaps.push(scheduled[i - 1] - scheduled[i])
+  // The median gap, so one slow week does not redefine the cadence.
+  const median = [...gaps].sort((a, b) => a - b)[Math.floor(gaps.length / 2)]
+  const ageMin = (now - scheduled[0]) / 60000
+  const limitMin = (median / 60000) * OVERDUE_FACTOR
+  if (ageMin > limitMin) {
+    return { name, ok: false, why: `last scheduled run ${Math.round(ageMin / 60)}h ago; its own recent cadence is about every ${Math.round(median / 3600000)}h (past ${OVERDUE_FACTOR}x)` }
+  }
+  return { name, ok: true, why: `last scheduled run ${Math.round(ageMin / 60)} min ago, cadence about every ${Math.round(median / 3600000)}h` }
+}
+
+async function fleetMode(token) {
+  const { getFleet } = await import('../lib/fleet.mjs')
+  const { fleet, source } = await getFleet()
+  const repos = [...new Set(fleet.map((p) => p.repo).filter(Boolean))]
+  console.log(`fleet workflows: reading ${repos.length} repo(s) from the ${source} fleet list`)
+
+  const dead = []
+  let judged = 0
+  for (const repo of repos) {
+    let listed
+    try {
+      listed = await gh(`/repos/${repo}/actions/workflows?per_page=100`, token)
+    } catch (err) {
+      dead.push({ name: repo, ok: false, why: `could not list its workflows (${err.message})` })
+      continue
+    }
+    for (const wf of listed.workflows || []) {
+      let runs = []
+      try {
+        const r = await gh(`/repos/${repo}/actions/workflows/${wf.id}/runs?per_page=5&event=schedule`, token)
+        runs = r.workflow_runs || []
+      } catch (err) {
+        dead.push({ name: `${repo} / ${wf.name}`, ok: false, why: `could not read its runs (${err.message})` })
+        continue
+      }
+      if (!runs.length) continue // never ran on a schedule: not a scheduled workflow, not our business
+      if (wf.state && wf.state !== 'active') {
+        dead.push({ name: `${repo} / ${wf.name}`, ok: false, why: `GitHub reports it as ${wf.state}, so its schedule is not firing` })
+        continue
+      }
+      const v = judgeObserved({ name: `${repo} / ${wf.name}`, runs, now: Date.now() })
+      if (!v) continue
+      judged++
+      if (!v.ok) dead.push(v)
+    }
+  }
+
+  console.log(`fleet workflows: judged ${judged} scheduled workflow(s) across ${repos.length} repo(s)`)
+  for (const d of dead) console.log(`  DEAD  ${d.name.padEnd(46)} ${d.why}`)
+  if (dead.length) {
+    console.error(`\nFAIL: ${dead.length} scheduled workflow(s) in the fleet are not running as scheduled.`)
+    return 1
+  }
+  console.log('\nEvery scheduled workflow in the fleet has run inside its own observed cadence.')
+  return 0
+}
+
 async function main() {
   const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN
   if (!token) {
     console.error('FAIL: no GH_TOKEN/GITHUB_TOKEN, so nothing could be checked')
     return 1
   }
+
+  if (process.argv.includes('--fleet')) return fleetMode(token)
 
   const files = readdirSync(WORKFLOW_DIR).filter((f) => /\.ya?ml$/.test(f))
   const scheduled = files

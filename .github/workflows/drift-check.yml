@@ -62,6 +62,23 @@ jobs:
           BACKOFFICE_SUPABASE_URL: ${{ secrets.BACKOFFICE_SUPABASE_URL }}
           BACKOFFICE_SERVICE_ROLE_KEY: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
 
+      # DID THE FLEET'S OWN SCHEDULED WORKFLOWS RUN? (added 2026-09-02 by the monitoring audit.)
+      # The hourly monitor asks this for THIS repo's crons. Nothing asked it for the other twelve,
+      # and the same hole is there: pull-engine's weekly technical-floor gate guards its heartbeat
+      # with `if [ -n "$HC_URL" ]` and the secret it reads does not exist in that repo, so its
+      # dead-man switch has never pinged anything. Daily rather than hourly because it costs one
+      # API call per scheduled workflow and the fleet's GitHub allowance is a shared 5,000/hour
+      # pool that has been drained to zero twice. if: always() so a drift failure above cannot
+      # skip it, which is the defect this same audit fixed one step up.
+      - name: Every scheduled workflow in the FLEET must have actually run
+        if: always()
+        run: node scripts/check-workflow-cadence.mjs --fleet
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_READ_TOKEN || secrets.DASHBOARD_PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          BACKOFFICE_SUPABASE_URL: ${{ secrets.BACKOFFICE_SUPABASE_URL }}
+          BACKOFFICE_SERVICE_ROLE_KEY: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
+
       # Drift-specific sender: renders the real drift findings (drift-results.json /
       # pipeline-drift-results.json) instead of send-alert.mjs's Playwright "no report
       # produced" fallback, which fired because this job never runs Playwright.
