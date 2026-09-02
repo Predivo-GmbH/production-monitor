@@ -13,6 +13,8 @@ import assert from 'node:assert'
 import {
   isLiveEnvironment, liveEnvironments, candidateKeys, keyFor, severityFor, signalFor, reconcile,
   readWithRetry, READ_ATTEMPTS, FILED_BY,
+  nextCursor,
+  MAX_ISSUE_PAGES,
 } from '../scripts/check-sentry-issues.mjs'
 
 let n = 0
@@ -276,6 +278,27 @@ await ta('the retry waits between attempts instead of hammering the upstream', a
   const f = flaky(2, transientErr)
   await readWithRetry(f.read, 'sentry', { sleep: async (ms) => { waits.push(ms) }, log: () => {} })
   assert.deepEqual(waits, [5000, 5000])
+})
+
+// ── ONE PAGE IS NOT THE POPULATION (2026-09-02 audit) ────────────────────────────────────────
+// The issue query asked for limit=100 and read whatever came back with no cursor, so issue 101 was
+// absent from `covered` - and reconcile() auto-resolves everything this producer filed and did not
+// re-cover, writing "Sentry no longer lists this as an unresolved error" over a live one.
+
+t('a Link header offering more results yields the cursor to follow', () => {
+  const link = '<https://sentry.io/x>; rel="previous"; results="false"; cursor="0:0:1", '
+    + '<https://sentry.io/x>; rel="next"; results="true"; cursor="0:100:0"'
+  assert.equal(nextCursor(link), '0:100:0')
+})
+
+t('the last page yields no cursor, so the loop stops instead of spinning', () => {
+  assert.equal(nextCursor('<https://x>; rel="next"; results="false"; cursor="0:200:0"'), null)
+  assert.equal(nextCursor(null), null)
+  assert.equal(nextCursor(''), null)
+})
+
+t('there is a hard page ceiling, so a runaway list fails rather than judging on part of it', () => {
+  assert.ok(MAX_ISSUE_PAGES > 1 && MAX_ISSUE_PAGES <= 50, 'a ceiling must exist and be sane')
 })
 
 console.log(`\n${n} tests passed.`)
