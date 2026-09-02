@@ -20,7 +20,7 @@ import { readFileSync } from 'node:fs'
 import {
   httpDeliveryVerdict, scheduleIntervalMs, RESPONSE_RETENTION_MS, PERSISTENT_FAILURES,
   msSinceLastFire, deliveryCoverage,
-  jobVerdict, allowanceMs,
+  jobVerdict, allowanceMs, attributionClause, ATTRIBUTION_WINDOW_SEC,
 } from '../scripts/check-cron-heartbeats.mjs'
 
 let n = 0
@@ -424,8 +424,89 @@ t('THE WIRING: the shipped script passes real job names and its own clock, not j
   // product calls it — exitDecision() was exported, documented and unit-tested here
   // while the CLI had stopped calling it (fixed in 6f2fd93). Same trap, same guard.
   const src = readFileSync(new URL('../scripts/check-cron-heartbeats.mjs', import.meta.url), 'utf8')
-  assert.match(src, /httpDeliveryVerdict\(\{ stats, queryError, httpPostJobs, nowMs: now \}\)/)
+  assert.match(src, /httpDeliveryVerdict\(\{ stats, queryError, httpPostJobs, nowMs: now, attribution, attributionError \}\)/)
   assert.match(src, /const httpPostJobs = rows\.filter\(\(r\) => r\.uses_http_post\)/)
+})
+
+// ── WHICH JOB WAS REFUSED ────────────────────────────────────────────────────────
+// The 2026-09-02 red run produced two findings and neither named a culprit: "2 of 184
+// were REFUSED (401)" and "27 of 231 failed". Both are counts. Acting on either meant a
+// human re-deriving the job by hand from the schedule list, which is what happened, twice.
+
+t('DEFECT: a refused call now NAMES the job and its route, where before it named a number', () => {
+  const v = httpDeliveryVerdict({
+    stats: { calls: 184, ok: 182, bad: 2, refused: 2, bad_codes: '401' }, queryError: null,
+    httpPostJobs: [{ jobname: 'vat-return-reminder-daily', schedule: '0 7 * * *' }],
+    attribution: [
+      { status: '401', candidate_count: 1, candidates: 'vat-return-reminder-daily -> https://x.supabase.co/functions/v1/vat-return-reminder', n: 2 },
+    ],
+  })
+  assert.equal(v.verdict, 'dead')
+  assert.match(v.detail, /WHICH JOB/)
+  assert.match(v.detail, /vat-return-reminder-daily/)
+  assert.match(v.detail, /functions\/v1\/vat-return-reminder/)
+  // The old wording is still there — the count was never the problem, the silence after it was.
+  assert.match(v.detail, /2 of 184 HTTP calls/)
+})
+
+t('a job that cannot be pinned down is offered as a candidate, never asserted as the culprit', () => {
+  const v = httpDeliveryVerdict({
+    stats: { calls: 231, ok: 204, bad: 27, refused: 0, timed_out: 27, errored: 27, bad_codes: 'no-response' }, queryError: null,
+    httpPostJobs: [{ jobname: 'process-queue-every-2min', schedule: '*/2 * * * *' }],
+    attribution: [
+      { status: 'no-response', candidate_count: 2, candidates: 'process-queue-every-2min -> https://x/a, refresh-tokens-hourly -> https://x/b', n: 27 },
+    ],
+  })
+  assert.match(v.detail, /one of 2 jobs/)
+  assert.match(v.detail, /process-queue-every-2min/)
+  assert.match(v.detail, /refresh-tokens-hourly/)
+})
+
+t('a bad call with no cron run behind it says so — net._http_response is per-database, not per-job', () => {
+  const c = attributionClause([{ status: '500', candidate_count: 0, candidates: '', n: 4 }])
+  assert.match(c, /4 × 500/)
+  assert.match(c, /no cron run in the 90s before them/)
+  assert.match(c, /other than pg_cron/)
+})
+
+t('DEFECT: a failed attribution read says it failed rather than going quiet', () => {
+  // Silence after "2 of 184 were REFUSED" reads as "there is nothing more to say", which
+  // is exactly the wrong inference. Same rule as layer 2's own unverifiable branch.
+  const v = httpDeliveryVerdict({
+    stats: { calls: 184, ok: 182, bad: 2, refused: 2, bad_codes: '401' }, queryError: null,
+    httpPostJobs: [{ jobname: 'a', schedule: '0 7 * * *' }],
+    attribution: null, attributionError: 'HTTP 500: upstream',
+  })
+  assert.match(v.detail, /WHICH JOB: unknown, the attribution read itself failed \(HTTP 500: upstream\)/)
+})
+
+t('a caller that supplies no attribution gets the verdict it always got, with nothing invented', () => {
+  const v = httpDeliveryVerdict({
+    stats: { calls: 184, ok: 182, bad: 2, refused: 2, bad_codes: '401' }, queryError: null,
+    httpPostJobs: [{ jobname: 'a', schedule: '0 7 * * *' }],
+  })
+  assert.equal(v.verdict, 'dead')
+  assert.doesNotMatch(v.detail, /WHICH JOB/)
+})
+
+t('SAFETY: the attribution query reads the URL out of the command and never the command itself', () => {
+  // These findings are emailed and printed into a run log. Older migrations wrote the
+  // service_role bearer as a LITERAL inside the cron command (the pattern migration 160
+  // replaces with a vault lookup), so selecting j.command would publish a live key.
+  const src = readFileSync(new URL('../scripts/check-cron-heartbeats.mjs', import.meta.url), 'utf8')
+  const sql = src.slice(src.indexOf('const HTTP_FAILURE_ATTRIBUTION_SQL'), src.indexOf('export function attributionClause'))
+  assert.match(sql, /substring\(j\.command from/)
+  // j.command may appear only inside substring() and the ilike filter — never as a selected column.
+  for (const m of sql.matchAll(/j\.command/g)) {
+    const around = sql.slice(Math.max(0, m.index - 40), m.index + 20)
+    assert.ok(/substring\(|ilike/.test(around), `j.command exposed raw near: ${around}`)
+  }
+})
+
+t('THE WIRING: the shipped script actually runs the attribution query, and only when there is a failure', () => {
+  const src = readFileSync(new URL('../scripts/check-cron-heartbeats.mjs', import.meta.url), 'utf8')
+  assert.match(src, /if \(stats && Number\(stats\.bad\) > 0\) \{/)
+  assert.match(src, /await query\(ref, pat, HTTP_FAILURE_ATTRIBUTION_SQL\)/)
 })
 
 console.log(`\n${n} assertions passed.`)

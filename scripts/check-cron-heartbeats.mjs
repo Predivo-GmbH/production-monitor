@@ -129,6 +129,108 @@ const HTTP_OUTCOME_SQL = `
   from net._http_response`
 
 /**
+ * WHICH JOB was refused — the question the alert above could not answer.
+ *
+ * The aggregate says "2 of 184 calls were REFUSED (401)". That is a count, and a count
+ * is not something anyone can act on: it names no job, no route, and no product surface.
+ * Measured on the 2026-09-02 red run, both findings read that way, and the follow-up work
+ * each time was a human re-deriving the culprit by hand from the job list.
+ *
+ * WHY THIS IS A TIME CORRELATION AND NOT A JOIN. The obvious fix is to join
+ * `net.http_request_queue` on the response id, where the URL is stored verbatim. pg_net
+ * deletes the queue row once the request is processed, so for exactly the rows that carry
+ * a status code — the ones we need — that join yields NULL. (Stated as the reason the
+ * design does not depend on it: no project reachable from this machine has pg_net
+ * installed, so this could not be re-confirmed against a live database on 2026-09-02.
+ * The correlation below needs no such assumption, which is the point of choosing it.)
+ *
+ * So the URL is recovered from where it is definitely still written down — `cron.job.command`
+ * — and the response is tied to the run by time: pg_net records the answer between the
+ * dispatch and the dispatch plus the request's timeout, so a bad response at T belongs to a
+ * job that started within ATTRIBUTION_WINDOW_SEC before T. A wider window costs ambiguity,
+ * never a wrong name, because the count of candidates is reported with the names and one
+ * candidate is the only thing ever presented as certain.
+ *
+ * ONLY THE URL LEAVES THE DATABASE, NEVER THE COMMAND. Some older migrations wrote the
+ * bearer token as a literal inside the cron command (the pattern migration 160 replaces
+ * with a vault lookup). This alert is emailed and printed into a public run log, so the
+ * command text must never be selected — `substring()` takes the URL and nothing else.
+ * `test/check-cron-heartbeats.test.mjs` holds that as a ratchet.
+ */
+export const ATTRIBUTION_WINDOW_SEC = 90
+
+const HTTP_FAILURE_ATTRIBUTION_SQL = `
+  with bad as (
+    select r.id, r.created,
+           coalesce(r.status_code::text, 'no-response') as status
+      from net._http_response r
+     where r.status_code is null or r.status_code < 200 or r.status_code >= 300
+  ),
+  posts as (
+    select j.jobid, j.jobname,
+           substring(j.command from 'https?://[^[:space:]'',)]+') as url
+      from cron.job j
+     where j.active and j.command ilike '%http_post%'
+  ),
+  runs as (
+    select d.jobid, d.start_time
+      from cron.job_run_details d
+     where d.start_time > now() - interval '7 hours'
+  ),
+  matched as (
+    select b.status,
+           (select count(distinct p.jobid)
+              from runs rn join posts p on p.jobid = rn.jobid
+             where rn.start_time <= b.created
+               and rn.start_time > b.created - interval '${ATTRIBUTION_WINDOW_SEC} seconds')::int as candidate_count,
+           (select string_agg(distinct p.jobname || coalesce(' -> ' || p.url, ' -> (command names no url)'), ', ')
+              from runs rn join posts p on p.jobid = rn.jobid
+             where rn.start_time <= b.created
+               and rn.start_time > b.created - interval '${ATTRIBUTION_WINDOW_SEC} seconds') as candidates
+      from bad b
+  )
+  select status, candidate_count, coalesce(candidates, '') as candidates, count(*)::int as n
+    from matched
+   group by 1, 2, 3
+   order by n desc, status
+   limit 20`
+
+/**
+ * Turn those attribution rows into the clause the alert carries, pure and testable.
+ *
+ * Three outcomes, kept apart on purpose, because collapsing them is how a guess starts
+ * reading as a fact:
+ *   * exactly one candidate  → the job is NAMED. This is the BackOffice shape: four daily
+ *     jobs hours apart, so a 401 pins to one of them without ambiguity.
+ *   * several candidates     → all of them are listed, explicitly as "one of N".
+ *   * no candidate           → said plainly. `net._http_response` is per-database and pg_net
+ *     is callable from anything, so a bad call with no cron run behind it is a real answer:
+ *     something other than pg_cron made it.
+ *
+ * A failed attribution read returns a clause saying so. Silence would read as "nothing to
+ * add", which is the same failure mode this whole file exists to remove.
+ */
+export function attributionClause(rows, error) {
+  if (error) return ` — WHICH JOB: unknown, the attribution read itself failed (${error})`
+  if (!Array.isArray(rows) || rows.length === 0) return ''
+  const named = [], ambiguous = [], orphan = []
+  for (const r of rows) {
+    const n = Number(r.n) || 0
+    const count = Number(r.candidate_count) || 0
+    if (count === 1) named.push(`${r.candidates} (${n} × ${r.status})`)
+    else if (count > 1) ambiguous.push(`${n} × ${r.status} came from one of ${count} jobs running together: ${r.candidates}`)
+    else orphan.push(`${n} × ${r.status}`)
+  }
+  const bits = []
+  if (named.length) bits.push(named.join('; '))
+  if (ambiguous.length) bits.push(ambiguous.join('; '))
+  if (orphan.length) {
+    bits.push(`${orphan.join('; ')} had no cron run in the ${ATTRIBUTION_WINDOW_SEC}s before them, so something other than pg_cron on this database dispatched those`)
+  }
+  return bits.length ? ` — WHICH JOB: ${bits.join('. ')}` : ''
+}
+
+/**
  * pg_net keeps `net._http_response` for six hours by default (`net.ttl`), and the
  * BackOffice window measured 2026-09-01 was 5.998h, so this is the real number and
  * not a guess. It decides ONE thing: whether "no rows at all" is a fact about the
@@ -284,15 +386,20 @@ function coverageClause(coverage) {
  * `httpPostJobs` ({jobname, schedule}[]) is preferred and enables the coverage clause;
  * `httpPostSchedules` (string[]) stays accepted so older callers and tests keep working.
  *
- * @param {{stats: object|null, queryError: string|null, httpPostJobs?: {jobname: string, schedule: string}[], httpPostSchedules?: string[], nowMs?: number}} input
+ * `attribution`/`attributionError` carry the per-failure culprit lookup. They are optional:
+ * a caller that does not supply them gets the verdict it always got, minus the naming.
+ *
+ * @param {{stats: object|null, queryError: string|null, httpPostJobs?: {jobname: string, schedule: string}[], httpPostSchedules?: string[], nowMs?: number, attribution?: object[]|null, attributionError?: string|null}} input
  * @returns {{verdict: 'ok'|'dead'|'unverifiable'|'not-applicable', detail: string}}
  */
-export function httpDeliveryVerdict({ stats, queryError, httpPostJobs, httpPostSchedules, nowMs }) {
+export function httpDeliveryVerdict({ stats, queryError, httpPostJobs, httpPostSchedules, nowMs, attribution, attributionError }) {
   const jobs = httpPostJobs
     ?? (httpPostSchedules || []).map((schedule, i) => ({ jobname: `job#${i + 1}`, schedule }))
   httpPostSchedules = jobs.map((j) => j.schedule)
   const coverage = nowMs == null ? null : deliveryCoverage({ httpPostJobs: jobs, nowMs })
   const cov = coverageClause(coverage)
+  // Named culprit first, then the coverage caveat: what to act on before what was not seen.
+  const attr = attributionClause(attribution, attributionError)
   if (!httpPostSchedules.length) {
     return { verdict: 'not-applicable', detail: 'no active cron job on this database dispatches an HTTP call' }
   }
@@ -325,10 +432,10 @@ export function httpDeliveryVerdict({ stats, queryError, httpPostJobs, httpPostS
   if (refused > 0) {
     // 401/403/404 do not heal themselves. One is a finding. This is the exact fault
     // that hid for weeks: 3 × 401 among 106 × 200, every job reporting 'succeeded'.
-    return { verdict: 'dead', detail: `${refused} of ${stats.calls} HTTP calls this database dispatched were REFUSED (status ${stats.bad_codes ?? 'unknown'}). A refused credential or a wrong route does not recover on its own, and cron.job_run_details still reports these as 'succeeded'. If signal-sweep-5min is among them, the fleet pager is not delivering.${cov}` }
+    return { verdict: 'dead', detail: `${refused} of ${stats.calls} HTTP calls this database dispatched were REFUSED (status ${stats.bad_codes ?? 'unknown'}). A refused credential or a wrong route does not recover on its own, and cron.job_run_details still reports these as 'succeeded'. If signal-sweep-5min is among them, the fleet pager is not delivering.${attr}${cov}` }
   }
   if (transient >= PERSISTENT_FAILURES) {
-    return { verdict: 'dead', detail: `${transient} of ${stats.calls} HTTP calls this database dispatched failed (status ${stats.bad_codes ?? 'unknown'}; ${stats.timed_out || 0} timed out, ${stats.errored || 0} errored). Past ${PERSISTENT_FAILURES} in one window this is no longer a blip.${cov}` }
+    return { verdict: 'dead', detail: `${transient} of ${stats.calls} HTTP calls this database dispatched failed (status ${stats.bad_codes ?? 'unknown'}; ${stats.timed_out || 0} timed out, ${stats.errored || 0} errored). Past ${PERSISTENT_FAILURES} in one window this is no longer a blip.${attr}${cov}` }
   }
   if (transient > 0) {
     return { verdict: 'ok', detail: `${stats.ok} of ${stats.calls} dispatched HTTP calls answered 2xx; ${transient} transient failure(s) (${stats.bad_codes}), under the ${PERSISTENT_FAILURES} needed to count${cov}` }
@@ -482,7 +589,7 @@ async function main() {
     // the ENQUEUE and nothing else. Ask pg_net what the calls actually returned.
     const httpPostJobs = rows.filter((r) => r.uses_http_post).map((r) => ({ jobname: r.jobname, schedule: r.schedule }))
     const httpPostSchedules = httpPostJobs.map((j) => j.schedule)
-    let stats = null, queryError = null
+    let stats = null, queryError = null, attribution = null, attributionError = null
     if (httpPostSchedules.length) {
       try {
         const out = await query(ref, pat, HTTP_OUTCOME_SQL)
@@ -490,8 +597,18 @@ async function main() {
       } catch (e) {
         queryError = e.message
       }
+      // A second round-trip only when the first one found something to attribute. A green
+      // database pays nothing for this, which is what keeps the nightly run cheap.
+      if (stats && Number(stats.bad) > 0) {
+        try {
+          const out = await query(ref, pat, HTTP_FAILURE_ATTRIBUTION_SQL)
+          attribution = Array.isArray(out) ? out : null
+        } catch (e) {
+          attributionError = e.message
+        }
+      }
     }
-    const delivery = httpDeliveryVerdict({ stats, queryError, httpPostJobs, nowMs: now })
+    const delivery = httpDeliveryVerdict({ stats, queryError, httpPostJobs, nowMs: now, attribution, attributionError })
     if (delivery.verdict === 'not-applicable') {
       // Say nothing: a database with no http_post cron has no delivery path to judge.
     } else if (delivery.verdict === 'ok') {
