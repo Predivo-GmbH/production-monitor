@@ -155,7 +155,15 @@ const HTTP_OUTCOME_SQL = `
          min(created) as oldest, max(created) as newest,
          (select string_agg(distinct coalesce(status_code::text, 'no-response'), ', ')
             from net._http_response
-           where status_code is null or status_code < 200 or status_code >= 300) as bad_codes
+           where status_code is null or status_code < 200 or status_code >= 300) as bad_codes,
+         -- The statuses of the REFUSED calls only. bad_codes spans every non-2xx call in
+         -- the window, and the refused headline was printing it as though it described the
+         -- refused ones: run 33657359918 read "1 of 194 HTTP calls were REFUSED (status 404,
+         -- 500, no-response)" — one call carrying three statuses. Two of those three were a
+         -- different call each, and one of them was the finding that actually mattered.
+         (select string_agg(distinct status_code::text, ', ')
+            from net._http_response
+           where status_code in (401, 403, 404)) as refused_codes
   from net._http_response`
 
 /**
@@ -169,17 +177,27 @@ const HTTP_OUTCOME_SQL = `
  * WHY THIS IS A TIME CORRELATION AND NOT A JOIN. The obvious fix is to join
  * `net.http_request_queue` on the response id, where the URL is stored verbatim. pg_net
  * deletes the queue row once the request is processed, so for exactly the rows that carry
- * a status code — the ones we need — that join yields NULL. (Stated as the reason the
- * design does not depend on it: no project reachable from this machine has pg_net
- * installed, so this could not be re-confirmed against a live database on 2026-09-02.
- * The correlation below needs no such assumption, which is the point of choosing it.)
+ * a status code — the ones we need — that join yields NULL. CONFIRMED against a live
+ * database on 2026-09-02, which the note here previously said could not be done: BackOffice
+ * production runs pg_net 0.20.4 and `select count(*) from net.http_request_queue` returned
+ * 0 while `net._http_response` held 194 rows. The queue is genuinely empty, the join is
+ * genuinely unavailable, and the time correlation is the only route to a name.
  *
  * So the URL is recovered from where it is definitely still written down — `cron.job.command`
- * — and the response is tied to the run by time: pg_net records the answer between the
- * dispatch and the dispatch plus the request's timeout, so a bad response at T belongs to a
- * job that started within ATTRIBUTION_WINDOW_SEC before T. A wider window costs ambiguity,
- * never a wrong name, because the count of candidates is reported with the names and one
- * candidate is the only thing ever presented as certain.
+ * — and the response is tied to the run by time: a bad row at T belongs to a job that
+ * started within DISPATCH_BAND_SEC before T, because `created` is when pg_net DISPATCHED
+ * the call and a cron job dispatches within a moment of starting. See DISPATCH_BAND_SEC
+ * for the measurement.
+ *
+ * THE SENTENCE THAT USED TO BE HERE WAS WRONG, AND IT IS WHY THIS PARAGRAPH IS LONG:
+ * "a wider window costs ambiguity, never a wrong name, because the count of candidates is
+ * reported with the names and one candidate is the only thing ever presented as certain."
+ * The safety argument only holds if every bad row was dispatched by SOME cron job, so that
+ * a wider window can add candidates but never invent the wrong one. It isn't: this table is
+ * per-database and anything can call pg_net. When the true caller is not a cron job at all,
+ * widening the window does not produce two candidates — it produces exactly one, the
+ * unrelated job that happened to run nearby, and hands it over as certain. Ambiguity was
+ * the failure mode being designed against, and it was the safe one.
  *
  * ONLY THE URL LEAVES THE DATABASE, NEVER THE COMMAND. Some older migrations wrote the
  * bearer token as a literal inside the cron command (the pattern migration 160 replaces
@@ -187,12 +205,59 @@ const HTTP_OUTCOME_SQL = `
  * command text must never be selected — `substring()` takes the URL and nothing else.
  * `test/check-cron-heartbeats.test.mjs` holds that as a ratchet.
  */
-export const ATTRIBUTION_WINDOW_SEC = 90
+/**
+ * HOW WIDE THE WINDOW IS, AND WHY IT IS NOT 90 SECONDS ANY MORE.
+ *
+ * The first version of this correlation used 90 seconds, reasoning that pg_net records the
+ * ANSWER, so the answer could land anywhere between the dispatch and the dispatch plus the
+ * request timeout. That reasoning had the column backwards, and the width it produced named
+ * an innocent job as a certainty on the very next run.
+ *
+ * `net._http_response.created` is the DISPATCH time, not the answer time. Measured on
+ * BackOffice production (xoecpzfsskalvjrtcbbl, pg_net 0.20.4, 194 rows, 2026-09-02):
+ *   * the origin's own `Date` response header is LATER than `created` on 134 of the 193
+ *     rows that carry one, by up to 3.7s. If `created` were the moment the answer was
+ *     collected, the answer could not have been generated after it.
+ *   * 168 of 194 calls sit within 0.5s of a cron job's start_time, and support-send-due's
+ *     call was recorded 21ms after its run began — not a possible round trip to Cloudflare.
+ * So a cron job's http_post is dispatched within a few hundred milliseconds of the job
+ * starting, and 2 seconds is a 4x margin on the worst case actually observed.
+ *
+ * WHAT THE OLD WIDTH DID. This database dispatches HTTP from somewhere other than pg_cron:
+ * the Supabase auth Send Email hook is configured as `pg-functions://postgres/public/
+ * handle_send_email`, which calls an edge function through pg_net on every login mail —
+ * 26 of the 194 calls in the window, at times unrelated to any schedule. With gaps of 2-3
+ * minutes between cron runs, a 90s look-back covers roughly 60% of the clock, so ~60% of
+ * those calls landed behind an unrelated cron job and were reported under its name with
+ * `candidate_count = 1`, which this file presents as identified.
+ *
+ * That is exactly what happened on run 33657359918: a 500 dispatched at 13:02:21.48 was
+ * reported as `signal-sweep-5min -> /functions/v1/signal-intake`, and the finding it fed
+ * says "if signal-sweep-5min is among them, the fleet pager is not delivering". The pager
+ * was fine. signal-sweep-5min dispatched at 13:02:00.23, 21 seconds earlier; the response
+ * body was `{"error":"Failed to send email"}`, which is `send-auth-email/index.ts:88` and
+ * appears nowhere else in BackOffice. A login email had failed, and the alarm sent the
+ * reader to audit the emergency pager instead.
+ *
+ * The 90 seconds is kept for ONE thing only — reporting the nearest run and its distance,
+ * so an unattributed call shows its own arithmetic instead of asking to be believed.
+ */
+export const DISPATCH_BAND_SEC = 2
+export const NEAREST_RUN_LOOKBACK_SEC = 90
 
 const HTTP_FAILURE_ATTRIBUTION_SQL = `
   with bad as (
     select r.id, r.created,
-           coalesce(r.status_code::text, 'no-response') as status
+           coalesce(r.status_code::text, 'no-response') as status,
+           -- Supabase's own classification of the failure, and the one piece of the
+           -- response that is safe to print: a short fixed enum set by the gateway
+           -- (NOT_FOUND, EDGE_FUNCTION_ERROR, ...), present only on failures — null on
+           -- all 192 successful rows measured. The response BODY is never selected: it
+           -- is whatever our own functions chose to return, this text is emailed and
+           -- printed into a public run log, and 'it is only an error message' is how
+           -- user data leaks. The enum says whether the route was missing or the
+           -- function ran and threw, which is the part anyone acts on.
+           r.headers->>'sb-error-code' as sb_error_code
       from net._http_response r
      where r.status_code is null or r.status_code < 200 or r.status_code >= 300
   ),
@@ -216,21 +281,64 @@ const HTTP_FAILURE_ATTRIBUTION_SQL = `
      where d.start_time > now() - interval '7 hours'
   ),
   matched as (
-    select b.status,
+    select b.status, b.sb_error_code,
            (select count(distinct p.jobid)
               from runs rn join posts p on p.jobid = rn.jobid
              where rn.start_time <= b.created
-               and rn.start_time > b.created - interval '${ATTRIBUTION_WINDOW_SEC} seconds')::int as candidate_count,
+               and rn.start_time > b.created - interval '${DISPATCH_BAND_SEC} seconds')::int as candidate_count,
            (select string_agg(distinct p.jobname || coalesce(' -> ' || p.url, ' -> (command names no url)'), ', ')
               from runs rn join posts p on p.jobid = rn.jobid
              where rn.start_time <= b.created
-               and rn.start_time > b.created - interval '${ATTRIBUTION_WINDOW_SEC} seconds') as candidates
+               and rn.start_time > b.created - interval '${DISPATCH_BAND_SEC} seconds') as candidates,
+           -- Only for the calls the band did NOT claim: which run was nearest, and how far
+           -- away it actually was. This is the number that makes an orphan verdict checkable
+           -- instead of assertable — "21.3s after signal-sweep-5min" is a reader's own proof
+           -- that signal-sweep-5min did not make the call, and it is the fact the 90s window
+           -- was throwing away in order to print that job's name as the answer.
+           (select round(extract(epoch from (b.created - max(rn.start_time)))::numeric, 1)
+              from runs rn join posts p on p.jobid = rn.jobid
+             where rn.start_time <= b.created
+               and rn.start_time > b.created - interval '${NEAREST_RUN_LOOKBACK_SEC} seconds') as nearest_gap_s,
+           (select p.jobname
+              from runs rn join posts p on p.jobid = rn.jobid
+             where rn.start_time <= b.created
+               and rn.start_time > b.created - interval '${NEAREST_RUN_LOOKBACK_SEC} seconds'
+             order by rn.start_time desc limit 1) as nearest_job
       from bad b
   )
-  select status, candidate_count, coalesce(candidates, '') as candidates, count(*)::int as n
+  select status, sb_error_code, candidate_count, coalesce(candidates, '') as candidates,
+         nearest_job, max(nearest_gap_s) as nearest_gap_s, count(*)::int as n
     from matched
-   group by 1, 2, 3
+   group by 1, 2, 3, 4, 5
    order by n desc, status
+   limit 20`
+
+/**
+ * WHO ELSE ON THIS DATABASE CAN DISPATCH AN HTTP CALL.
+ *
+ * `net._http_response` is per-DATABASE, not per-job, so "no cron job made this call" is
+ * only half an answer — it says where to stop looking, not where to look. The other half
+ * is already written down in the catalogue: any SQL function whose body calls http_post.
+ * On BackOffice that is exactly one, `public.handle_send_email`, the Supabase auth Send
+ * Email hook, and naming it turns "something else dispatched this" into a place to go.
+ *
+ * ONLY THE NAME AND THE ROUTE LEAVE THE DATABASE. `handle_send_email`'s body carries a
+ * bearer token as a literal — read and confirmed on production 2026-09-02 — so this is the
+ * same rule as the cron command: `substring()` takes the route, and the definition itself
+ * is never selected. `test/check-cron-heartbeats.test.mjs` holds it as a ratchet.
+ */
+const NON_CRON_DISPATCHER_SQL = `
+  select n.nspname || '.' || p.proname as fn,
+         substring(pg_get_functiondef(p.oid) from '/functions/v1/[A-Za-z0-9_-]+') as route
+    from pg_proc p
+    join pg_namespace n on n.oid = p.pronamespace
+   where p.prokind = 'f'
+     and n.nspname not in ('pg_catalog', 'information_schema', 'net', 'cron', 'extensions',
+                           'graphql', 'graphql_public', 'pgbouncer', 'vault', 'storage',
+                           'realtime', 'pgsodium', 'pgsodium_masks', 'supabase_functions',
+                           'supabase_migrations', 'pg_toast')
+     and pg_get_functiondef(p.oid) ilike '%http_post%'
+   order by 1
    limit 20`
 
 /**
@@ -248,22 +356,41 @@ const HTTP_FAILURE_ATTRIBUTION_SQL = `
  * A failed attribution read returns a clause saying so. Silence would read as "nothing to
  * add", which is the same failure mode this whole file exists to remove.
  */
-export function attributionClause(rows, error) {
+export function attributionClause(rows, error, dispatchers) {
   if (error) return ` — WHICH JOB: unknown, the attribution read itself failed (${error})`
   if (!Array.isArray(rows) || rows.length === 0) return ''
   const named = [], ambiguous = [], orphan = []
+  // The gateway's own word for what went wrong, when it gave one. 'no-response' rows have
+  // no headers at all, so most failures still show only a status — this never invents one.
+  const label = (r) => (r.sb_error_code ? `${r.status} ${r.sb_error_code}` : `${r.status}`)
   for (const r of rows) {
     const n = Number(r.n) || 0
     const count = Number(r.candidate_count) || 0
-    if (count === 1) named.push(`${r.candidates} (${n} × ${r.status})`)
-    else if (count > 1) ambiguous.push(`${n} × ${r.status} came from one of ${count} jobs running together: ${r.candidates}`)
-    else orphan.push(`${n} × ${r.status}`)
+    if (count === 1) named.push(`${r.candidates} (${n} × ${label(r)})`)
+    else if (count > 1) ambiguous.push(`${n} × ${label(r)} came from one of ${count} jobs running together: ${r.candidates}`)
+    else {
+      // Show the distance, not just the conclusion. A reader who is told "no cron job did
+      // this" has to take it on trust; a reader who is told the nearest run was 21.3s away
+      // when pg_cron dispatches inside 2s can check the claim in their head.
+      const gap = r.nearest_gap_s == null ? null : Number(r.nearest_gap_s)
+      const why = gap == null || !r.nearest_job
+        ? `no cron job on this database ran in the ${NEAREST_RUN_LOOKBACK_SEC}s before them at all`
+        : `the nearest cron run was ${r.nearest_job}, ${gap}s earlier — well outside the ${DISPATCH_BAND_SEC}s in which pg_cron's own http_post calls are dispatched, so it was not that job`
+      orphan.push(`${n} × ${label(r)}: ${why}`)
+    }
   }
   const bits = []
   if (named.length) bits.push(named.join('; '))
   if (ambiguous.length) bits.push(ambiguous.join('; '))
   if (orphan.length) {
-    bits.push(`${orphan.join('; ')} had no cron run in the ${ATTRIBUTION_WINDOW_SEC}s before them, so something other than pg_cron on this database dispatched those`)
+    // Naming the other dispatchers is the difference between closing this and re-opening it
+    // every hour. Without it the reader is told only where NOT to look.
+    const others = Array.isArray(dispatchers) && dispatchers.length
+      ? ` The other things on this database that dispatch HTTP are: ${dispatchers.map((d) => `${d.fn}${d.route ? ` -> ${d.route}` : ''}`).join(', ')}.`
+      : Array.isArray(dispatchers)
+        ? ' No SQL function on this database calls http_post either, so the caller is outside the database.'
+        : ''
+    bits.push(`${orphan.join('; ')} — so something other than pg_cron on this database dispatched those.${others}`)
   }
   // The scope is stated, because it is NOT the headline's scope. The headline counts one
   // class (refused, or transient-past-the-threshold); this lists every non-2xx call in the
@@ -284,6 +411,33 @@ export const RESPONSE_RETENTION_MS = 6 * 3600_000
 /** How many transient-capable failures (5xx, timeouts, refused connections) it takes
  *  before this stops being a blip. Same spirit as layer 1's 3× interval rule. */
 export const PERSISTENT_FAILURES = 3
+
+/** The one cron job in the fleet whose failure is not just a job failing: it is the channel
+ *  that reports everything else failing. BackOffice only — it does not exist on the other
+ *  five databases, which is why the warning about it must be gated rather than printed. */
+export const PAGER_JOB = 'signal-sweep-5min'
+
+/** Whether the pager could be one of the jobs behind these calls at all.
+ *  Callers on the legacy `httpPostSchedules` path supply no job names — that is genuinely
+ *  unknown, and unknown must not read as "ruled out". */
+export function pagerCouldBeOnThisDb(httpPostJobs, jobs) {
+  if (!Array.isArray(httpPostJobs)) return true
+  return jobs.some((j) => j.jobname === PAGER_JOB)
+}
+
+/**
+ * Was the pager actually IMPLICATED — read off the rows, never off the rendered sentence.
+ *
+ * The first attempt at this tested the finished clause with /signal-sweep-5min/, which is
+ * the identical mistake one layer up: the orphan wording NAMES the nearest run in order to
+ * rule it out ("the nearest cron run was signal-sweep-5min, 45.2s earlier ... so it was not
+ * that job"), and a substring match read that as an accusation. Presence in the text is not
+ * presence in the answer. Only a row that actually offers the pager as a candidate counts.
+ */
+export function pagerIsNamed(attribution) {
+  if (!Array.isArray(attribution)) return false
+  return attribution.some((r) => Number(r.candidate_count) >= 1 && String(r.candidates || '').includes(PAGER_JOB))
+}
 
 /** The raw interval a cron schedule implies, in ms — NOT layer 1's 3x allowance.
  *  Used only to decide whether a job is fast enough that it MUST have left a trace
@@ -435,14 +589,18 @@ function coverageClause(coverage) {
  * @param {{stats: object|null, queryError: string|null, httpPostJobs?: {jobname: string, schedule: string}[], httpPostSchedules?: string[], nowMs?: number, attribution?: object[]|null, attributionError?: string|null}} input
  * @returns {{verdict: 'ok'|'dead'|'unverifiable'|'not-applicable', detail: string}}
  */
-export function httpDeliveryVerdict({ stats, queryError, httpPostJobs, httpPostSchedules, nowMs, attribution, attributionError }) {
+export function httpDeliveryVerdict({ stats, queryError, httpPostJobs, httpPostSchedules, nowMs, attribution, attributionError, dispatchers }) {
   const jobs = httpPostJobs
     ?? (httpPostSchedules || []).map((schedule, i) => ({ jobname: `job#${i + 1}`, schedule }))
   httpPostSchedules = jobs.map((j) => j.schedule)
   const coverage = nowMs == null ? null : deliveryCoverage({ httpPostJobs: jobs, nowMs })
   const cov = coverageClause(coverage)
   // Named culprit first, then the coverage caveat: what to act on before what was not seen.
-  const attr = attributionClause(attribution, attributionError)
+  const attr = attributionClause(attribution, attributionError, dispatchers)
+  // "The attribution read failed" is a non-empty clause that names nobody. Treating it as
+  // knowledge would rule the pager out on the strength of an error message.
+  const namesSomething = Boolean(attr) && !attributionError
+  const pagerNamed = pagerIsNamed(attribution)
   if (!httpPostSchedules.length) {
     return { verdict: 'not-applicable', detail: 'no active cron job on this database dispatches an HTTP call' }
   }
@@ -475,7 +633,24 @@ export function httpDeliveryVerdict({ stats, queryError, httpPostJobs, httpPostS
   if (refused > 0) {
     // 401/403/404 do not heal themselves. One is a finding. This is the exact fault
     // that hid for weeks: 3 × 401 among 106 × 200, every job reporting 'succeeded'.
-    return { verdict: 'dead', detail: `${refused} of ${stats.calls} HTTP calls this database dispatched were REFUSED (status ${stats.bad_codes ?? 'unknown'}). A refused credential or a wrong route does not recover on its own, and cron.job_run_details still reports these as 'succeeded'. If signal-sweep-5min is among them, the fleet pager is not delivering.${attr}${cov}` }
+    //
+    // The pager warning has THREE states now, because it used to have one. It was printed
+    // on every refusal on every database — including ReplyFlow, which has no such job — and
+    // on run 33657359918 it rode along with a 404 that no cron job made, next to an
+    // attribution line that (wrongly) named signal-sweep-5min. Two independent-looking
+    // statements, one shared mistake, and the reader's whole hour went to the pager.
+    //
+    // The hedge ("if it is among them") is kept for the case it was written for: we have no
+    // attribution, so we genuinely do not know. What is removed is saying it when we DO
+    // know, and know it is not the pager. An alarm that hedges when it is ignorant and
+    // commits when it is informed is readable; one that hedges always is noise.
+    const pagerRuledOut = !pagerCouldBeOnThisDb(httpPostJobs, jobs) || (namesSomething && !pagerNamed)
+    const pager = pagerNamed
+      ? ` ${PAGER_JOB} IS among them, so the fleet pager is not delivering.`
+      : pagerRuledOut
+        ? ''
+        : ` If ${PAGER_JOB} is among them, the fleet pager is not delivering.`
+    return { verdict: 'dead', detail: `${refused} of ${stats.calls} HTTP calls this database dispatched were REFUSED (status ${stats.refused_codes ?? stats.bad_codes ?? 'unknown'}). A refused credential or a wrong route does not recover on its own, and cron.job_run_details still reports these as 'succeeded'.${pager}${attr}${cov}` }
   }
   // ── THE CALLER HUNG UP IS NOT THE CALL FAILED ────────────────────────────────
   // `net.http_post` takes `timeout_milliseconds` and DEFAULTS IT TO 5000. When a worker
@@ -708,7 +883,7 @@ async function main() {
     // the ENQUEUE and nothing else. Ask pg_net what the calls actually returned.
     const httpPostJobs = rows.filter((r) => r.uses_http_post).map((r) => ({ jobname: r.jobname, schedule: r.schedule }))
     const httpPostSchedules = httpPostJobs.map((j) => j.schedule)
-    let stats = null, queryError = null, attribution = null, attributionError = null
+    let stats = null, queryError = null, attribution = null, attributionError = null, dispatchers = null
     if (httpPostSchedules.length) {
       try {
         const out = await query(ref, pat, HTTP_OUTCOME_SQL)
@@ -725,9 +900,16 @@ async function main() {
         } catch (e) {
           attributionError = e.message
         }
+        // Same rule, same reason: only paid for on a database that has a failure to explain.
+        // A failure here leaves `dispatchers` null and the clause simply says less, rather
+        // than claiming there is no other caller — which would be the wrong half to guess.
+        try {
+          const out = await query(ref, pat, NON_CRON_DISPATCHER_SQL)
+          dispatchers = Array.isArray(out) ? out : null
+        } catch { /* stays null: unknown, not "none" */ }
       }
     }
-    const delivery = httpDeliveryVerdict({ stats, queryError, httpPostJobs, nowMs: now, attribution, attributionError })
+    const delivery = httpDeliveryVerdict({ stats, queryError, httpPostJobs, nowMs: now, attribution, attributionError, dispatchers })
     if (delivery.verdict === 'not-applicable') {
       // Say nothing: a database with no http_post cron has no delivery path to judge.
     } else if (delivery.verdict === 'ok') {
