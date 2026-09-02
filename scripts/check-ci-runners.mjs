@@ -144,17 +144,38 @@ const perRepo = []
 
 for (const repo of repos) {
   const runners = await gh(`repos/${OWNER}/${repo}/actions/runners`)
-  const list = runners?.runners || []
+  // A RUNNER LIST WE COULD NOT READ IS NOT AN EMPTY ONE (2026-09-01 audit; the same defect
+  // checksFrom() closed in check-healthchecks-down.mjs). `runners?.runners || []` turned a 404
+  // from a renamed or descoped repository, an error object, or a changed body shape into "this
+  // repository has no runners", which the next line read as "never migrated: leave it alone". A
+  // repository we cannot SEE is not a repository that is fine, so it is counted as an API error
+  // and the existing apiErrors bail fails the run instead of certifying a fleet nobody read.
+  if (!Array.isArray(runners?.runners)) {
+    apiErrors++
+    console.error(`::error::could not read the runner list for ${repo}: ${runners?.notFound
+      ? 'HTTP 404 - the token cannot see this repository, or it was renamed'
+      : runners?.error || 'the response carried no runner list'}`)
+    continue
+  }
+  const list = runners.runners
   perRepo.push({ repo, runners: list })
-  if (!list.length) continue // never migrated: nothing to watch, leave it alone
+
+  // The label is read for EVERY repository, BEFORE the "nothing registered" skip, because the two
+  // cases that skip look identical from the runner list alone and are opposites:
+  //   no runners + no label  -> never migrated. Nothing to watch.
+  //   no runners + our label -> the runners were DEREGISTERED while every job still asks for a
+  //                             label nothing answers, so they queue for ever.
+  const cur = await gh(`repos/${OWNER}/${repo}/actions/variables/RUNNER_LABEL`)
+  const isSet = !cur?.notFound && cur?.value === LABEL
+  if (!list.length && !isSet) continue // never migrated: nothing to watch, leave it alone
   migrated++
 
   const online = list.filter((r) => r.status === 'online').length
-  const cur = await gh(`repos/${OWNER}/${repo}/actions/variables/RUNNER_LABEL`)
-  const isSet = !cur?.notFound && cur?.value === LABEL
 
   if (online === 0 && isSet) {
-    alerts.push(`${repo}: ${list.length} runner(s) registered, NONE online -> falling back to GitHub-hosted`)
+    alerts.push(list.length
+      ? `${repo}: ${list.length} runner(s) registered, NONE online -> falling back to GitHub-hosted`
+      : `${repo}: every job still asks for "${LABEL}" but NO runner is registered at all, so they queue for ever -> falling back to GitHub-hosted`)
     if (APPLY) {
       const res = await gh(`repos/${OWNER}/${repo}/actions/variables/RUNNER_LABEL`, { method: 'DELETE' })
       flipped.push(`${repo} -> ubuntu-latest${res?.error ? ` (FAILED: ${res.error})` : ''}`)
@@ -170,7 +191,14 @@ for (const repo of repos) {
           method: 'POST', body, headers: { 'Content-Type': 'application/json' },
         })
       }
-      flipped.push(`${repo} -> ${LABEL} (runner back online)`)
+      // THE WRITE IS CHECKED, exactly like its sibling above (2026-09-01 audit). This used to
+      // report the flip home the instant it had been ATTEMPTED: a 404 from the POST leaves no
+      // apiErrors behind, so the report said "runner back online", the run went green, and the
+      // repository carried on paying for GitHub-hosted minutes. Reporting a write whose answer you
+      // never read is how a watchdog certifies the opposite of what happened.
+      const failedWrite = res?.notFound || res?.error
+      flipped.push(`${repo} -> ${LABEL} (runner back online)${failedWrite ? ` (FAILED: ${res.error || 'HTTP 404'})` : ''}`)
+      if (failedWrite) alerts.push(`${repo}: the runner is back online but the label could NOT be restored (${res?.error || 'HTTP 404'}) - this repository keeps using paid runners.`)
     }
   }
 
