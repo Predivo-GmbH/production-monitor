@@ -91,3 +91,17 @@ for (const repo of REPOS_REQUIRING_KEEPALIVE) {
     ).toBe(200);
   });
 }
+
+test('workflow-presence: DASHBOARD_PAT is present in CI', () => {
+  // The per-test `test.skip(!ghToken)` above is right for a developer running locally, but in CI
+  // it is a silent off-switch: if DASHBOARD_PAT is ever lost, expired or renamed, all 10 checks
+  // turn into SKIPs and the hourly monitor still reports green — a job that reports success for
+  // doing nothing. This test is the floor: in CI the token must exist. Local runs stay optional
+  // (GitHub Actions sets CI=true on every step; a developer's shell does not).
+  test.skip(!process.env.CI, 'local run — DASHBOARD_PAT is optional outside CI');
+
+  expect(
+    ghToken,
+    `DASHBOARD_PAT is not set in CI — all ${REPOS_REQUIRING_KEEPALIVE.length} keep-alive workflow-presence checks would silently SKIP and the monitor would still report green. Restore the secret.`
+  ).toBeTruthy();
+});

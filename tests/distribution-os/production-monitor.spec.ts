@@ -79,10 +79,39 @@ test.describe('Distribution-OS — Production Monitor', () => {
   // ── Authenticated tests ────────────────────────────────────────────
 
   test('full login works and dashboard loads', async ({ page }) => {
+    // WHAT THE OLD ASSERTION COULD NOT CATCH: it was `expect(page.url()).not.toContain('/auth')`,
+    // and it could not fail. This app signs in at /login (src/App.tsx:74) and the magic link
+    // redirects to '/', the public landing page. A run where no session was ever created therefore
+    // sits on 'https://distributionos.predivo.ch/' — a URL containing neither '/auth' nor '/login'
+    // — and the check passed with nobody logged in. Same defect, and same fix, as the Valrano
+    // login test (tests/valrano/production-monitor.spec.ts:137-177).
+    await page.addInitScript(() => { try { sessionStorage.setItem('distribution-os-dev-access', 'true') } catch {} })
     await loginViaMagicLink(page, AUTH_CONFIG)
     await page.waitForLoadState('networkidle')
-    const url = page.url()
-    expect(url).not.toContain('/auth')
+
+    // What a session actually looks like here: '/' is wrapped in PublicOnlyRoutes (src/App.tsx:55),
+    // so a real session moves it to /dashboard, which mounts AuthenticatedApp behind
+    // ProtectedRoutes; anyone without one is sent back to /login. AppLayout's desktop sidebar
+    // (<aside class="hidden md:flex ...">, src/components/layout/AppLayout.tsx:236) exists ONLY
+    // inside that authenticated shell, and the 1280px config viewport renders it.
+    await expect(
+      page.locator('aside.hidden.md\\:flex'),
+      'a signed-in session must render the authenticated app shell',
+    ).toBeVisible({ timeout: 20_000 })
+
+    // And the session itself, read back out of the browser instead of inferred from a URL.
+    // src/lib/supabase.ts creates the client at module scope (no lazy proxy), so a successful
+    // magic-link landing always writes the sb-<ref>-auth-token key.
+    const hasSession = await page.evaluate(() =>
+      Object.keys(localStorage).some(
+        (k) => k.startsWith('sb-') && k.endsWith('-auth-token') && !!localStorage.getItem(k),
+      ),
+    )
+    expect(hasSession, 'a real Supabase session must exist after the magic link').toBe(true)
+    expect(
+      page.url(),
+      'a signed-in session must not be sitting on an auth route',
+    ).not.toMatch(/\/(login|signup|auth)(?![a-z])/)
   })
 
   test('dashboard shows content after login', async ({ page }) => {

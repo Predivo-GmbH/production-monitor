@@ -9,7 +9,7 @@
 import assert from 'node:assert'
 import { readFileSync } from 'node:fs'
 import {
-  intervalMinutes, cronsIn, verdictFor, coverageLine, OVERDUE_FACTOR,
+  intervalMinutes, cronsIn, verdictFor, coverageLine, OVERDUE_FACTOR, judgeObserved,
 } from '../scripts/check-workflow-cadence.mjs'
 
 let n = 0
@@ -149,6 +149,42 @@ t('THE LIVE SHAPE: the heartbeat schedule now on disk is one this guard can judg
   for (const c of crons) {
     assert.notEqual(intervalMinutes(c), null, `cadence guard cannot read cron '${c}'`)
   }
+})
+
+// ── THE FLEET HALF: cadence MEASURED, not parsed (2026-09-02) ────────────────────────────────
+// Reading every fleet repo's YAML would cost a content fetch per workflow and would still be a
+// guess about what GitHub actually does with it. The gap between a workflow's own recent scheduled
+// runs is what it actually does. This closes the hole found the same day: pull-engine's weekly
+// technical-floor gate has a heartbeat step reading a secret that does not exist in that repo, so
+// its dead-man switch has never pinged anything.
+
+const RNOW = Date.parse('2026-09-02T16:00:00Z')
+const ranHoursAgo = (h) => ({ created_at: new Date(RNOW - h * 3600000).toISOString() })
+
+t('a weekly workflow six days after its last run is fine', () => {
+  const v = judgeObserved({ name: 'x', runs: [ranHoursAgo(144), ranHoursAgo(312), ranHoursAgo(480), ranHoursAgo(648)], now: RNOW })
+  assert.equal(v.ok, true)
+})
+
+t('a weekly workflow silent for a month is DEAD, measured against its OWN cadence', () => {
+  const v = judgeObserved({ name: 'x', runs: [ranHoursAgo(720), ranHoursAgo(888), ranHoursAgo(1056)], now: RNOW })
+  assert.equal(v.ok, false)
+  assert.match(v.why, /past 3x/)
+})
+
+t('fewer than three runs is NOT judged, because there is no observed cadence to judge against', () => {
+  // Inventing a window for a workflow with no history is how a checker starts reporting on a
+  // schedule nobody chose.
+  assert.equal(judgeObserved({ name: 'x', runs: [ranHoursAgo(1), ranHoursAgo(169)], now: RNOW }), null)
+  assert.equal(judgeObserved({ name: 'x', runs: [], now: RNOW }), null)
+})
+
+t('one slow week does not redefine the cadence, because the gap is the MEDIAN', () => {
+  // hourly, hourly, hourly, then one 40h stall in the history: the median stays ~1h.
+  const runs = [ranHoursAgo(1), ranHoursAgo(2), ranHoursAgo(3), ranHoursAgo(43)]
+  const v = judgeObserved({ name: 'x', runs, now: RNOW })
+  assert.equal(v.ok, true)
+  assert.match(v.why, /cadence about every/)
 })
 
 console.log(`\n${n} assertions passed.`)
