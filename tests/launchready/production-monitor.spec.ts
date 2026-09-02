@@ -74,10 +74,42 @@ test.describe('LaunchReady — Production Monitor', () => {
   // ── Authenticated tests ────────────────────────────────────────────
 
   test('full login works and dashboard loads', async ({ page }) => {
+    // WHAT THE OLD ASSERTION COULD NOT CATCH: it was `expect(page.url()).not.toContain('/auth')`,
+    // and it was UNFALSIFIABLE. LaunchReady has no /auth route and no /login route at all — auth
+    // is a modal opened from <Header> (src/components/layout/Header.tsx) — so no URL this app can
+    // produce contains '/auth'. A run where the magic link created no session sat on the landing
+    // page and reported a healthy login.
+    //
+    // NO localStorage sb-*-auth-token PROBE HERE, unlike the Valrano login test
+    // (tests/valrano/production-monitor.spec.ts:170). LaunchReady's Supabase client is a lazy
+    // Proxy (src/lib/supabase.ts) that only calls createClient() on first property access, and the
+    // one thing that touches it on the landing page is useAuth inside <Header>, which sits inside
+    // <PasswordGate> and is not rendered until the gate is unlocked. So the storage key can be
+    // absent after a PERFECTLY GOOD login — the probe would be measuring whether this harness woke
+    // the client, not whether the product signed anyone in.
+    //
+    // What proves the session instead is the dashboard's own signed-in content:
+    // src/app/dashboard/page.tsx renders <h2>My Audits</h2> only when `user` is truthy, and shows
+    // "Log in to see your audit history." otherwise. Both branches render an h1 "Dashboard", so
+    // the h1 proves nothing and is deliberately not used.
+    //
+    // The gate bypass is set BEFORE the magic-link navigation, so <Header> mounts on the landing
+    // page, wakes the lazy client, and lets it persist the session out of the URL hash before we
+    // navigate away.
+    await page.addInitScript(() => { try { sessionStorage.setItem('launchready-unlocked', 'true') } catch {} })
     await loginViaMagicLink(page, AUTH_CONFIG)
     await page.waitForLoadState('networkidle')
-    const url = page.url()
-    expect(url).not.toContain('/auth')
+
+    await page.goto(`${SITE_URL}/dashboard`, { waitUntil: 'networkidle' })
+    await page.locator('[role="status"]').waitFor({ state: 'hidden', timeout: 15_000 }).catch(() => {})
+    await expect(
+      page.locator('h2', { hasText: 'My Audits' }),
+      'a signed-in session must render the dashboard audits section',
+    ).toBeVisible({ timeout: 20_000 })
+    await expect(
+      page.locator('text=Log in to see your audit history'),
+      'the signed-out dashboard must not be what we are looking at',
+    ).toHaveCount(0)
   })
 
   test('dashboard shows content after login', async ({ page }) => {

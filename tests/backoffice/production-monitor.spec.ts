@@ -218,7 +218,10 @@ test.describe('BackOffice — Production Monitor', () => {
     await loginViaMagicLink(page, AUTH_OPTS)
     await page.goto(`${SITE_URL}/crm`)
     await page.waitForLoadState('networkidle')
-    await expect(page.locator('h1').first()).toBeVisible({ timeout: 10_000 })
+    // Assert the page's OWN heading: a bare h1 also matches NotFound's <h1>404</h1>
+    // (src/pages/NotFound.tsx), so a dead route scored green — exactly how /dokumente
+    // and /health-monitor stayed passing until Wave 6 (see the removals below).
+    await expect(page.locator('h1:has-text("Kontakte")').first()).toBeVisible({ timeout: 10_000 })
     expect(page.url()).toContain('/crm')
   })
 
@@ -226,7 +229,8 @@ test.describe('BackOffice — Production Monitor', () => {
     await loginViaMagicLink(page, AUTH_OPTS)
     await page.goto(`${SITE_URL}/projects`)
     await page.waitForLoadState('networkidle')
-    await expect(page.locator('h1').first()).toBeVisible({ timeout: 10_000 })
+    // Real heading, not a bare h1 — NotFound renders <h1>404</h1>, so a bare h1 passes on a dead route.
+    await expect(page.locator('h1:has-text("Projekte")').first()).toBeVisible({ timeout: 10_000 })
     expect(page.url()).toContain('/projects')
   })
 
@@ -237,7 +241,8 @@ test.describe('BackOffice — Production Monitor', () => {
     await loginViaMagicLink(page, AUTH_OPTS)
     await page.goto(`${SITE_URL}/banking`)
     await page.waitForLoadState('networkidle')
-    await expect(page.locator('h1').first()).toBeVisible({ timeout: 10_000 })
+    // Real heading, not a bare h1 — NotFound renders <h1>404</h1>, so a bare h1 passes on a dead route.
+    await expect(page.locator('h1:has-text("Banking")').first()).toBeVisible({ timeout: 10_000 })
     expect(page.url()).toContain('/banking')
   })
 
@@ -245,7 +250,8 @@ test.describe('BackOffice — Production Monitor', () => {
     await loginViaMagicLink(page, AUTH_OPTS)
     await page.goto(`${SITE_URL}/stripe`)
     await page.waitForLoadState('networkidle')
-    await expect(page.locator('h1').first()).toBeVisible({ timeout: 10_000 })
+    // Real heading, not a bare h1 — NotFound renders <h1>404</h1>, so a bare h1 passes on a dead route.
+    await expect(page.locator('h1:has-text("Stripe Dashboard")').first()).toBeVisible({ timeout: 10_000 })
     expect(page.url()).toContain('/stripe')
   })
 
@@ -256,21 +262,26 @@ test.describe('BackOffice — Production Monitor', () => {
     await loginViaMagicLink(page, AUTH_OPTS)
     await page.goto(`${SITE_URL}/invoicing`)
     await page.waitForLoadState('networkidle')
-    await expect(page.locator('h1').first()).toBeVisible({ timeout: 10_000 })
+    // Real heading, not a bare h1 — NotFound renders <h1>404</h1>, so a bare h1 passes on a dead route.
+    await expect(page.locator('h1:has-text("Debitoren")').first()).toBeVisible({ timeout: 10_000 })
+    expect(page.url()).toContain('/invoicing')
   })
 
   test('bills page loads', async ({ page }) => {
     await loginViaMagicLink(page, AUTH_OPTS)
     await page.goto(`${SITE_URL}/bills`)
     await page.waitForLoadState('networkidle')
-    await expect(page.locator('h1').first()).toBeVisible({ timeout: 10_000 })
+    // Real heading, not a bare h1 — NotFound renders <h1>404</h1>, so a bare h1 passes on a dead route.
+    await expect(page.locator('h1:has-text("Kreditoren")').first()).toBeVisible({ timeout: 10_000 })
+    expect(page.url()).toContain('/bills')
   })
 
   test('accounting page loads', async ({ page }) => {
     await loginViaMagicLink(page, AUTH_OPTS)
     await page.goto(`${SITE_URL}/accounting`)
     await page.waitForLoadState('networkidle')
-    await expect(page.locator('h1').first()).toBeVisible({ timeout: 10_000 })
+    // Real heading, not a bare h1 — NotFound renders <h1>404</h1>, so a bare h1 passes on a dead route.
+    await expect(page.locator('h1:has-text("Buchhaltung")').first()).toBeVisible({ timeout: 10_000 })
     expect(page.url()).toContain('/accounting')
   })
 
@@ -278,14 +289,17 @@ test.describe('BackOffice — Production Monitor', () => {
     await loginViaMagicLink(page, AUTH_OPTS)
     await page.goto(`${SITE_URL}/time-tracking`)
     await page.waitForLoadState('networkidle')
-    await expect(page.locator('h1').first()).toBeVisible({ timeout: 10_000 })
+    // Real heading, not a bare h1 — NotFound renders <h1>404</h1>, so a bare h1 passes on a dead route.
+    await expect(page.locator('h1:has-text("Zeiterfassung")').first()).toBeVisible({ timeout: 10_000 })
+    expect(page.url()).toContain('/time-tracking')
   })
 
   test('settings page loads', async ({ page }) => {
     await loginViaMagicLink(page, AUTH_OPTS)
     await page.goto(`${SITE_URL}/settings`)
     await page.waitForLoadState('networkidle')
-    await expect(page.locator('h1').first()).toBeVisible({ timeout: 10_000 })
+    // Real heading, not a bare h1 — NotFound renders <h1>404</h1>, so a bare h1 passes on a dead route.
+    await expect(page.locator('h1:has-text("Einstellungen")').first()).toBeVisible({ timeout: 10_000 })
     expect(page.url()).toContain('/settings')
   })
 
@@ -327,7 +341,9 @@ test.describe('BackOffice — Production Monitor', () => {
     await loginViaMagicLink(page, AUTH_OPTS)
     await page.goto(`${SITE_URL}/stripe`)
     await page.waitForLoadState('networkidle')
-    await expect(page.locator('h1').first()).toBeVisible({ timeout: 10_000 })
+    // Real heading, not a bare h1 — NotFound renders <h1>404</h1>, so a bare h1 passes on a dead route.
+    await expect(page.locator('h1:has-text("Stripe Dashboard")').first()).toBeVisible({ timeout: 10_000 })
+    expect(page.url()).toContain('/stripe')
     const balanceLocator = page.locator('text=/CHF|Balance|Saldo|Guthaben|Umsatz/i').first()
     await expect(balanceLocator).toBeVisible({ timeout: 15_000 })
   })
@@ -377,8 +393,10 @@ test.describe('BackOffice — Production Monitor', () => {
     await page.goto(`${SITE_URL}/crm`)
     await page.waitForLoadState('networkidle')
 
-    // Wait for the contacts table to settle (loading state resolves)
-    await expect(page.locator('h1').first()).toBeVisible({ timeout: 10_000 })
+    // Wait for the contacts table to settle (loading state resolves).
+    // Real heading, not a bare h1 — NotFound renders <h1>404</h1>, so a bare h1 passes on a dead route.
+    await expect(page.locator('h1:has-text("Kontakte")').first()).toBeVisible({ timeout: 10_000 })
+    expect(page.url()).toContain('/crm')
     await page.waitForTimeout(1500)
 
     // Click "Neuer Kontakt" button
@@ -467,6 +485,7 @@ test.describe('BackOffice — Production Monitor', () => {
     await page.waitForLoadState('networkidle')
 
     await expect(page.locator('h1:has-text("Debitoren")').first()).toBeVisible({ timeout: 10_000 })
+    expect(page.url()).toContain('/invoicing')
 
     // Wait for invoice data to load
     await page.waitForTimeout(2000)
@@ -489,8 +508,9 @@ test.describe('BackOffice — Production Monitor', () => {
     if (count > 1) {
       await filterButtons.nth(1).click()
       await page.waitForTimeout(800)
-      // Should not crash — h1 still present
-      await expect(page.locator('h1').first()).toBeVisible({ timeout: 5_000 })
+      // Should not crash — the Debitoren heading is still present. Named, not a bare h1:
+      // NotFound renders <h1>404</h1>, so a bare h1 would also pass on a crashed/redirected route.
+      await expect(page.locator('h1:has-text("Debitoren")').first()).toBeVisible({ timeout: 5_000 })
     }
 
     // Search box is present and accepts input
@@ -511,6 +531,7 @@ test.describe('BackOffice — Production Monitor', () => {
     await page.waitForLoadState('networkidle')
 
     await expect(page.locator('h1:has-text("Banking")').first()).toBeVisible({ timeout: 10_000 })
+    expect(page.url()).toContain('/banking')
 
     // Wait for data hooks to resolve
     await page.waitForTimeout(2000)
@@ -527,7 +548,9 @@ test.describe('BackOffice — Production Monitor', () => {
     if (visible) {
       await filterButtons.first().click()
       await page.waitForTimeout(500)
-      await expect(page.locator('h1').first()).toBeVisible({ timeout: 5_000 })
+      // Named heading, not a bare h1: NotFound renders <h1>404</h1>, so a bare h1 would
+      // also pass on a crashed/redirected route.
+      await expect(page.locator('h1:has-text("Banking")').first()).toBeVisible({ timeout: 5_000 })
     }
 
     // Import button must always be present
@@ -544,6 +567,7 @@ test.describe('BackOffice — Production Monitor', () => {
     await page.waitForLoadState('networkidle')
 
     await expect(page.locator('h1:has-text("Buchhaltung")').first()).toBeVisible({ timeout: 10_000 })
+    expect(page.url()).toContain('/accounting')
 
     // All 6 tab buttons must be visible
     const expectedTabs = ['Kontenplan', 'Bilanz', 'Erfolgsrechnung', 'Journal', 'Offene Posten', 'Buchung erfassen']
@@ -589,6 +613,7 @@ test.describe('BackOffice — Production Monitor', () => {
     await page.waitForLoadState('networkidle')
 
     await expect(page.locator('h1:has-text("Zeiterfassung")').first()).toBeVisible({ timeout: 10_000 })
+    expect(page.url()).toContain('/time-tracking')
 
     // Wait for projects list to load (needed for the form select)
     await page.waitForTimeout(2000)
@@ -668,6 +693,7 @@ test.describe('BackOffice — Production Monitor', () => {
     await page.waitForLoadState('networkidle')
 
     await expect(page.locator('h1:has-text("Einstellungen")').first()).toBeVisible({ timeout: 10_000 })
+    expect(page.url()).toContain('/settings')
 
     // Wait for profile data to load
     await page.waitForTimeout(2000)
@@ -721,6 +747,7 @@ test.describe('BackOffice — Production Monitor', () => {
     await page.waitForLoadState('networkidle')
 
     await expect(page.locator('h1:has-text("Stripe Dashboard")').first()).toBeVisible({ timeout: 10_000 })
+    expect(page.url()).toContain('/stripe')
 
     // Wait for Stripe API calls to resolve
     await page.waitForTimeout(3000)

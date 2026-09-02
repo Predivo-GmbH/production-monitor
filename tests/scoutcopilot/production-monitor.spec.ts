@@ -66,8 +66,39 @@ test.describe('ScoutCopilot — Production Monitor', () => {
   test('full login works and dashboard loads', async ({ page }) => {
     await loginViaMagicLink(page, AUTH_CONFIG)
     await page.waitForLoadState('networkidle')
+
+    // WHY THIS READS THE SESSION INSTEAD OF ASSERTING not.toContain('/auth').
+    //
+    // ScoutCopilot signs in at /:lang/login (src/App.tsx:76) — only the Supabase
+    // callbacks live under /auth. loginViaMagicLink redirects to SITE_URL, and '/'
+    // is <Navigate to="/en">, the public LandingPage. So a run where the session was
+    // never established sits on 'https://scoutcopilot.com/en': a URL containing no
+    // '/auth' at all, and the old assertion passed with nobody logged in. It could
+    // not fail for the failure it was written to catch.
+    //
+    // What proves a session is the session itself: supabase-js persists it in
+    // localStorage under sb-<project-ref>-auth-token (src/lib/supabase.ts uses the
+    // default storage). Same fix as tests/valrano/production-monitor.spec.ts.
+    // Polled, because the SPA writes the key while it consumes the URL hash.
+    await expect
+      .poll(
+        () =>
+          page.evaluate(() =>
+            Object.keys(localStorage).some(
+              (k) => k.startsWith('sb-') && k.endsWith('-auth-token') && !!localStorage.getItem(k),
+            ),
+          ),
+        {
+          message: 'a real Supabase session must exist in localStorage after the magic link',
+          timeout: 15_000,
+        },
+      )
+      .toBe(true)
+
     const url = page.url()
-    expect(url).not.toContain('/auth')
+    expect(url, 'a signed-in session must not be sitting on a login route').not.toMatch(
+      /\/(login|signup|auth)(?![a-z])/,
+    )
   })
 
   test('dashboard loads after login', async ({ page }) => {
@@ -113,31 +144,34 @@ test.describe('ScoutCopilot — Production Monitor', () => {
     const btn = page.locator('button').filter({ hasText: /^search$/i }).first()
     await btn.click()
 
-    // Wait for results with graceful timeout handling (same pattern as detail test)
+    // Wait for the search to ANSWER: a result count, the empty state, or a row.
+    // Strings confirmed in SearchResultsTable.tsx + src/i18n/en.json:
+    //   search.playersFound = 'players found' / search.playerFound = 'player found'
+    //   search.noResults    = 'No players found'  (the empty state)
     const gotResponse = await page.waitForFunction(
       () => {
         const body = document.body.textContent?.toLowerCase() ?? ''
         return (
-          body.includes('found') ||
-          body.includes('no player') ||
+          body.includes('players found') ||
+          body.includes('player found') ||
+          body.includes('no players found') ||
           document.querySelector('table tbody tr') !== null
         )
       },
       { timeout: 60_000 },
     ).then(() => true).catch(() => false)
 
-    // If search timed out, verify page is still functional
-    const bodyText = (await page.locator('body').textContent())?.toLowerCase() ?? ''
-    if (!gotResponse) {
-      // Non-fatal: search API may be slow, but page should still be alive
-      expect(bodyText.length).toBeGreaterThan(50)
-      return
-    }
-    const respondedToSearch =
-      bodyText.includes('found') ||
-      bodyText.includes('no player') ||
-      (await page.locator('table tbody tr').count()) > 0
-    expect(respondedToSearch).toBe(true)
+    // A search backend that never answers must turn this test red. The old form
+    // swallowed the timeout and asserted only bodyText.length > 50 — but the shell,
+    // nav and headings are always > 50 characters, so a total search outage passed
+    // as green. Same leniency tests/signalscore/production-monitor.spec.ts deleted
+    // for its Zefix search (§'"Migros" MUST return results').
+    expect(
+      gotResponse,
+      'search for "Messi" produced no result count, no empty state and no row within 60s — search pipeline down?',
+    ).toBe(true)
+    // The re-read of body text that used to follow was implied by the assertion
+    // above: it tested the same three signals waitForFunction had just matched.
   })
 
   test('player detail view: search then click first result to view profile', async ({ page }) => {
@@ -155,29 +189,36 @@ test.describe('ScoutCopilot — Production Monitor', () => {
 
     // SearchResultsTable renders <tr role="link"> rows in table view (default on desktop).
     // Grid view renders [role="button"][aria-label="<player>: <name>"].
-    // Wait for either, or gracefully accept no-results state.
+    // Wait for rows or the empty state. The empty-state string used to be 'no results'
+    // — that is the i18n KEY (search.noResults); the rendered English text is
+    // 'No players found' (src/i18n/en.json). Matching the key meant a genuine empty
+    // state was never recognised, which only stayed invisible because the timeout
+    // below was non-fatal.
     const hasResults = await page.waitForFunction(
       () => {
         const rows = document.querySelectorAll('table tbody tr[role="link"]')
         const cards = document.querySelectorAll('[role="button"][aria-label^="Player:"]')
         const body = document.body.textContent ?? ''
-        return rows.length > 0 || cards.length > 0 || body.toLowerCase().includes('no results')
+        return rows.length > 0 || cards.length > 0 || body.toLowerCase().includes('no players found')
       },
       { timeout: 60_000 },
     ).then(() => true).catch(() => false)
 
-    if (!hasResults) {
-      // Timeout — treat as non-fatal if page body shows any response
-      const bodyText = (await page.locator('body').textContent()) ?? ''
-      expect(bodyText.length).toBeGreaterThan(50)
-      return
-    }
+    // Must fail when the search answered with nothing at all. The old form caught the
+    // timeout and asserted bodyText.length > 50, which the app shell satisfies even
+    // when the search backend is dead — so it could not detect the outage it was
+    // watching for (leniency removed in tests/signalscore/production-monitor.spec.ts).
+    expect(
+      hasResults,
+      'search produced no row, no card and no empty state within 60s — search pipeline down?',
+    ).toBe(true)
 
     // Check if we got actual results or the empty state
     const bodyText = (await page.locator('body').textContent()) ?? ''
-    if (bodyText.toLowerCase().includes('no results')) {
-      // Empty state is a valid outcome — test passes
-      expect(bodyText.toLowerCase()).toContain('no results')
+    if (bodyText.toLowerCase().includes('no players found')) {
+      // Empty state is a valid outcome — return. The expect() that used to sit here
+      // re-asserted the exact substring this `if` had just matched, so it could never
+      // fail; taking this branch already proves the empty state rendered.
       return
     }
 
@@ -239,13 +280,16 @@ test.describe('ScoutCopilot — Production Monitor', () => {
     const liveIndicator = page.locator('span').filter({ hasText: /live/i }).first()
     await expect(liveIndicator).toBeVisible({ timeout: 5_000 })
 
-    // Recent searches section is always rendered (table or empty state)
-    // DashboardPage always renders the "RECENT SEARCHES" header via t('dashboard.recentSearches')
-    const hasRecentSection =
-      bodyText.toLowerCase().includes('recent') ||
-      bodyText.toLowerCase().includes('search') ||
-      bodyText.toLowerCase().includes('query')
-    expect(hasRecentSection).toBe(true)
+    // Recent searches section is always rendered (table or empty state).
+    // DashboardPage renders it as an <h3> holding t('dashboard.recentSearches') =
+    // 'Recent Searches' (DashboardPage.tsx:107), outside the has-rows conditional.
+    // The old check was an OR that included 'search' — a substring the quick-actions
+    // assertion five lines above had already proven present — so it could not fail
+    // even if the whole Recent Searches panel had disappeared. Assert the heading.
+    await expect(
+      page.getByRole('heading', { name: /recent searches/i }).first(),
+      'the Recent Searches panel must render (header is unconditional)',
+    ).toBeVisible({ timeout: 10_000 })
   })
 
   test('settings interaction: settings tabs and profile form load', async ({ page }) => {
@@ -292,8 +336,17 @@ test.describe('ScoutCopilot — Production Monitor', () => {
       { timeout: 10_000 },
     )
 
-    const billingText = (await page.locator('body').textContent()) ?? ''
-    expect(billingText.toLowerCase()).toMatch(/plan|billing|subscription|tier/)
+    // The old assertion here matched /plan|billing|subscription|tier/ against the body —
+    // but the waitForFunction directly above had already waited for 'plan' or 'billing',
+    // and the word "Billing" is on the page before any click, in the nav tab we just
+    // pressed. It therefore could not fail even if BillingSettings never mounted.
+    // 'Current Usage' (t('settings.billing.currentUsage'), BillingSettings.tsx:82) exists
+    // ONLY in the loaded panel — not in the nav, not in the role="status" loading state —
+    // so it proves the panel actually rendered.
+    await expect(
+      page.getByText(/current usage/i).first(),
+      'clicking the Billing tab must render the loaded BillingSettings panel',
+    ).toBeVisible({ timeout: 15_000 })
   })
 
   test('site identity — title contains scoutcopilot', async ({ page }) => {
