@@ -39,6 +39,7 @@ import { join } from 'path'
 import { homedir } from 'os'
 import { pathToFileURL } from 'url'
 import { DEPLOY_DENY_TOOLS, agentToolFlags, DEPLOY_DENY_POLICY_NOTE } from './lib/deploy-deny-tools.mjs'
+import { adoptionTarget, closurePlan, resolvedPatch, sameEntitySignals, ACTIVE_SIGNAL_STATES } from './lib/signal-closure.mjs'
 
 // ── config ──────────────────────────────────────────────────────────────────────────────
 const BO_REF = 'xoecpzfsskalvjrtcbbl'
@@ -345,6 +346,13 @@ export function signalToIncident(sig) {
     // marker onto the item on every run - a marker flood in place of a mute. Attaching twice must
     // be a no-op, and this is what makes it one.
     joined_to: detail.work_item ?? null,
+    // WHETHER THAT POINTER CAME FROM A JOIN OR FROM A SUPERSEDE, and the two must not be confused.
+    // `joined_at` is stamped by markSignalJoined and by nothing else, so its presence is the only
+    // honest way to tell "attached to a live job, deliberately still visible on /signals" (Roger,
+    // 2026-08-28) from "handed over and muted". adoptionTarget() refuses to adopt a joined row for
+    // exactly that reason: adopting routes it into supersedeSignal, which is the mute that decision
+    // reversed. Without this field the two states are indistinguishable downstream.
+    joined_at: detail.joined_at ?? null,
   }
 }
 
@@ -1336,12 +1344,14 @@ export function handedOverClearsCounter(r) {
 }
 
 export async function routeToWorkBoard(inc, cls, deps) {
-  const slug = workItemSlugFor(inc)
+  const hashSlug = workItemSlugFor(inc)
+  let slug = hashSlug
   const { title, objections, from } = plainTitle(inc)
   const existing = await deps.findItem(slug)
 
   let created = false
   let itemId = existing?.id ?? null
+  let adopted = null
   if (existing && CLOSED_WORK_STATUSES.has(existing.status)) {
     // A RECURRENCE AFTER SIGN-OFF is new work, not the old item. Two wrong moves are possible here
     // and this branch refuses both: re-minting under the same slug would break idempotence and pile
@@ -1362,6 +1372,37 @@ export async function routeToWorkBoard(inc, cls, deps) {
     // handled above, because superseding onto a finished item is a silent mute.
     deps.log?.(`    already on the work board as "${existing.slug}" (${existing.status}) — not minting a second item`)
   } else {
+    // ── ADOPT BEFORE MINTING ────────────────────────────────────────────────────────────────
+    // No row exists under THIS hash. That is normally correct — but two known board defects make
+    // it a lie, and both of them mint a duplicate task for work that already has one:
+    //
+    //   * A RENAMED KEY. The slug is sha1(source|key), so a signal's key IS its task identity. The
+    //     2026-08-27 key-normalisation cutover renamed two commit-review keys and the next run
+    //     minted twins under the new hashes, stranding the originals (4cc5f100, 48df96b6) that no
+    //     producer could ever close again. The signal ROW survived that rename, and it is still
+    //     carrying detail.work_item — an exact pointer the drainer wrote itself.
+    //   * ONE FAULT, TWO CHANNELS. upsert_incident deduplicates on (source, key), so the same fault
+    //     arriving by healthchecks mail and by backoffice mail is two rows, two hashes, two items.
+    //     Measured 2026-09-02: 12 such pairs among 659 rows.
+    //
+    // So follow the pointer that already exists rather than guessing at a new one. This is
+    // deliberately NOT the key-stem fallback that was proposed and rejected: a stem match silently
+    // merges signals whose keys merely share a prefix, and a silent merge is worse than a duplicate
+    // because a duplicate is visible. adoptionTarget matches only an exact stored pointer or an
+    // exact whole-key equality, and refuses when the answer is ambiguous or the item is finished.
+    if (deps.findAdoptableItem) {
+      adopted = await deps.findAdoptableItem(inc)
+      if (adopted?.slug) {
+        slug = adopted.slug
+        itemId = adopted.item?.id ?? null
+        deps.log?.(`    ADOPTING existing work item "${adopted.slug}" instead of minting "${hashSlug}" (${adopted.via}: ${adopted.evidence})`)
+      }
+    }
+    if (adopted?.slug) {
+      // Fall through to the supersede at the bottom: the task already exists and is live, so the
+      // signal is handed over onto it exactly as if this run had minted it. Nothing new is created
+      // and the adopted item's own evidence trail is not spammed on every 20-minute tick.
+    } else {
     // No row exists for THIS signal yet. Before minting a sibling on Roger's lane, look for a
     // LIVE in-progress item a session is already working that is plainly about the same object,
     // and attach the signal to THAT instead — this is the whole reason this step exists.
@@ -1442,10 +1483,22 @@ export async function routeToWorkBoard(inc, cls, deps) {
         })
       }
     }
+    }
   }
 
   const superseded = await deps.supersedeSignal(inc, slug)
-  return { created, slug, title, superseded, objections, reason: cls?.reason || 'needs a person' }
+  return {
+    created,
+    slug,
+    title,
+    superseded,
+    objections,
+    // The slug this signal WOULD have minted under, kept so a log line can name both sides of an
+    // adoption. Equal to `slug` on every ordinary run.
+    hashSlug,
+    adopted: adopted ? { via: adopted.via, evidence: adopted.evidence, slug: adopted.slug } : null,
+    reason: adopted ? `adopted the existing work item (${adopted.via})` : (cls?.reason || 'needs a person'),
+  }
 }
 
 /**
@@ -1469,6 +1522,88 @@ export function workBoardDeps(secret, base = BO_BASE) {
       const rows = await res.json()
       return rows[0] || null
     },
+    /**
+     * The work item this signal already belongs to, read from EXACT stored pointers only.
+     *
+     * Two reads, both cheap, both by equality:
+     *   1. this row's own detail.work_item (carried through as inc.joined_to) — survives a key
+     *      rename, because renaming a key does not delete the row that holds the pointer;
+     *   2. rows with the IDENTICAL key under a different source — the (source,key) split — and the
+     *      items their pointers name.
+     *
+     * Every failure returns null, which means "mint a row exactly as before". That is the safe
+     * direction and the only one: a read we could not complete must never be able to fold a live
+     * signal into somebody else's task.
+     */
+    async findAdoptableItem(inc) {
+      try {
+        let pointerItem = null
+        if (inc?.joined_to) {
+          const r = await fetch(`${base}/rest/v1/work_items?slug=eq.${encodeURIComponent(inc.joined_to)}&select=id,slug,status,title&limit=1`, { headers: H })
+          if (r.ok) pointerItem = (await r.json())[0] || null
+          else log(`    could not read the stored work_item pointer (HTTP ${r.status}) — will mint rather than guess`)
+        }
+        const siblingItems = []
+        if (inc?.key) {
+          const r = await fetch(`${base}/rest/v1/fleet_signals?key=eq.${encodeURIComponent(inc.key)}&select=source,key,state,detail`, { headers: H })
+          if (r.ok) {
+            const rows = await r.json()
+            const wanted = [...new Set(rows
+              .filter((s) => s.source !== inc.source && s?.detail?.work_item)
+              .map((s) => s.detail.work_item))]
+            if (wanted.length) {
+              const q = wanted.map((x) => `"${x}"`).join(',')
+              const ri = await fetch(`${base}/rest/v1/work_items?slug=in.(${encodeURIComponent(q)})&select=id,slug,status,title`, { headers: H })
+              if (ri.ok) {
+                const items = await ri.json()
+                const bySlug = new Map(items.map((i) => [i.slug, i]))
+                for (const s of rows) {
+                  const it = bySlug.get(s?.detail?.work_item)
+                  if (it) siblingItems.push({ signal: s, item: it })
+                }
+              }
+            }
+          } else log(`    could not read same-key sibling signals (HTTP ${r.status}) — will mint rather than guess`)
+        }
+        return adoptionTarget(inc, { pointerItem, siblingItems })
+      } catch (e) {
+        log(`    adoption lookup failed (${String(e).slice(0, 120)}) — minting a row, which is the safe direction`)
+        return null
+      }
+    },
+
+    /** Active signal rows that carry a work-item pointer — the input to the closure sweep. The
+     *  select carries last_seen_at, which boardQueryUrl does not: the whole sweep turns on being
+     *  able to order "seen again" against "work finished". */
+    async listPointedActiveSignals() {
+      const res = await fetch(`${base}/rest/v1/fleet_signals`
+        + `?select=id,source,key,title,state,detail,first_seen_at,last_seen_at`
+        + `&state=in.(${[...ACTIVE_SIGNAL_STATES].join(',')})`, { headers: H })
+      if (!res.ok) throw new Error(`fleet_signals read HTTP ${res.status}`)
+      return await res.json()
+    },
+
+    /** The work_items rows for a set of slugs, in one read. */
+    async findItemsBySlugs(slugs) {
+      const list = [...new Set((slugs || []).filter(Boolean))]
+      if (!list.length) return []
+      const q = list.map((x) => `"${x}"`).join(',')
+      const res = await fetch(`${base}/rest/v1/work_items?slug=in.(${encodeURIComponent(q)})&select=id,slug,status,title,closed_at,state_since`, { headers: H })
+      if (!res.ok) throw new Error(`work_items read HTTP ${res.status}`)
+      return await res.json()
+    },
+
+    /** Close one signal against its finished work item. PATCHed by primary key, so it can never
+     *  touch a second row by accident the way a (source,key) filter could after a rename. */
+    async resolveSignal(row, item, why) {
+      const res = await fetchWithTransportRetry(`${base}/rest/v1/fleet_signals?id=eq.${encodeURIComponent(row.id)}`, {
+        method: 'PATCH', headers: { ...H, Prefer: 'return=minimal' },
+        body: JSON.stringify(resolvedPatch({ row, item, why })),
+      })
+      if (!res.ok) throw new Error(`signal resolve HTTP ${res.status}: ${(await res.text()).slice(0, 160)}`)
+      return true
+    },
+
     /**
      * The items a session is ACTIVELY working — read from the work_board VIEW, whose lane logic
      * (sql/066) already encodes "in progress right now" as owner_session set AND activity inside
@@ -1588,6 +1723,91 @@ export function workBoardDeps(secret, base = BO_BASE) {
       return true
     },
   }
+}
+
+/**
+ * THE REVERSE LINK: a finished work item closes the signal(s) it was handed.
+ *
+ * routeToWorkBoard writes the forward link — signal -> work item — and until now nothing ever
+ * walked it back. So a complaint stayed in the active band after the work fixing it was signed off,
+ * and anything that re-derives work from open signals could mint a fresh question about a problem
+ * that no longer existed. That is not hypothetical: on 2026-09-02 at 04:07:39Z an overnight session
+ * put commit-review/BackOffice:e2492d9:health-monitor-has-no-page-policy-row back on Roger's lane,
+ * opening with a clause that stopped being true when the paging rule went live at
+ * 2026-09-01 20:45:30Z. A person resolved that row by hand at 06:08:36Z.
+ *
+ * EVERY ROW FOR THE ENTITY, NOT JUST ONE. Because upsert_incident deduplicates on (source, key),
+ * one fault reported through two channels is two rows and only one of them carries the pointer.
+ * Closing that one would leave its twin sitting open saying the same thing. sameEntitySignals()
+ * gathers both, by exact key equality.
+ *
+ * WHAT IT REFUSES TO DO. It never resolves a row whose producer has seen it AFTER the work
+ * finished — that is a recurrence and it stays loud. See closurePlan(), which is where that guard
+ * lives and where it is tested.
+ *
+ * SCOPE, chosen deliberately: the ACTIVE band only (open + acknowledged). A `superseded` row is
+ * already off every board surface and costs nobody anything, so sweeping the several hundred
+ * historical ones would be a bulk rewrite of rows that are not hurting anyone — and this defect is
+ * specifically about a complaint that stays VISIBLE and gets re-derived. The rows that are both
+ * pointed and active are exactly the two populations that matter: a signal its producer re-opened
+ * after the hand-off, and a signal ATTACHED to a live job. The second is worth spelling out,
+ * because Roger's 2026-08-28 decision was that a joined signal stays on /signals "until a person
+ * marks it handled" — and a person signing off the work item it is attached to IS that person
+ * marking it handled. This closes it on his own terms rather than around them.
+ */
+export async function sweepFinishedWork(deps, { dryRun = false } = {}) {
+  const out = { checked: 0, entities: 0, resolved: [], keptOpen: [], errors: [] }
+  let signals
+  try {
+    signals = await deps.listPointedActiveSignals()
+  } catch (e) {
+    // A read failure is reported, never swallowed into a green "nothing to do" — a sweep that
+    // reports success for doing nothing is worse than one that fails.
+    out.errors.push(`could not read active signals: ${String(e).slice(0, 160)}`)
+    return out
+  }
+  const pointed = signals.filter((s) => s?.detail?.work_item)
+  out.checked = pointed.length
+  const slugs = [...new Set(pointed.map((s) => s.detail.work_item))]
+  if (!slugs.length) return out
+
+  let items
+  try {
+    items = await deps.findItemsBySlugs(slugs)
+  } catch (e) {
+    out.errors.push(`could not read work items: ${String(e).slice(0, 160)}`)
+    return out
+  }
+
+  const handled = new Set()
+  for (const item of items) {
+    const plan = closurePlan({ item, signals })
+    if (plan.skipped) continue
+    out.entities++
+    for (const k of plan.keepOpen) {
+      if (handled.has(k.row.id)) continue
+      handled.add(k.row.id)
+      out.keptOpen.push({ source: k.row.source, key: k.row.key, item: item.slug, why: k.why })
+      deps.log?.(`    LEFT OPEN ${k.row.source}/${k.row.key} — ${k.why}`)
+    }
+    for (const r of plan.resolve) {
+      if (handled.has(r.row.id)) continue
+      handled.add(r.row.id)
+      if (dryRun) {
+        out.resolved.push({ source: r.row.source, key: r.row.key, item: item.slug, via: r.via, dryRun: true })
+        deps.log?.(`    would RESOLVE ${r.row.source}/${r.row.key} (${r.via}) — ${r.why}`)
+        continue
+      }
+      try {
+        await deps.resolveSignal(r.row, item, r.why)
+        out.resolved.push({ source: r.row.source, key: r.row.key, item: item.slug, via: r.via })
+        deps.log?.(`    RESOLVED ${r.row.source}/${r.row.key} (${r.via}) — ${r.why}`)
+      } catch (e) {
+        out.errors.push(`${r.row.source}/${r.row.key}: ${String(e).slice(0, 160)}`)
+      }
+    }
+  }
+  return out
 }
 
 // ── Tier-B agent policy (the boundary is enforced here + in allowedTools) ─────────────────
@@ -2109,6 +2329,22 @@ async function main() {
     log(`      it is dispatched OUTSIDE the blast-radius cap (${MAX_PER_RUN} + 1 this run), so reviving it never displaces fresh work.`)
   }
 
+  // ── close the signals whose work has finished, BEFORE anything is derived from the board ────
+  // Deliberately ahead of the dry-run return so a DRY-RUN still REPORTS what it would close: this
+  // sweep is the half of the signal<->work-item link that was missing, and a fix nobody can see
+  // running is how the forward link went a fortnight without anyone noticing the reverse one was
+  // absent. FIXTURE runs read canned data and have no live board, so they skip it entirely.
+  if (!FIXTURE) {
+    const sweepDeps = workBoardDeps(secret)
+    log('  ⏵ closing signals whose work item has finished (the reverse of the hand-off link)')
+    const sw = await sweepFinishedWork(sweepDeps, { dryRun: !LIVE })
+    log(`    ${sw.checked} active signal(s) carry a work-item pointer; ${sw.entities} of those items are finished`
+      + ` — ${LIVE ? 'resolved' : 'would resolve'} ${sw.resolved.length}, left open ${sw.keptOpen.length} (seen again since the close)`)
+    // Errors are NAMED, never folded into the count. A sweep that reports success for doing nothing
+    // is worse than one that fails.
+    for (const e of sw.errors) log(`    ⚠ closure sweep error: ${e}`)
+  }
+
   // In DRY-RUN or FIXTURE we stop here: classification only, nothing dispatched or written.
   if (!LIVE || FIXTURE) {
     const fixes = toWork.filter((r) => r.cls.mode === 'fix').length
@@ -2146,7 +2382,8 @@ async function main() {
         if (r.joined) {
           log(`    joined live in-progress item ${r.slug} (tier ${r.tier}) — no new row, no owner touched; signal ${(r.marked || r.alreadyAttached) ? 'marked as attached — still on /signals until a person ticks it off' : 'NOT MARKED (join write failed)'}`)
         } else {
-          log(`    ${r.created ? 'created' : 'already existed'}: ${r.slug} — signal ${r.superseded ? 'superseded (off the alarm surface)' : 'LEFT OPEN (supersede failed)'}`)
+          const how = r.adopted ? `ADOPTED (${r.adopted.via}, no second row minted; would have been ${r.hashSlug})` : (r.created ? 'created' : 'already existed')
+          log(`    ${how}: ${r.slug} — signal ${r.superseded ? 'superseded (off the alarm surface)' : 'LEFT OPEN (supersede failed)'}`)
         }
         if (handedOverClearsCounter(r)) { delete state.attempts[inc.key]; delete state.stuck[inc.key]; saveState(state) }
         continue
