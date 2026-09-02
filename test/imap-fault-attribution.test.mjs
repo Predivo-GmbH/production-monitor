@@ -42,7 +42,7 @@ import assert from 'node:assert'
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, dirname, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { MailboxUnreachableError, describeOtpFailure } from '../scripts/lib/otp-failure.mjs'
+import { MailboxUnreachableError, describeOtpFailure, imapCauseText } from '../scripts/lib/otp-failure.mjs'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 let passed = 0
@@ -199,6 +199,100 @@ check('waitForOtpEmail proves the mailbox before reporting an empty inbox', () =
   const provenAt = src.indexOf('mailboxProven = true')
   const searchAt = src.indexOf('await client.search(')
   assert.ok(provenAt > searchAt && searchAt !== -1, 'mailboxProven is not set by a completed search')
+})
+
+// ── 9. THE REAL SHAPE: an imapflow login rejection, reproduced property-for-property ──
+// Measured 2026-09-03 against a live IMAP server (one login with an invalid account):
+//   message "Command failed" | response "3 NO [AUTHENTICATIONFAILED] Invalid credentials
+//   (Failure)" | serverResponseCode "AUTHENTICATIONFAILED" | authenticationFailed true
+// Case 2 above uses a hand-made Error whose .message carries the text, so it passed for a
+// full day while every production run printed "Underlying IMAP error: Command failed".
+function imapflowLoginRejection() {
+  const err = new Error('Command failed') // <- imap-flow.js:747, constant for ALL NO/BAD
+  err.response = '3 NO [AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+  err.responseText = 'Invalid credentials (Failure)'
+  err.responseStatus = 'NO'
+  err.serverResponseCode = 'AUTHENTICATIONFAILED'
+  err.authenticationFailed = true
+  err.executedCommand = '3 LOGIN "monitor@example" "(* value hidden *)"'
+  return err
+}
+
+check('the real imapflow rejection is not reduced to "Command failed"', () => {
+  const msg = describeOtpFailure(
+    new MailboxUnreachableError('IMAP connect/login failed', imapflowLoginRejection()),
+    'ReplyFlow',
+  )
+  assert.ok(
+    !/Underlying IMAP error: Command failed$/.test(msg),
+    'the message still ends in "Command failed" - the diagnosis on the error object was dropped again',
+  )
+  assert.ok(/AUTHENTICATIONFAILED/.test(msg), 'the server response code was not carried through')
+  assert.ok(/Invalid credentials/.test(msg), 'the server sentence was not carried through')
+})
+
+// ── 10. A refused login and an unreachable host must give OPPOSITE instructions ───
+check('a refused password says reset it; anything else says do not', () => {
+  const refused = describeOtpFailure(
+    new MailboxUnreachableError('x', imapflowLoginRejection()),
+    'Valrano',
+  )
+  assert.ok(/reset it at the mail provider/.test(refused), 'a refused login does not name the password reset')
+  assert.ok(/IMAP_PASS/.test(refused), 'a refused login does not name the secret to update')
+  assert.ok(
+    !/not a wrong password/.test(refused),
+    'a refused login is being described as "not a wrong password" - the branches are inverted',
+  )
+
+  const unreachable = describeOtpFailure(
+    new MailboxUnreachableError('x', Object.assign(new Error('getaddrinfo ENOTFOUND mail.example'), { code: 'ENOTFOUND' })),
+    'Valrano',
+  )
+  assert.ok(
+    /not a wrong password/.test(unreachable),
+    'an unreachable host still sends Roger to reset a password that is fine',
+  )
+  assert.ok(/ENOTFOUND/.test(unreachable), 'the errno that identifies the network fault was dropped')
+})
+
+// ── 11. A NO/BAD that is NOT an auth failure must not be read as one ──────────────
+// Throttling arrives as the same `new Error('Command failed')`, and `response` is still the
+// unparsed object here because only the LOGIN path stringifies it - hence the typeof guard.
+check('a throttled mailbox is not reported as a bad password', () => {
+  const err = new Error('Command failed')
+  err.response = { command: 'BAD', attributes: [] } // object, NOT a string
+  err.responseText = 'Request is throttled. Suggested Backoff Time: 92415 milliseconds'
+  err.responseStatus = 'BAD'
+
+  const wrapped = new MailboxUnreachableError('x', err)
+  assert.strictEqual(wrapped.credentialsRejected, false, 'throttling was classified as a credential rejection')
+  assert.ok(/Request is throttled/.test(wrapped.reason), 'the throttle text was dropped')
+  assert.ok(
+    !/\[object Object\]/.test(wrapped.reason),
+    'the unparsed response object leaked into the message as [object Object]',
+  )
+  const msg = describeOtpFailure(wrapped, 'ChannelMover')
+  assert.ok(!/reset it at the mail provider/.test(msg), 'throttling sends Roger to reset a working password')
+})
+
+// ── 12. The compiled LOGIN line must never be surfaced ────────────────────────────
+check('the executed LOGIN command is never printed', () => {
+  const msg = describeOtpFailure(new MailboxUnreachableError('x', imapflowLoginRejection()), 'SignalScore')
+  assert.ok(!/LOGIN/.test(msg), 'err.executedCommand leaked into the operator-facing message')
+})
+
+// ── 13. Order ratchet: the server line outranks the constant .message ─────────────
+check('imapCauseText prefers the server response over .message', () => {
+  const err = new Error('Command failed')
+  err.response = '5 NO [OVERQUOTA] Mailbox is full'
+  assert.ok(
+    !imapCauseText(err).includes('Command failed'),
+    'the constant library message is winning over the actual server response again',
+  )
+  assert.ok(imapCauseText(err).includes('OVERQUOTA'), 'the server response was not used')
+  // …and with nothing else available, .message is still better than nothing.
+  assert.strictEqual(imapCauseText(new Error('socket hang up')), 'socket hang up')
+  assert.strictEqual(imapCauseText(null), 'unknown')
 })
 
 console.log(`imap-fault-attribution: ${passed} passed, ${failures.length} failed`)
