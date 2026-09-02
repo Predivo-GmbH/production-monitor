@@ -105,28 +105,23 @@ for (const repo of TIERED_REPOS) {
       }
     }
 
-    // NAME THE ACTUALLY-FAILING GATE, don't hardcode E2E wording. A red nightly can be ANY gate
-    // (gate-security/audit, gate-integration, gate-edge-typecheck, gate-e2e). Hardcoding
-    // "real-login / integration / E2E gate regressed" masked a browserslist advisory that only
-    // failed gate-security for hours and pointed at the wrong subsystem (Valrano run 33592350429,
-    // 2026-09-02: gate-integration/edge-typecheck/e2e all green, only gate-security red).
-    // Defensive: any error resolving the job list → fall back to a generic phrasing, never block
-    // the alert or SKIP on it.
-    let failedGates = 'one or more gates';
-    const jobsRes = await request.get(
-      `https://api.github.com/repos/${repo}/actions/runs/${latest.id}/jobs?per_page=100`,
-      { headers: { Authorization: `Bearer ${ghToken}`, Accept: 'application/vnd.github.v3+json' } },
-    );
-    if (jobsRes.ok()) {
-      const failed = ((await jobsRes.json()).jobs ?? [])
-        .filter((j: { conclusion: string }) => ['failure', 'timed_out'].includes(j.conclusion))
-        .map((j: { name: string }) => j.name);
-      if (failed.length) failedGates = `the ${failed.join(', ')} gate(s)`;
-    }
-
     expect(
       isFail && persistent,
-      `${repo} NIGHTLY GAUNTLET PERSISTENTLY FAILING — ${failedGates} regressed against staging and the auto-retry did NOT recover it (attempt ${attempt}, ${ageHours.toFixed(1)}h, ${latest.html_url}). Do NOT promote ${repo} to production until fixed.`,
+      `${repo} NIGHTLY GAUNTLET PERSISTENTLY FAILING — a real-login / integration / E2E gate regressed against staging and the auto-retry did NOT recover it (attempt ${attempt}, ${ageHours.toFixed(1)}h, ${latest.html_url}). Do NOT promote ${repo} to production until fixed.`,
     ).toBe(false);
   });
 }
+
+test('nightly-gauntlet: DASHBOARD_PAT is present in CI', () => {
+  // The per-test `test.skip(!ghToken)` above is right for a developer running locally, but in CI
+  // it is a silent off-switch: if DASHBOARD_PAT is ever lost, expired or renamed, all 5 checks
+  // turn into SKIPs and the hourly monitor still reports green — a job that reports success for
+  // doing nothing. This test is the floor: in CI the token must exist. Local runs stay optional
+  // (GitHub Actions sets CI=true on every step; a developer's shell does not).
+  test.skip(!process.env.CI, 'local run — DASHBOARD_PAT is optional outside CI');
+
+  expect(
+    ghToken,
+    `DASHBOARD_PAT is not set in CI — all ${TIERED_REPOS.length} nightly-gauntlet checks would silently SKIP and the monitor would still report green. Restore the secret.`,
+  ).toBeTruthy();
+});

@@ -91,8 +91,30 @@ test.describe('ReplyFlow — Production Monitor', () => {
       siteUrl: SITE_URL,
     })
     await page.waitForLoadState('networkidle')
-    const url = page.url()
-    expect(url).not.toContain('/auth')
+
+    // WHY THIS READS THE SESSION INSTEAD OF ASSERTING not.toContain('/auth').
+    //
+    // The old assertion proved NOTHING here. ReplyFlow signs in at /login (src/router.tsx:89),
+    // not /auth, and the magic link lands on '/', the public landing page. A run where no session
+    // was ever established therefore sits on 'https://replyflow.help/' — a URL containing no
+    // '/auth' — and the assertion passed with nobody logged in. Same shape of defect as the
+    // /auth/v1/otp probe this monitoring exists to replace (see tests/valrano for the first case).
+    //
+    // A URL is a symptom of being logged in; the session is the claim. So: read the Supabase
+    // session back out of the browser, then prove the app ADMITTED us by rendering the dashboard
+    // behind ProtectedRoute (/app → ProtectedRoute → RootLayout, src/router.tsx:244).
+    const hasSession = await page.evaluate(() =>
+      Object.keys(localStorage).some(
+        (k) => k.startsWith('sb-') && k.endsWith('-auth-token') && !!localStorage.getItem(k),
+      ),
+    )
+    expect(hasSession, 'a real Supabase session must exist after the magic link').toBe(true)
+
+    await page.goto(`${SITE_URL}/app`, { waitUntil: 'networkidle' })
+    await expect(
+      page.locator('h1', { hasText: 'Dashboard' }),
+      'a signed-in session must render the Dashboard heading behind ProtectedRoute',
+    ).toBeVisible({ timeout: 15_000 })
   })
 
   // ── Public page tests ───────────────────────────────────────────────
@@ -139,11 +161,13 @@ test.describe('ReplyFlow — Production Monitor', () => {
     // Should be on /app or dashboard area
     await page.goto(`${SITE_URL}/app`, { waitUntil: 'networkidle' })
 
-    // Dashboard should show stats cards, review list, or an empty state
-    const dashboardContent = page.locator(
-      '[class*="dashboard"], [class*="Dashboard"], [class*="stats"], [class*="card"], [class*="empty"], [class*="review"], main, [role="main"]'
-    ).first()
-    await expect(dashboardContent).toBeVisible({ timeout: 15_000 })
+    // The dashboard's OWN heading, not the app shell.
+    // The old selector list ended in `main, [role="main"]`, which matches a <main> on ANY page:
+    // AuthLayout.tsx:47 (login), NotFoundPage.tsx:13 (404) and RootLayout.tsx:152 (the error
+    // boundary's shell) all render one. So a logged-out redirect, a 404 and a crashed dashboard
+    // all scored green. The h1 "Dashboard" (DashboardPage.tsx:125) exists only when the real page
+    // rendered — the same assertion the interaction test below already relies on.
+    await expect(page.locator('h1', { hasText: 'Dashboard' })).toBeVisible({ timeout: 15_000 })
   })
 
   test('reviews page loads', async ({ page }) => {
@@ -161,11 +185,13 @@ test.describe('ReplyFlow — Production Monitor', () => {
     // Should not redirect away (still on reviews page)
     expect(page.url()).toContain('/app/reviews')
 
-    // Page should render review list or empty state
-    const reviewsContent = page.locator(
-      '[class*="review"], [class*="Review"], [class*="empty"], [class*="Empty"], table, [role="table"], main, [role="main"]'
-    ).first()
-    await expect(reviewsContent).toBeVisible({ timeout: 15_000 })
+    // The reviews page's OWN heading, not the app shell.
+    // The old list ended in `main, [role="main"]`, present on the login page (AuthLayout.tsx:47),
+    // the 404 page (NotFoundPage.tsx:13) and inside the error boundary's shell
+    // (RootLayout.tsx:152) — so it could not tell "reviews rendered" from "we were bounced to
+    // login" or "this page threw". The h1 "Reviews" (ReviewsPage.tsx:241) only exists on the real
+    // page; it is what the reviews interaction test below already asserts.
+    await expect(page.locator('h1', { hasText: 'Reviews' })).toBeVisible({ timeout: 15_000 })
   })
 
   test('analytics page loads', async ({ page }) => {
@@ -183,11 +209,13 @@ test.describe('ReplyFlow — Production Monitor', () => {
     // Should stay on analytics page
     expect(page.url()).toContain('/app/analytics')
 
-    // Page should render charts, stats, or empty state
-    const analyticsContent = page.locator(
-      '[class*="analytics"], [class*="Analytics"], [class*="chart"], [class*="Chart"], [class*="empty"], [class*="Empty"], canvas, svg, main, [role="main"]'
-    ).first()
-    await expect(analyticsContent).toBeVisible({ timeout: 15_000 })
+    // The analytics page's OWN heading, not the app shell.
+    // The old list ended in `main, [role="main"]` (and `svg`, which every icon in the shell
+    // supplies), all of which render on the login page (AuthLayout.tsx:47), the 404 page
+    // (NotFoundPage.tsx:13) and the error boundary (RootLayout.tsx:152). It therefore passed
+    // whether or not Analytics loaded. The h1 "Analytics" (AnalyticsPage.tsx:113) is the same
+    // assertion the analytics interaction test below makes.
+    await expect(page.locator('h1', { hasText: 'Analytics' })).toBeVisible({ timeout: 15_000 })
   })
 
   test('settings page loads with tabs', async ({ page }) => {
@@ -205,11 +233,13 @@ test.describe('ReplyFlow — Production Monitor', () => {
     // Should stay on settings page
     expect(page.url()).toContain('/app/settings')
 
-    // Settings should have tabs or sections
-    const settingsTabs = page.locator(
-      '[role="tablist"], [class*="tab"], [class*="Tab"], [class*="settings"], [class*="Settings"], nav, [class*="section"], [class*="Section"]'
-    ).first()
-    await expect(settingsTabs).toBeVisible({ timeout: 15_000 })
+    // A field that only the settings page owns, not the app shell.
+    // The old list contained `nav` (plus `[class*="section"]`), which the sidebar and the public
+    // site nav both provide — the 404 page renders SiteNav (NotFoundPage.tsx:13) and the login
+    // page its own header (AuthLayout.tsx:47), so this matched with settings nowhere in sight.
+    // #settings-email (ProfileTab.tsx:269) exists only when the profile tab actually rendered;
+    // the settings interaction test and the navigation test below both key off it.
+    await expect(page.locator('#settings-email')).toBeVisible({ timeout: 15_000 })
   })
 
   // ── Feature interaction tests ────────────────────────────────────────
