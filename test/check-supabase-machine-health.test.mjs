@@ -15,7 +15,7 @@
 import assert from 'node:assert'
 import fs2 from 'node:fs'
 import { spawnSync } from 'node:child_process'
-import { metricValue, exitDecision, discover, blindSignal, coverageGaps, missingFindings, productionOnly, loadBaseline } from '../scripts/check-supabase-machine-health.mjs'
+import { metricValue, exitDecision, discover, blindSignal, coverageGaps, missingFindings, productionOnly, loadBaseline, escalation, diskSignal, diskKey, recoveredKeys, recoverySignal } from '../scripts/check-supabase-machine-health.mjs'
 
 let passed = 0
 let failed = 0
@@ -343,6 +343,165 @@ check('a fully-covered run has zero gaps and stays green on coverage alone', () 
   }
   const gaps = coverageGaps(discover(env), JASSTOUR_BASELINE)
   assert.deepEqual(gaps, [], 'both baseline projects are wired — coverage is PROVEN complete, not merely quiet')
+})
+
+// ---------------------------------------------------------------------------------------
+// THE TWO-DEVICE CASE, PINNED AGAINST A REAL CAPTURE (not a hand-written string).
+//
+// test/fixtures/supabase-metrics-two-device.prom is the verbatim disk/vmstat/memory block of a
+// live 200 response from https://xoecpzfsskalvjrtcbbl.supabase.co/customer/v1/privileged/metrics
+// (BackOffice), captured 2026-09-02. It is here because the inline TWO_DEVICE string above was
+// written from a DESCRIPTION of the endpoint's format, and the two things a hand-written fixture
+// got wrong are exactly the two that let the bug through:
+//   1. the real values are in Prometheus SCIENTIFIC NOTATION (5.292687872e+10), not plain digits;
+//   2. the real label block is not just {device="..."} — it carries supabase_project_ref,
+//      supabase_identifier and service_type BEFORE device, so anything matching on a short or
+//      anchored label block matches nothing at all.
+// The same capture also disproves this file's old claim that vmstat/memory are UNLABELLED: they
+// carry labels too, minus the device. The optional-label-block regex handles both, and that is
+// now pinned by a real sample rather than by a belief about the format.
+// ---------------------------------------------------------------------------------------
+
+const REAL = fs2.readFileSync(new URL('./fixtures/supabase-metrics-two-device.prom', import.meta.url), 'utf8')
+
+check('REAL CAPTURE: the endpoint really does expose two devices per disk counter', () => {
+  assert.equal((REAL.match(/^node_disk_written_bytes_total\{/mg) || []).length, 2,
+    'the fixture must actually contain the two-device case it is here to pin')
+  assert.equal((REAL.match(/^node_disk_read_bytes_total\{/mg) || []).length, 2)
+})
+
+check('REAL CAPTURE: written bytes SUM both devices (first-series-only would drop 46% here)', () => {
+  const nvme0 = 5.292687872e+10, nvme1 = 4.5584490496e+10
+  assert.equal(metricValue(REAL, 'node_disk_written_bytes_total'), nvme0 + nvme1)
+  // The receipt for why this matters on THIS machine: the dropped device is not a rounding error.
+  const dropped = nvme1 / (nvme0 + nvme1)
+  assert.ok(dropped > 0.4, `the second device carries ${(dropped * 100).toFixed(0)}% of BackOffice's writes — a first-series-only read undercounts by that much`)
+})
+
+check('REAL CAPTURE: read bytes SUM both devices', () => {
+  assert.equal(metricValue(REAL, 'node_disk_read_bytes_total'), 9.3461862144e+11 + 5.3061108736e+10)
+})
+
+check('REAL CAPTURE: the labelled single-series scalars are still read exactly once', () => {
+  assert.equal(metricValue(REAL, 'node_vmstat_pgmajfault'), 4.5032897e+07)
+  assert.equal(metricValue(REAL, 'node_memory_MemTotal_bytes'), 4.26258432e+08)
+})
+
+check('DEFECT, proven by injection: the old first-series-only parser undercounts the real capture', () => {
+  // The exact pre-7bf492c implementation, run against the real bytes.
+  const oldMetricValue = (text, name) => {
+    const m = text.match(new RegExp('^' + name + '(\\{[^}]*\\})?\\s+([0-9.e+-]+)', 'm'))
+    return m ? Number(m[2]) : null
+  }
+  const old = oldMetricValue(REAL, 'node_disk_written_bytes_total')
+  const now = metricValue(REAL, 'node_disk_written_bytes_total')
+  assert.ok(old < now, 'THE BUG: the old parser returns strictly less than the machine actually wrote')
+  assert.equal(old, 5.292687872e+10, 'and what it returns is exactly the first device, nothing more')
+})
+
+// ---------------------------------------------------------------------------------------
+// THRESHOLDS + SUSTAINED-SAMPLE DEBOUNCE (2026-09-02, board item 62512b15).
+//
+// Two separate defects met here. The thresholds (2.0 warn / 4.0 fail) were calibrated against
+// readings taken by the BROKEN one-device parser, so correcting the sum stepped the whole fleet
+// over a line drawn for half a machine — 31.5% of 216 measured samples crossed the warn line and
+// ten products sat on the board "wearing out its disk allowance". And a single 180-second sample
+// was allowed to set needs_human, the flag that rings a phone, even though the same fleet swings
+// by 4x between consecutive runs (BACKOFFICE 1.57 -> 6.66 MB/s, nothing wrong with it).
+// ---------------------------------------------------------------------------------------
+
+check('the warn line sits ABOVE the fleet p99 measured after the sum was fixed', () => {
+  const src = fs2.readFileSync(new URL('../scripts/check-supabase-machine-health.mjs', import.meta.url), 'utf8')
+  const warn = Number(src.match(/DISK_WARN_MB_S \|\| ([\d.]+)/)[1])
+  const fail = Number(src.match(/DISK_FAIL_MB_S \|\| ([\d.]+)/)[1])
+  // Measured 2026-09-01T21:07Z..2026-09-02T10:54Z, 216 samples over 18 post-7bf492c monitor runs.
+  const FLEET_P99 = 6.27, FLEET_MAX = 9.09, WORST_MACHINE_P90 = 6.22, VENDOR_COMPLAINED_AT = 7.74
+  assert.ok(warn > FLEET_P99, `a warn line at or below the fleet p99 (${FLEET_P99}) alarms on normal traffic`)
+  assert.ok(warn > WORST_MACHINE_P90, 'and it must clear the worst single machine p90, or that machine alarms forever')
+  assert.ok(warn >= VENDOR_COMPLAINED_AT, 'it must not sit above the level the vendor itself complained at — 7.74 is a LOWER bound (one-device reading)')
+  assert.ok(fail > FLEET_MAX, `a fail line at or below the highest reading ever measured (${FLEET_MAX}) pages for observed-normal load`)
+  assert.ok(fail > warn, 'fail must be louder than warn')
+})
+
+check('DEFECT, proven by injection: the OLD 2.0/4.0 pair alarms on a third of all measured samples', () => {
+  // The real measured p50/p75/p90/p95/p99 of the post-fix fleet, as a stand-in for the 216 samples.
+  const measured = [1.21, 2.52, 4.33, 4.86, 6.27]
+  const overOld = measured.filter((v) => v >= 2.0).length
+  const overNew = measured.filter((v) => v >= 8.0).length
+  assert.equal(overOld, 4, 'THE BUG: 4 of the 5 fleet percentiles are at or above the old 2.0 warn line')
+  assert.equal(overNew, 0, 'the re-derived line clears every one of them')
+})
+
+check('DEBOUNCE: a machine over the line for the FIRST time files a row but may not page', () => {
+  const { consecutive, confirmed } = escalation(undefined)
+  assert.equal(consecutive, 1)
+  assert.equal(confirmed, false, 'THE BUG 62512b15 names: one 180s sample must not be allowed to ring a phone')
+  const row = diskSignal({ product: 'VALRANO', mbs: 8.4, detail: '8.40 MB/s sustained disk' }, { consecutive, confirmed })
+  assert.equal(row.needs_human, false, 'needs_human is the flag that rings at 03:00 — a single sample must never set it')
+  assert.equal(row.severity, 'warning')
+  assert.match(row.summary, /NOT alerted/, 'and the board row must say so, so a reader is not misled')
+})
+
+check('DEBOUNCE: the SECOND consecutive run over the line is what escalates and may page', () => {
+  const prior = { key: 'supabase-disk:VALRANO', detail: { consecutive: 1 } }
+  const { consecutive, confirmed } = escalation(prior)
+  assert.equal(consecutive, 2)
+  assert.equal(confirmed, true, 'sustained load across two hourly runs is a real finding')
+  const row = diskSignal({ product: 'VALRANO', mbs: 8.4, detail: '8.40 MB/s sustained disk' }, { consecutive, confirmed })
+  assert.equal(row.needs_human, true)
+  assert.equal(row.severity, 'critical')
+  assert.match(row.title, /2 runs in a row/, 'the title must say what makes it real, not just that it is loud')
+})
+
+check('DEBOUNCE: the half-hour blip from run 33307618045 -> 33308941358 cannot page', () => {
+  // VALRANO measured 4.23 MB/s, then 1.50 MB/s 25 minutes later. Under the re-derived line it is
+  // not even loud; and even at a hypothetical over-line first reading it only files a warning.
+  const first = escalation(undefined)
+  assert.equal(first.confirmed, false)
+  // The next run finds it quiet, so nothing carries forward and the row is resolved instead.
+  const stillOpen = ['supabase-disk:VALRANO']
+  const thisRun = [{ product: 'VALRANO', level: 'ok', mbs: 1.5 }]
+  assert.deepEqual(recoveredKeys(stillOpen, thisRun), ['supabase-disk:VALRANO'],
+    'a machine measured back under the line must have its row closed, not left standing forever')
+})
+
+check('an old row with no consecutive count is treated as a prior sighting, not a fresh one', () => {
+  // Rows filed before this change carry no `consecutive`. Reading that as zero would restart the
+  // clock every run and a genuinely sustained machine could never escalate.
+  const { consecutive, confirmed } = escalation({ key: 'supabase-disk:REPLYFLOW', detail: {} })
+  assert.equal(consecutive, 2)
+  assert.equal(confirmed, true)
+})
+
+check('RECOVERY: a machine that was UNREADABLE this run keeps its open row', () => {
+  const open = ['supabase-disk:REPLYFLOW', 'supabase-disk:VALRANO']
+  const thisRun = [{ product: 'REPLYFLOW', level: 'unreadable' }, { product: 'VALRANO', level: 'ok' }]
+  assert.deepEqual(recoveredKeys(open, thisRun), ['supabase-disk:VALRANO'],
+    '"we could not look" is not "it recovered" — closing on absence turns a blind spot into a clean bill of health')
+})
+
+check('RECOVERY: a machine still over the line is never resolved', () => {
+  const open = ['supabase-disk:REPLYFLOW']
+  assert.deepEqual(recoveredKeys(open, [{ product: 'REPLYFLOW', level: 'warn', mbs: 9.1 }]), [])
+  assert.deepEqual(recoveredKeys(open, [{ product: 'REPLYFLOW', level: 'fail', mbs: 13 }]), [])
+})
+
+check('RECOVERY: rows belonging to other sensors are never touched', () => {
+  const open = ['supabase-disk:VALRANO', 'products-down:ReplyFlow', 'supabase-disk-blind']
+  assert.deepEqual(recoveredKeys(open, [{ product: 'VALRANO', level: 'ok' }]), ['supabase-disk:VALRANO'],
+    'only this check\'s own per-product keys are eligible to be closed by this check')
+})
+
+check('recoverySignal closes the row and says what re-measurement proved it', () => {
+  const r = recoverySignal(diskKey('VALRANO'))
+  assert.equal(r.state, 'resolved')
+  assert.equal(r.key, 'supabase-disk:VALRANO')
+  assert.match(r.title, /VALRANO/)
+  assert.match(r.summary, /below/)
+})
+
+check('diskKey is stable, so repeat sightings update one row instead of breeding duplicates', () => {
+  assert.equal(diskKey('REPLYFLOW'), 'supabase-disk:REPLYFLOW')
 })
 
 console.log(`\n${passed} passed, ${failed} failed`)

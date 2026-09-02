@@ -60,8 +60,70 @@ export function productionOnly(baseline) {
   return { ...baseline, projects: baseline.projects.filter((p) => !/staging/i.test(p.product)) }
 }
 
-const WARN_MB_S = Number(process.env.DISK_WARN_MB_S || 2.0)   // sustained OS-disk traffic; the quiet fleet sits at 0.06-0.5
-const FAIL_MB_S = Number(process.env.DISK_FAIL_MB_S || 4.0)   // ScoutCopilot was 7.74 when Supabase complained
+/**
+ * THRESHOLDS, RE-DERIVED 2026-09-02 FROM MEASURED DATA. The old pair (2.0 warn / 4.0 fail) was
+ * chosen on 2026-08-29 against numbers produced by the BROKEN parser — the one that read a
+ * single block device and dropped the rest of the machine (fixed in 7bf492c). Every reading the
+ * old line was calibrated against was therefore an UNDERCOUNT, so when the sum was corrected the
+ * whole fleet stepped over a line that had been drawn for half a machine. That is why ten
+ * products were sitting on the signals board titled "is wearing out its disk allowance" and why
+ * the board's own hygiene row says the numbers "flip OK to FAIL within half an hour".
+ *
+ * THE MEASUREMENT (this is the arithmetic, not a feeling). 216 samples = 12 production machines
+ * x 18 consecutive monitor runs, read out of the "Supabase machine health" step logs of runs
+ * 33556826606 .. 33620858198, window 2026-09-01T21:07Z -> 2026-09-02T10:54Z (13.8 h). Every one
+ * of those runs is post-7bf492c, i.e. all-device sums, verified with `git merge-base
+ * --is-ancestor 7bf492c <run sha>`.
+ *
+ *   fleet percentiles   p50 1.21   p75 2.52   p90 4.33   p95 4.86   p99 6.27   max 9.09 MB/s
+ *   samples at or above the OLD warn line (2.0): 68/216 = 31.5%
+ *   samples at or above the OLD fail line (4.0): 26/216 = 12.0%
+ *   worst single machine p90: BACKOFFICE 6.22   (per-product p90s: ARIVIOO 2.42, BOATBUDDY 3.06,
+ *   CHANNELMOVER 3.45, DISTRIBUTIONOS 4.51, JASSTOUR 3.68, LAUNCHREADY 4.00, REPLYFLOW 4.98,
+ *   SCOUTCOPILOT 4.15, SIGNALSCORE 0.56, VALRANO 4.70, YTMIGRATION 3.46)
+ *
+ * A line that 31.5% of all normal samples cross is not a line, it is a metronome. Worse, it is a
+ * line nobody outside this repo agrees with: Supabase sent ZERO disk warnings in the 21 days
+ * covering that traffic (2026-09-01 mailbox sweep, 1 Supabase mail in the period and it was a
+ * password reset). So the entire observed band up to p99 6.27 MB/s is traffic the vendor who
+ * actually meters and bills the disk allowance is demonstrably fine with.
+ *
+ * THE ONE HARD ANCHOR is the 2026-08-29 ScoutCopilot email — the only time the vendor did
+ * complain. The machine measured 7.74 MB/s then, BUT that figure came off the one-device parser,
+ * so 7.74 is a LOWER BOUND on what the machine was really doing. Setting the warn line at or
+ * just above it is therefore conservative in the safe direction.
+ *
+ *   WARN 8.0 = above the vendor's proven lower-bound complaint level (7.74), above the fleet p99
+ *              (6.27) and above every single machine's p90 (worst 6.22). Reached by 1/216 = 0.5%
+ *              of measured samples — one REPLYFLOW reading of 9.09.
+ *   FAIL 12.0 = 1.5 x WARN, and 1.9 x the fleet p99. Nothing in the fleet has ever been observed
+ *              there; the highest reading in 216 samples is 9.09.
+ *
+ * These are still env-overridable, so a machine class with a genuinely different floor can be
+ * tuned in monitor.yml without a code change.
+ */
+const WARN_MB_S = Number(process.env.DISK_WARN_MB_S || 8.0)
+const FAIL_MB_S = Number(process.env.DISK_FAIL_MB_S || 12.0)
+
+/**
+ * SUSTAINED-SAMPLE DEBOUNCE. A threshold alone cannot fix this alarm, because the reading itself
+ * is one 180-second delta and a single checkpoint or autovacuum burst inside those three minutes
+ * moves it by a factor of four: BACKOFFICE ranged 1.57 -> 6.66 MB/s across the same 18 runs, with
+ * nothing wrong with it. Board item 62512b15 ("The new disk alarm can wake you for a machine that
+ * was fine 25 minutes later") pins the original sighting: run 33307618045 called VALRANO critical
+ * at 4.23 MB/s and 25 minutes later run 33308941358 read the same machine at 1.50 while flagging
+ * two entirely different products.
+ *
+ * So being over the line ONCE is a board row and nothing else. `needs_human` — the flag that is
+ * allowed to ring Roger's phone at 03:00 — is set only when the SAME machine is over the line on
+ * two consecutive monitor runs, which at the hourly cadence means the load held for about an
+ * hour. A half-hour blip cannot page, by construction.
+ *
+ * This is deliberately the SAME two-run rule check-products-down.mjs already runs ("a single bad
+ * hour is not an outage"), read from the same place: the previously filed signal row. Copying the
+ * house pattern rather than inventing a second one is the point.
+ */
+const SUSTAINED_RUNS = Number(process.env.DISK_SUSTAINED_RUNS || 2)
 const SAMPLE_GAP_MS = 180_000  // Supabase refreshes these counters on its own scrape interval.
                                // At 30s BOTH samples read identical values and every machine
                                // scored a perfect 0.00 MB/s, i.e. a false all-clear across the
@@ -237,6 +299,82 @@ export function blindSignal(findings) {
   })
 }
 
+export const diskKey = (product) => `supabase-disk:${product}`
+
+/**
+ * How many consecutive runs this machine has now been over the line, and whether that is enough
+ * to be allowed to wake anybody. Pure, because this is the whole debounce and it must be tested
+ * without a network: the previous run's count travels on the previously filed signal row.
+ *
+ * `prior` is the open fleet_signals row for this product, or undefined when there is none. A row
+ * that exists but carries no count is treated as ONE prior sighting rather than zero — rows filed
+ * before this change have no `consecutive` field, and reading that absence as "never seen before"
+ * would silently restart the clock on every genuinely sustained machine.
+ */
+export function escalation(prior, needed = SUSTAINED_RUNS) {
+  const before = prior ? Number(prior.detail?.consecutive) || 1 : 0
+  const consecutive = before + 1
+  return { consecutive, confirmed: consecutive >= needed }
+}
+
+/**
+ * The board row for a machine over the disk line. First sighting is a WARNING nobody is woken
+ * for and it says so in its own text, so a person reading the board is not misled into thinking
+ * it has been checked twice. Only a confirmed, sustained breach sets needs_human.
+ */
+export function diskSignal(f, { confirmed, consecutive }) {
+  return signal({
+    key: diskKey(f.product),
+    product: f.product,
+    severity: confirmed ? 'critical' : 'warning',
+    needsHuman: confirmed,
+    title: confirmed
+      ? `${f.product} has been over its disk line for ${consecutive} runs in a row`
+      : `${f.product} read high on disk once — confirming on the next run`,
+    summary: confirmed
+      ? `${f.product} has measured at or above ${WARN_MB_S} MB/s of sustained disk traffic on ${consecutive} consecutive monitor runs (latest ${f.mbs} MB/s: ${f.detail}). That is roughly ${consecutive - 1} hour(s) of held load, not a burst. The line sits at ${WARN_MB_S} MB/s because that is above this fleet's measured p99 of 6.27 MB/s and at/above the 7.74 MB/s at which Supabase itself sent a Disk IO warning for ScoutCopilot on 2026-08-29.`
+      : `${f.product} measured ${f.mbs} MB/s of disk traffic in one 180-second sample (${f.detail}). Filed but NOT alerted: one sample is not a sustained problem — the same fleet routinely swings by a factor of four between runs with nothing wrong. If the next monitor run finds it over the line again, this escalates and is allowed to ring.`,
+    detail: { ...f, consecutive, confirmed, warnLine: WARN_MB_S, failLine: FAIL_MB_S },
+  })
+}
+
+/**
+ * Rows to close: a machine that has an open disk signal and is no longer over the line. Without
+ * this the check only ever ADDS rows — which is exactly how ten "is wearing out its disk
+ * allowance" rows accumulated on the board for machines that had long since gone quiet, and why
+ * "self-resolved" on the cockpit has to be a fact about the fleet rather than an artefact of
+ * whether anybody happened to tidy up. Same shape as check-products-down.mjs's recovery path.
+ */
+export function recoveredKeys(openKeys, measuredFindings) {
+  const quietNow = new Set(
+    (measuredFindings ?? []).filter((f) => f.level === 'ok').map((f) => diskKey(f.product)),
+  )
+  // A row is closed ONLY when this run took a reading for that exact machine and the reading was
+  // under the line. A machine that came back unreadable, or that this run never sampled at all,
+  // keeps its open row: "we did not look" is not "it recovered", and closing on absence is how a
+  // watchdog turns its own blind spot into a clean bill of health.
+  return [...(openKeys ?? [])].filter((k) => k.startsWith('supabase-disk:') && quietNow.has(k))
+}
+
+export function recoverySignal(key) {
+  return {
+    source: 'production-monitor', key, kind: 'incident', severity: 'info', state: 'resolved',
+    title: `${key.slice('supabase-disk:'.length)} is back under its disk line`,
+    summary: `Its sustained disk traffic is below ${WARN_MB_S} MB/s again. This cleared without anyone doing anything, which is what a burst does.`,
+    link: 'https://cockpit.predivo.ch/signals',
+  }
+}
+
+const BO_BASE = 'https://xoecpzfsskalvjrtcbbl.supabase.co'
+
+async function boGet(secret, path) {
+  const res = await fetch(`${BO_BASE}/rest/v1/${path}`, {
+    headers: { apikey: secret, Authorization: `Bearer ${secret}`, 'User-Agent': 'supabase-watchdog/1.0' },
+  })
+  if (!res.ok) throw new Error(`GET ${path} -> HTTP ${res.status}`)
+  return res.json()
+}
+
 if (process.argv[1] && process.argv[1].endsWith('check-supabase-machine-health.mjs')) {
   // One invisible character in a key blinds this check without ever naming the key. On
   // 2026-09-01 a UTF-8 BOM on JASSTOUR_SERVICE_ROLE_KEY made the metrics request unsendable,
@@ -268,22 +406,50 @@ if (process.argv[1] && process.argv[1].endsWith('check-supabase-machine-health.m
   // alert email listing ZERO failures while the real fact appeared nowhere a person looks.
   // Same contract as every neighbouring sensor in monitor.yml: a filed alarm exits 0, and only
   // a failed READ exits non-zero, so one event is never double-reported.
-  if (loud.length) {
+  // A machine over the line files a board row on the FIRST sighting and is allowed to page only
+  // on the second consecutive one. The previous run's count is read back off the board, which is
+  // the only durable store this check has: the runner is ephemeral, so there is nowhere else a
+  // count could survive between runs. Recovered machines are resolved in the same pass, so the
+  // board reflects the fleet rather than the history of everything that ever spiked.
+  // Guarded on having actually MEASURED something: a run where every machine came back
+  // unreadable has no standing to resolve anybody's row, and must not touch the board at all.
+  const measured = findings.filter((f) => f.level !== 'unreadable')
+  if (measured.length) {
     const dry = process.argv.includes("--dry")
-    const secret = dry ? null : boardSecret()
+    // --dry still READS the board. The read is what decides warning-vs-page, so a preview that
+    // skipped it would preview the wrong decision for every machine — which is the whole thing
+    // being tested when somebody runs --dry. Only the writes below are suppressed.
+    const secret = boardSecret()
+
+    // Read BEFORE writing: once this run files, every key looks "already open".
+    let openRows = []
+    try {
+      openRows = await boGet(secret, `fleet_signals?source=eq.production-monitor&key=like.supabase-disk:*&state=eq.open&select=key,detail`)
+    } catch (e) {
+      // A board read failure must not silently downgrade every machine to "first sighting" —
+      // that would switch the pager off for a genuinely sustained breach and read as normal.
+      console.error(`::error::could not read the open disk signals, so this run cannot tell a first sighting from a sustained one: ${e.message}`)
+      process.exitCode = 1
+      openRows = null
+    }
+    const priorByKey = new Map((openRows ?? []).map((r) => [r.key, r]))
+
     for (const f of loud) {
-      const row = signal({
-        key: `supabase-disk:${f.product}`,
-        product: f.product,
-        severity: f.level === 'fail' ? 'critical' : 'warning',
-        needsHuman: f.level === 'fail',
-        title: `${f.product} is wearing out its disk allowance`,
-        summary: `${f.product} is moving ${f.mbs} MB/s of disk continuously (${f.detail}). The quiet fleet sits between 0.06 and 1.67 MB/s. ScoutCopilot was at 7.74 MB/s when Supabase emailed a Disk IO warning on 2026-08-29; that time the cause was an out-of-date Supabase platform build and the free upgrade fixed it.`,
-        detail: f,
-      })
+      const { consecutive, confirmed } = escalation(priorByKey.get(diskKey(f.product)))
+      const row = diskSignal(f, { confirmed, consecutive })
       if (dry) { console.log("[dry] would file: " + row.key + " / " + row.severity + " / " + row.title); continue }
       await fileSignal(secret, row)
-      console.log(`filed to the cockpit signals board: ${f.product}`)
+      console.log(`filed to the cockpit signals board: ${f.product} (run ${consecutive} over the line, ${confirmed ? 'CONFIRMED — may page' : 'unconfirmed — no page'})`)
+    }
+
+    // Only resolve what is genuinely open and genuinely quiet now. Never blanket-resolve: a row
+    // closed without its claim being re-measured is the same lie as a row opened without one.
+    if (openRows) {
+      for (const key of recoveredKeys(priorByKey.keys(), measured)) {
+        if (dry) { console.log(`[dry] would resolve: ${key}`); continue }
+        await fileSignal(secret, recoverySignal(key))
+        console.log(`recovered: ${key} — signal resolved (measured under ${WARN_MB_S} MB/s this run).`)
+      }
     }
   }
   // A machine we could not read is not a clean bill of health, so this one does red the run.

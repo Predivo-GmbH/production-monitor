@@ -1,0 +1,14 @@
+# HELP node_disk_written_bytes_total The total number of bytes written successfully.
+# TYPE node_disk_written_bytes_total counter
+node_disk_written_bytes_total{supabase_project_ref="xoecpzfsskalvjrtcbbl",supabase_identifier="xoecpzfsskalvjrtcbbl",service_type="db",device="nvme0n1"} 5.292687872e+10
+node_disk_written_bytes_total{supabase_project_ref="xoecpzfsskalvjrtcbbl",supabase_identifier="xoecpzfsskalvjrtcbbl",service_type="db",device="nvme1n1"} 4.5584490496e+10
+# HELP node_memory_MemTotal_bytes Memory information field MemTotal_bytes.
+# TYPE node_memory_MemTotal_bytes gauge
+node_memory_MemTotal_bytes{supabase_project_ref="xoecpzfsskalvjrtcbbl",supabase_identifier="xoecpzfsskalvjrtcbbl",service_type="db"} 4.26258432e+08
+# HELP node_disk_read_bytes_total The total number of bytes read successfully.
+# TYPE node_disk_read_bytes_total counter
+node_disk_read_bytes_total{supabase_project_ref="xoecpzfsskalvjrtcbbl",supabase_identifier="xoecpzfsskalvjrtcbbl",service_type="db",device="nvme0n1"} 9.3461862144e+11
+node_disk_read_bytes_total{supabase_project_ref="xoecpzfsskalvjrtcbbl",supabase_identifier="xoecpzfsskalvjrtcbbl",service_type="db",device="nvme1n1"} 5.3061108736e+10
+# HELP node_vmstat_pgmajfault /proc/vmstat information field pgmajfault.
+# TYPE node_vmstat_pgmajfault untyped
+node_vmstat_pgmajfault{supabase_project_ref="xoecpzfsskalvjrtcbbl",supabase_identifier="xoecpzfsskalvjrtcbbl",service_type="db"} 4.5032897e+07
