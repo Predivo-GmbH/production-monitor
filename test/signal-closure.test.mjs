@@ -343,6 +343,33 @@ ta('but a twin SEEN AGAIN after the close is still left open, per row', async ()
   assert.equal(b.getSignal('production-monitor', 'ci-cost-guard').state, 'open')
 })
 
+t('a same-key SIBLING carrying its OWN pointer to a still-live item is LEFT OPEN', () => {
+  // The (source,key) split of defect 3, but the sibling points at a DIFFERENT work item that is NOT
+  // finished. sameEntitySignals admits it on exact key equality alone; resolving it here would cancel
+  // the alarm for work nobody finished and repoint the row at the wrong task. It must stand.
+  const item = { slug: 'monitor-finished', status: 'done', closed_at: T.closed }
+  const signals = [
+    { id: 's1', source: 'healthchecks', key: 'k', state: 'open', detail: { work_item: 'monitor-finished' }, last_seen_at: T.seenBeforeClose },
+    { id: 's2', source: 'production-monitor', key: 'k', state: 'open', detail: { work_item: 'monitor-other-still-open' }, last_seen_at: T.seenBeforeClose },
+  ]
+  const plan = closurePlan({ item, signals })
+  assert.equal(plan.resolve.length, 1, 'the row pointing at the finished item still closes')
+  assert.equal(plan.resolve[0].row.id, 's1')
+  assert.equal(plan.keepOpen.length, 1, 'the sibling pointing at a live item is left standing')
+  assert.equal(plan.keepOpen[0].row.id, 's2')
+  assert.match(plan.keepOpen[0].why, /monitor-other-still-open/, 'and the why names the other task')
+})
+
+t('a resolve NEVER changes detail.work_item — only the closed_by_work_item audit fields are added', () => {
+  // Defensive twin of the guard above: even a legitimately resolved row must keep its own forward
+  // pointer, so a resolve can never repoint a signal at the finishing item and strand the real task.
+  const row = { source: 'production-monitor', key: 'k', detail: { work_item: 'monitor-someone-elses-task' } }
+  const item = { slug: 'monitor-finished', status: 'done', closed_at: T.closed }
+  const patch = resolvedPatch({ row, item, why: 'x' })
+  assert.equal(patch.detail.work_item, 'monitor-someone-elses-task', 'the row keeps its own pointer, unchanged')
+  assert.equal(patch.detail.closed_by_work_item, 'monitor-finished', 'the finishing item is recorded only in the audit field')
+})
+
 // ══ the refusals that stop this becoming a silent merge ═══════════════════════════════════════
 
 t('NO STEM MATCHING: keys that share a prefix are NOT the same entity', () => {

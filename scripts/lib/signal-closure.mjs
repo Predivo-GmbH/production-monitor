@@ -122,6 +122,15 @@ export function closurePlan({ item, signals, now = new Date().toISOString() }) {
 
   for (const { row, via } of sameEntitySignals(slug, signals)) {
     if (!ACTIVE_SIGNAL_STATES.has(row.state)) continue        // already resolved/superseded: nothing to do
+    const ownPointer = row?.detail?.work_item
+    if (ownPointer && ownPointer !== slug) {
+      // Admitted as a SIBLING on exact key equality (defect 3), but this row carries its OWN written
+      // pointer to a DIFFERENT work item. That is the (source,key) split where one fault became two
+      // rows AND two items: finishing this item does NOT finish the other. Resolving the sibling here
+      // would cancel the alarm for work nobody has finished, so it stays open until its item finishes too.
+      keepOpen.push({ row, via, why: `this signal points at its own work item ${ownPointer}, a different task from the one that finished (${slug}); it stands until ${ownPointer} finishes too` })
+      continue
+    }
     const seenMs = Date.parse(row.last_seen_at || '')
     if (!Number.isFinite(seenMs)) {
       keepOpen.push({ row, via, why: 'the signal carries no readable last_seen_at, so it cannot be ordered against the close' })
@@ -152,7 +161,9 @@ export function resolvedPatch({ row, item, why, now = new Date().toISOString() }
     page_suppressed_reason: `work item ${item.slug} finished (${item.status}) and the signal was not seen again`,
     detail: {
       ...(row.detail || {}),
-      work_item: item.slug,
+      // NEVER rewrite detail.work_item: this row keeps its own forward pointer. The finishing item is
+      // recorded ONLY in the closed_by_work_item* audit fields below, so a resolve can never repoint a
+      // signal at somebody else's task and strand the real one on its next recurrence.
       closed_by_work_item: item.slug,
       closed_by_work_item_status: item.status,
       closed_by_work_item_at: closedAt(item),
