@@ -993,6 +993,25 @@ export function repoOf(inc) {
 }
 
 /**
+ * The `opened_at` a freshly minted work item should carry, as a spreadable fragment: `{opened_at}`
+ * when the signal's own first sighting is usable, and `{}` — meaning "let the column default to
+ * now()" — when it is not.
+ *
+ * ONE DIRECTION ONLY. It can move an item's clock BACK to when the fault was actually first seen;
+ * it can never move it forward. A first_seen_at in the future, or one that will not parse, is
+ * refused rather than trusted, because the failure mode being fixed here is items looking YOUNGER
+ * than they are and a bad value must not be able to deepen that.
+ */
+export function mintOpenedAt(inc, now = Date.now()) {
+  const raw = inc?.opened_at
+  if (!raw) return {}
+  const t = Date.parse(raw)
+  if (!Number.isFinite(t)) return {}
+  if (t > now) return {}
+  return { opened_at: new Date(t).toISOString() }
+}
+
+/**
  * A STABLE identity for "the work item that belongs to this signal".
  *
  * Derived from source+key, never from the title: titles on this board are rewritten constantly
@@ -1479,6 +1498,25 @@ export async function routeToWorkBoard(inc, cls, deps) {
       slug,
       title,
       kind: 'task',
+      // THE CLOCK STARTS WHEN THE FAULT WAS FIRST SEEN, NOT WHEN THIS ROW WAS MINTED.
+      //
+      // work_items.opened_at defaults to now(), and this call omitted it, so a signal first seen
+      // days ago produced an item that looked minted-this-minute. Two things read that column and
+      // both were wrong because of it: the closer prefixes `[AGING Nh]` from opened_at (its own
+      // prompt says "aging is computed from the board row's opened_at, so it survives inbox
+      // churn"), and the drainer reads its queue `order=opened_at.asc`, so the oldest complaints
+      // sorted as the newest.
+      //
+      // Measured on production 2026-09-02 before this line existed: of 36 open `monitor-*` items
+      // that still had their signal, 18 understated their own age, by 93 hours on average and by
+      // 348 hours — a fortnight — at worst. That is the defect filed as
+      // monitoring-hygiene/closer-age-basis-reset-by-drainer-reminting, whose own measurements
+      // were gemini 47.96h and recurring-costs 90.39h true against a much smaller reported age.
+      //
+      // NEVER FORWARD. `least(first_seen, now)` in effect: a first_seen_at in the future, or an
+      // unparseable one, falls back to the column default rather than making an item look younger
+      // than it is. Ageing an item is safe; rejuvenating one is the bug being fixed.
+      ...mintOpenedAt(inc),
       // This item is here BECAUSE the drainer classified it as needing Roger's hands. It must land
       // in his lane. Cockpit sql/062 derives the lane from `status`: only 'blocked'/'awaiting_signoff'
       // reach 'your_turn' (needs_you=true); 'next' is matched one branch earlier and derives lane='next',
