@@ -1,15 +1,37 @@
 name: Fleet Cron Heartbeat
 
-# Nightly dead-man's-switch for every product's pg_cron jobs: each product's own
-# watchdog auto-fixes its domain, but a watchdog that stops RUNNING is silent from
-# the inside. This asks each prod Supabase project whether every active cron job
+# Dead-man's-switch for every product's pg_cron jobs: each product's own watchdog
+# auto-fixes its domain, but a watchdog that stops RUNNING is silent from the
+# inside. This asks each prod Supabase project whether every active cron job
 # succeeded within ~3× its own interval (persistent-only — never a single missed
-# tick). A red run IS the alert; send-heartbeat-alert.mjs mails the findings, so a
-# standing breakage pages at most once per day. Approved 2026-07-23.
+# tick). A red run IS the alert; send-heartbeat-alert.mjs mails the findings.
+# Approved 2026-07-23.
+#
+# WHY TWICE A DAY, AND WHY AT THESE TWO TIMES (2026-09-02).
+# Layer 2 — "was the dispatched HTTP call actually answered?" — reads pg_net's
+# net._http_response, which keeps roughly SIX hours. A single 05:07 run could
+# therefore only ever see calls dispatched between ~23:07 and ~05:07: six hours of
+# every twenty-four, with the other eighteen structurally invisible. BackOffice's
+# four broken jobs fire at 06:23, 06:31, 07:00 and 07:17 — all inside the blind
+# eighteen — so they 401'd unseen while the run printed "all 175 HTTP calls this
+# database dispatched in the last ~6h answered 2xx". That sentence was true and
+# useless: every call it counted came from a job that was fine.
+#
+# Adding 11:07 makes the two windows tile 23:07 → 11:07 with no gap. Every
+# fixed-time cron job in the fleet today fires between 03:00 and 09:35 UTC
+# (measured across all six projects on 2026-09-02), so two runs cover all of them,
+# and check-cron-heartbeats.mjs now NAMES any job whose last fire fell outside the
+# window it just read — so a future job scheduled into the still-blind 11:07-23:07
+# half announces itself in the log instead of hiding the way these four did.
+#
+# Paging cost: a standing breakage on a fixed-time job is inside exactly ONE of the
+# two windows, so it still pages once a day. One on a job that fires every few
+# minutes is in both, so it can page twice. That is the deliberate price of not
+# being blind for eighteen hours.
 
 on:
   schedule:
-    - cron: '7 5 * * *'
+    - cron: '7 5,11 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -41,8 +63,14 @@ jobs:
           SUPABASE_TOKEN_ARIVIOO: ${{ secrets.SUPABASE_TOKEN_ARIVIOO }}
           SUPABASE_TOKEN_VALRANO: ${{ secrets.VALRANO_SUPABASE_ACCESS_TOKEN }}
 
+      # Scheduled runs only. A workflow_dispatch is somebody (usually the hourly
+      # auto-fix agent) opening this check to LOOK at it, and they are already
+      # reading the log they just asked for — mailing them a copy pages Roger for
+      # a problem that is being worked on. Two dispatches on 2026-09-02 sent two
+      # such emails about findings the session had already diagnosed. A dispatched
+      # run still goes red, so nothing becomes invisible.
       - name: Send heartbeat alert on failure
-        if: failure()
+        if: failure() && github.event_name == 'schedule'
         run: node scripts/send-heartbeat-alert.mjs
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}

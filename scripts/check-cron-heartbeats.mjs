@@ -163,13 +163,136 @@ export function scheduleIntervalMs(schedule) {
 }
 
 /**
+ * How long ago a cron schedule last fired, in ms — an UPPER BOUND, never an underestimate.
+ *
+ * Layer 2 reads a table that only remembers six hours. Whether a given job's call CAN be
+ * in there is therefore a question about that job's clock, not about its health, and it
+ * had never been asked. For step schedules ('*\/5', '2-59/5', '0 *\/6') the interval is
+ * already the worst case, so the interval IS the answer. For a job pinned to a wall-clock
+ * time the answer has to be computed, because '17 7 * * *' is between 0 and 24 hours old
+ * depending only on when you look.
+ *
+ * Returns null when the shape is not recognised — unknown, which the caller reports as
+ * unknown rather than quietly folding into either bucket.
+ */
+export function msSinceLastFire(schedule, nowMs) {
+  const parts = String(schedule).trim().split(/\s+/)
+  if (parts.length !== 5) return null
+  const [min, hour, dom, , dow] = parts
+  const step = (f) => { const m = /^(?:\*|\d+-\d+)\/(\d+)$/.exec(f); return m ? parseInt(m[1], 10) : null }
+  const fixed = (f) => (/^\d+$/.test(f) ? parseInt(f, 10) : null)
+
+  // Step schedules repeat within their own interval, so the interval bounds the age.
+  // Each field is validated before the next is trusted: 'H/5 * * * *' has an hour of
+  // '*' and would otherwise be called hourly on the strength of a minute field nobody
+  // could parse — a guess wearing the costume of a measurement.
+  const sMin = step(min)
+  if (sMin) return sMin * 60_000
+  if (min === '*') return 60_000
+  const mm = fixed(min)
+  if (mm == null) return null
+
+  const sHour = step(hour)
+  if (sHour) return sHour * 3600_000
+  if (hour === '*') return 3600_000
+  const hh = fixed(hour)
+  if (hh == null) return null
+
+  const d = new Date(nowMs)
+  let fire = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), hh, mm, 0, 0)
+
+  if (dom === '*' && dow === '*') {                       // daily at HH:MM UTC
+    if (fire > nowMs) fire -= 24 * 3600_000
+    return nowMs - fire
+  }
+  if (dow !== '*') {                                      // weekly on one weekday
+    const want = fixed(dow)
+    if (want == null) return null
+    if (fire > nowMs) fire -= 24 * 3600_000
+    for (let i = 0; i < 7; i++) {
+      if (new Date(fire).getUTCDay() === want % 7) return nowMs - fire
+      fire -= 24 * 3600_000
+    }
+    return null
+  }
+  const wantDom = fixed(dom)                              // monthly on one day-of-month
+  if (wantDom == null) return null
+  for (let back = 0; back < 14; back++) {
+    const c = new Date(nowMs)
+    c.setUTCMonth(c.getUTCMonth() - back, 1)
+    const cand = Date.UTC(c.getUTCFullYear(), c.getUTCMonth(), wantDom, hh, mm, 0, 0)
+    if (new Date(cand).getUTCDate() === wantDom && cand <= nowMs) return nowMs - cand
+  }
+  return null
+}
+
+/**
+ * WHICH http_post jobs this run could actually have seen, and which it could not.
+ *
+ * THE HOLE THIS CLOSES (measured 2026-09-02). cron-heartbeat.yml ran once a day at 05:07
+ * UTC and pg_net keeps six hours, so layer 2 only ever saw calls dispatched between about
+ * 23:07 and 05:07 — 6 hours of every 24. BackOffice's four broken jobs fire at 06:23,
+ * 06:31, 07:00 and 07:17, so they sat permanently in the unobservable 18 hours. The run at
+ * 05:24 that morning printed "OK HTTP delivery — all 175 HTTP calls this database
+ * dispatched in the last ~6h answered 2xx", which was TRUE and told nobody anything: every
+ * call it counted came from jobs that were fine, and every job that was 401ing had fired
+ * outside the window. A dispatch at 12:28 the same day, with a window that did contain
+ * them, found all three immediately.
+ *
+ * So the sentence "all N answered 2xx" was never a statement about this database's
+ * delivery path — only about the part of it that happened to fall inside the window. This
+ * is the same three-valued discipline the Supabase coverage baseline already uses: proven
+ * clean, proven broken, and NOT LOOKED AT are three different answers, and the third one
+ * must say so out loud instead of borrowing the first one's wording.
+ *
+ * Not a finding on its own: with any single window some jobs are always outside it, so
+ * reddening on that would be an alarm nobody could ever clear. It is a sentence, and the
+ * schedule is what shrinks it.
+ */
+export function deliveryCoverage({ httpPostJobs, nowMs, retentionMs = RESPONSE_RETENTION_MS }) {
+  const observed = [], unobserved = [], unknown = []
+  for (const j of httpPostJobs || []) {
+    const age = msSinceLastFire(j.schedule, nowMs)
+    if (age == null) unknown.push(j)
+    else if (age <= retentionMs) observed.push(j)
+    else unobserved.push({ ...j, age })
+  }
+  return { observed, unobserved, unknown }
+}
+
+/** The clause appended to every layer-2 verdict so no wording can imply coverage the
+ *  window did not have. Empty string when the window really did cover everything. */
+function coverageClause(coverage) {
+  if (!coverage) return ''
+  const bits = []
+  if (coverage.unobserved.length) {
+    const names = coverage.unobserved
+      .slice().sort((a, b) => a.age - b.age)
+      .map((j) => `${j.jobname} [${j.schedule}], last fired ${fmtAge(j.age)} ago`)
+    bits.push(`${coverage.unobserved.length} http_post job(s) last fired OUTSIDE this window, so their delivery is UNOBSERVED here — ${names.join('; ')}`)
+  }
+  if (coverage.unknown.length) {
+    bits.push(`${coverage.unknown.length} job(s) have a schedule this check cannot place in time (${coverage.unknown.map((j) => `${j.jobname} [${j.schedule}]`).join('; ')})`)
+  }
+  return bits.length ? ` — NOTE: ${bits.join('; ')}` : ''
+}
+
+/**
  * THE WHOLE LAYER-2 DECISION, pure and testable: given what pg_net recorded and which
  * cron jobs dispatch HTTP, is the delivery path working, broken, or unjudgeable?
  *
- * @param {{stats: object|null, queryError: string|null, httpPostSchedules: string[]}} input
+ * `httpPostJobs` ({jobname, schedule}[]) is preferred and enables the coverage clause;
+ * `httpPostSchedules` (string[]) stays accepted so older callers and tests keep working.
+ *
+ * @param {{stats: object|null, queryError: string|null, httpPostJobs?: {jobname: string, schedule: string}[], httpPostSchedules?: string[], nowMs?: number}} input
  * @returns {{verdict: 'ok'|'dead'|'unverifiable'|'not-applicable', detail: string}}
  */
-export function httpDeliveryVerdict({ stats, queryError, httpPostSchedules }) {
+export function httpDeliveryVerdict({ stats, queryError, httpPostJobs, httpPostSchedules, nowMs }) {
+  const jobs = httpPostJobs
+    ?? (httpPostSchedules || []).map((schedule, i) => ({ jobname: `job#${i + 1}`, schedule }))
+  httpPostSchedules = jobs.map((j) => j.schedule)
+  const coverage = nowMs == null ? null : deliveryCoverage({ httpPostJobs: jobs, nowMs })
+  const cov = coverageClause(coverage)
   if (!httpPostSchedules.length) {
     return { verdict: 'not-applicable', detail: 'no active cron job on this database dispatches an HTTP call' }
   }
@@ -191,9 +314,9 @@ export function httpDeliveryVerdict({ stats, queryError, httpPostSchedules }) {
     // worker is not running, and every http_post cron on this database is a no-op
     // while `job_run_details` cheerfully reports 'succeeded'.
     if (fastest * 2 <= RESPONSE_RETENTION_MS) {
-      return { verdict: 'dead', detail: `pg_net recorded ZERO HTTP responses in its ~${(RESPONSE_RETENTION_MS / 3600_000).toFixed(0)}h retention window, but a cron job dispatches one every ${fmtAge(fastest)}. The calls are being enqueued and never sent (or never recorded), so every http_post cron here is silently doing nothing while cron.job_run_details reports 'succeeded'.` }
+      return { verdict: 'dead', detail: `pg_net recorded ZERO HTTP responses in its ~${(RESPONSE_RETENTION_MS / 3600_000).toFixed(0)}h retention window, but a cron job dispatches one every ${fmtAge(fastest)}. The calls are being enqueued and never sent (or never recorded), so every http_post cron here is silently doing nothing while cron.job_run_details reports 'succeeded'.${cov}` }
     }
-    return { verdict: 'unverifiable', detail: `no HTTP responses inside pg_net's ~${(RESPONSE_RETENTION_MS / 3600_000).toFixed(0)}h retention window; the fastest http_post cron runs every ${fmtAge(fastest)}, so an empty window proves nothing either way` }
+    return { verdict: 'unverifiable', detail: `no HTTP responses inside pg_net's ~${(RESPONSE_RETENTION_MS / 3600_000).toFixed(0)}h retention window; the fastest http_post cron runs every ${fmtAge(fastest)}, so an empty window proves nothing either way${cov}` }
   }
 
   const refused = stats.refused || 0
@@ -202,15 +325,15 @@ export function httpDeliveryVerdict({ stats, queryError, httpPostSchedules }) {
   if (refused > 0) {
     // 401/403/404 do not heal themselves. One is a finding. This is the exact fault
     // that hid for weeks: 3 × 401 among 106 × 200, every job reporting 'succeeded'.
-    return { verdict: 'dead', detail: `${refused} of ${stats.calls} HTTP calls this database dispatched were REFUSED (status ${stats.bad_codes ?? 'unknown'}). A refused credential or a wrong route does not recover on its own, and cron.job_run_details still reports these as 'succeeded'. If signal-sweep-5min is among them, the fleet pager is not delivering.` }
+    return { verdict: 'dead', detail: `${refused} of ${stats.calls} HTTP calls this database dispatched were REFUSED (status ${stats.bad_codes ?? 'unknown'}). A refused credential or a wrong route does not recover on its own, and cron.job_run_details still reports these as 'succeeded'. If signal-sweep-5min is among them, the fleet pager is not delivering.${cov}` }
   }
   if (transient >= PERSISTENT_FAILURES) {
-    return { verdict: 'dead', detail: `${transient} of ${stats.calls} HTTP calls this database dispatched failed (status ${stats.bad_codes ?? 'unknown'}; ${stats.timed_out || 0} timed out, ${stats.errored || 0} errored). Past ${PERSISTENT_FAILURES} in one window this is no longer a blip.` }
+    return { verdict: 'dead', detail: `${transient} of ${stats.calls} HTTP calls this database dispatched failed (status ${stats.bad_codes ?? 'unknown'}; ${stats.timed_out || 0} timed out, ${stats.errored || 0} errored). Past ${PERSISTENT_FAILURES} in one window this is no longer a blip.${cov}` }
   }
   if (transient > 0) {
-    return { verdict: 'ok', detail: `${stats.ok} of ${stats.calls} dispatched HTTP calls answered 2xx; ${transient} transient failure(s) (${stats.bad_codes}), under the ${PERSISTENT_FAILURES} needed to count` }
+    return { verdict: 'ok', detail: `${stats.ok} of ${stats.calls} dispatched HTTP calls answered 2xx; ${transient} transient failure(s) (${stats.bad_codes}), under the ${PERSISTENT_FAILURES} needed to count${cov}` }
   }
-  return { verdict: 'ok', detail: `all ${stats.calls} HTTP calls this database dispatched in the last ~${(RESPONSE_RETENTION_MS / 3600_000).toFixed(0)}h answered 2xx` }
+  return { verdict: 'ok', detail: `all ${stats.calls} HTTP calls this database dispatched in the last ~${(RESPONSE_RETENTION_MS / 3600_000).toFixed(0)}h answered 2xx${cov}` }
 }
 
 /** Max tolerated age of the last SUCCESSFUL run, derived from the cron schedule.
@@ -357,7 +480,8 @@ async function main() {
     // ── LAYER 2 ─────────────────────────────────────────────────────────────
     // Every 'succeeded' printed above is, for an http_post job, a statement about
     // the ENQUEUE and nothing else. Ask pg_net what the calls actually returned.
-    const httpPostSchedules = rows.filter((r) => r.uses_http_post).map((r) => r.schedule)
+    const httpPostJobs = rows.filter((r) => r.uses_http_post).map((r) => ({ jobname: r.jobname, schedule: r.schedule }))
+    const httpPostSchedules = httpPostJobs.map((j) => j.schedule)
     let stats = null, queryError = null
     if (httpPostSchedules.length) {
       try {
@@ -367,7 +491,7 @@ async function main() {
         queryError = e.message
       }
     }
-    const delivery = httpDeliveryVerdict({ stats, queryError, httpPostSchedules })
+    const delivery = httpDeliveryVerdict({ stats, queryError, httpPostJobs, nowMs: now })
     if (delivery.verdict === 'not-applicable') {
       // Say nothing: a database with no http_post cron has no delivery path to judge.
     } else if (delivery.verdict === 'ok') {

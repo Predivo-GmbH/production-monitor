@@ -16,8 +16,10 @@
  * Run: node test/check-cron-heartbeats.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
+import { readFileSync } from 'node:fs'
 import {
   httpDeliveryVerdict, scheduleIntervalMs, RESPONSE_RETENTION_MS, PERSISTENT_FAILURES,
+  msSinceLastFire, deliveryCoverage,
   jobVerdict, allowanceMs,
 } from '../scripts/check-cron-heartbeats.mjs'
 
@@ -286,6 +288,144 @@ t('last_success decides the verdict; last_run is evidence and never overrules it
   }, NOW)
   assert.equal(v.verdict, 'dead')
   assert.match(v.detail, /failed: boom/)
+})
+
+
+// ─── LAYER 2, COVERAGE ───────────────────────────────────────────────────────
+// The window is six hours; the day is twenty-four. Everything below is about the
+// eighteen hours layer 2 could not see, and the fact that it used to describe them
+// with the same words it used for a clean bill of health.
+
+/** BackOffice production, exactly as read from cron.job on 2026-09-02. */
+const BACKOFFICE_HTTP_JOBS = [
+  { jobname: 'github-invite-poller',           schedule: '*/15 * * * *' },
+  { jobname: 'ledger-invariant-monitor-daily', schedule: '23 6 * * *' },
+  { jobname: 'outreach-reply-digest-daily',    schedule: '31 6 * * *' },
+  { jobname: 'reminders-check-daily',          schedule: '17 7 * * *' },
+  { jobname: 'signal-sweep-5min',              schedule: '2-59/5 * * * *' },
+  { jobname: 'support-send-due',               schedule: '*/5 * * * *' },
+  { jobname: 'vat-return-reminder-daily',      schedule: '0 7 * * *' },
+]
+
+/** 05:24 UTC — when the nightly run actually looked, and saw none of the broken jobs. */
+const AT_0524 = Date.parse('2026-09-02T05:24:00Z')
+/** 12:28 UTC — the manual dispatch whose window did contain them. */
+const AT_1228 = Date.parse('2026-09-02T12:28:00Z')
+
+t('a daily job pinned to a wall-clock hour is placed in time, not guessed at', () => {
+  // Cross-checked against pg_cron's own last_success in run 33594504359: the log said
+  // 22.1h / 22.4h / 22.9h / 23.0h for these four, to the decimal.
+  const h = (s, now) => msSinceLastFire(s, now) / 3600_000
+  assert.equal(h('17 7 * * *', AT_0524).toFixed(1), '22.1')
+  assert.equal(h('0 7 * * *',  AT_0524).toFixed(1), '22.4')
+  assert.equal(h('31 6 * * *', AT_0524).toFixed(1), '22.9')
+  assert.equal(h('23 6 * * *', AT_0524).toFixed(1), '23.0')
+  // Same job, seen from after its fire time: hours old, not a day old.
+  assert.equal(h('17 7 * * *', AT_1228).toFixed(1), '5.2')
+})
+
+t('a step schedule is bounded by its own interval and is always inside the window', () => {
+  assert.equal(msSinceLastFire('*/5 * * * *', AT_0524), 5 * 60_000)
+  assert.equal(msSinceLastFire('2-59/5 * * * *', AT_0524), 5 * 60_000)   // the pager's range-step
+  assert.equal(msSinceLastFire('0 */6 * * *', AT_0524), 6 * 3600_000)
+  assert.equal(msSinceLastFire('0 * * * *', AT_0524), 3600_000)          // hourly at fixed minute
+})
+
+t('weekly and monthly shapes resolve to a real past instant', () => {
+  // 2026-09-02 is a Wednesday; the Monday 08:00 fire is 2026-08-31.
+  const weekly = msSinceLastFire('0 8 * * 1', AT_1228)
+  assert.equal(new Date(AT_1228 - weekly).toISOString(), '2026-08-31T08:00:00.000Z')
+  // Monthly on the 1st at 09:00 → yesterday, not next month.
+  const monthly = msSinceLastFire('0 9 1 * *', AT_1228)
+  assert.equal(new Date(AT_1228 - monthly).toISOString(), '2026-09-01T09:00:00.000Z')
+})
+
+t('THE INJECTED BLIND SPOT: a clean-sounding sentence about a window that excluded every broken job', () => {
+  // These are the REAL numbers from the 05:24 run on 2026-09-02: 175 calls, every one
+  // of them 2xx. Nothing here is a failure the old code missed by misjudging it — it is
+  // a failure the old code never had in front of it, because the four jobs that were
+  // 401ing had fired 22-23 hours earlier and pg_net had already forgotten them.
+  const facts = { stats: { calls: 175, ok: 175, bad: 0, refused: 0 }, queryError: null }
+
+  // OLD: no nowMs, so no coverage clause — the exact sentence that was printed, which
+  // reads as "this database's delivery is fine".
+  const old = httpDeliveryVerdict({ ...facts, httpPostJobs: BACKOFFICE_HTTP_JOBS })
+  assert.equal(old.verdict, 'ok')
+  assert.doesNotMatch(old.detail, /UNOBSERVED/)
+
+  // NEW: same verdict — 175 really were fine — but it can no longer be read as a
+  // statement about the four jobs nobody looked at, because it names all four.
+  const now = httpDeliveryVerdict({ ...facts, httpPostJobs: BACKOFFICE_HTTP_JOBS, nowMs: AT_0524 })
+  assert.equal(now.verdict, 'ok')
+  assert.match(now.detail, /UNOBSERVED/)
+  for (const name of ['ledger-invariant-monitor-daily', 'outreach-reply-digest-daily',
+                      'reminders-check-daily', 'vat-return-reminder-daily']) {
+    assert.match(now.detail, new RegExp(name))
+  }
+  // The jobs that WERE covered must not be smeared into the doubt.
+  assert.doesNotMatch(now.detail, /signal-sweep-5min/)
+  assert.doesNotMatch(now.detail, /support-send-due/)
+})
+
+t('shifting the window to when those jobs fire makes the doubt disappear', () => {
+  // The same database seen at 12:28, which is what the dispatch that found the 401s did.
+  const c = deliveryCoverage({ httpPostJobs: BACKOFFICE_HTTP_JOBS, nowMs: AT_1228 })
+  const unobserved = c.unobserved.map((j) => j.jobname)
+  // ledger fires 06:23 and the window opens 06:28, so it is the one that stays outside —
+  // five minutes of blind spot, which is exactly why the schedule and not the wording is
+  // what has to close this.
+  assert.deepEqual(unobserved, ['ledger-invariant-monitor-daily'])
+  assert.equal(c.observed.length, 6)
+})
+
+t('a covered window adds nothing: the healthy sentence stays short', () => {
+  const v = httpDeliveryVerdict({
+    stats: { calls: 259, ok: 259, bad: 0, refused: 0 }, queryError: null,
+    httpPostJobs: [{ jobname: 'lifecycle-tick', schedule: '*/5 * * * *' }],
+    nowMs: AT_0524,
+  })
+  assert.equal(v.verdict, 'ok')
+  assert.doesNotMatch(v.detail, /NOTE:/)
+})
+
+t('a DEAD finding is still only a finding about what was in the window', () => {
+  // 27 of 230 no-response on ReplyFlow is real, but it is not the whole database either.
+  const v = httpDeliveryVerdict({
+    stats: { calls: 230, ok: 203, bad: 27, refused: 0, timed_out: 27, errored: 27, bad_codes: 'no-response' },
+    queryError: null,
+    httpPostJobs: [
+      { jobname: 'process-queue-every-2min', schedule: '*/2 * * * *' },
+      { jobname: 'send-weekly-digest-monday-8am', schedule: '0 8 * * 1' },
+    ],
+    nowMs: AT_0524,
+  })
+  assert.equal(v.verdict, 'dead')
+  assert.match(v.detail, /no longer a blip/)
+  assert.match(v.detail, /UNOBSERVED here — send-weekly-digest-monday-8am/)
+})
+
+t('a schedule that cannot be placed in time is UNKNOWN, not quietly counted as covered', () => {
+  const c = deliveryCoverage({
+    httpPostJobs: [{ jobname: 'weird', schedule: 'H/5 * * * *' }],
+    nowMs: AT_0524,
+  })
+  assert.equal(c.observed.length, 0)
+  assert.equal(c.unobserved.length, 0)
+  assert.equal(c.unknown.length, 1)
+  const v = httpDeliveryVerdict({
+    stats: { calls: 10, ok: 10, bad: 0, refused: 0 }, queryError: null,
+    httpPostJobs: [{ jobname: 'weird', schedule: 'H/5 * * * *' }], nowMs: AT_0524,
+  })
+  assert.match(v.detail, /cannot place in time/)
+})
+
+t('THE WIRING: the shipped script passes real job names and its own clock, not just schedules', () => {
+  // A green test on an exported function proves the function works, never that the
+  // product calls it — exitDecision() was exported, documented and unit-tested here
+  // while the CLI had stopped calling it (fixed in 6f2fd93). Same trap, same guard.
+  const src = readFileSync(new URL('../scripts/check-cron-heartbeats.mjs', import.meta.url), 'utf8')
+  assert.match(src, /httpDeliveryVerdict\(\{ stats, queryError, httpPostJobs, nowMs: now \}\)/)
+  assert.match(src, /const httpPostJobs = rows\.filter\(\(r\) => r\.uses_http_post\)/)
 })
 
 console.log(`\n${n} assertions passed.`)
