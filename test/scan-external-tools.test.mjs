@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   classify, indexFingerprints, indexHints, normalizeName, matchByHint, isReportable, isReportableHostname,
+  orphanBlockers,
 } from '../scripts/scan-external-tools.mjs'
 
 // Tests for the pure half of the external-tools discovery scan.
@@ -122,4 +123,53 @@ test('inside the window is fresh, past it is stale, and the page uses the same 3
   assert.equal(judge('2026-08-27T06:00:00Z', now).stale, false)   // 6h
   assert.equal(judge('2026-08-26T04:00:00Z', now).stale, false)   // 32h, still inside
   assert.equal(judge('2026-08-25T20:00:00Z', now).stale, true)    // 40h
+})
+
+// ── the absence guard ───────────────────────────────────────────────────────
+// The 2026-08-31 false alarm: the page said "Nothing uses Zyte any more", the same for
+// Browserless and the Google Search Console API. All three were live. The one thing those
+// three shared was that each lives in exactly ONE repo — arivioo or pull-engine — and the host
+// running the daily scan has neither checked out. The repo-COUNT floor cleared comfortably
+// while the two repos that decided the answer were missing. These lock in the per-tool test.
+const FLEET = new Set(['BackOffice', 'ChannelMover', 'replyflow', 'signalscore', 'Cockpit', 'production-monitor'])
+
+test('a tool whose only repo was not scanned gets NO orphan verdict', () => {
+  assert.deepEqual(orphanBlockers(new Set(['arivioo']), FLEET), ['arivioo'])
+  assert.deepEqual(orphanBlockers(new Set(['pull-engine']), FLEET), ['pull-engine'])
+})
+
+test('a tool whose repos were all scanned CAN be judged', () => {
+  assert.deepEqual(orphanBlockers(new Set(['BackOffice', 'Cockpit']), FLEET), [])
+})
+
+test('one missing repo out of several is still enough to withhold the verdict', () => {
+  // Half a tool's usage sites being visible is the most dangerous case: it looks like partial
+  // decommissioning and reads as evidence. It is not — the rest may be in the missing repo.
+  assert.deepEqual(orphanBlockers(new Set(['BackOffice', 'arivioo']), FLEET), ['arivioo'])
+})
+
+test('missing repos are reported by name, sorted, so the log says WHERE it could not look', () => {
+  assert.deepEqual(orphanBlockers(new Set(['pull-engine', 'arivioo', 'Valrano']), FLEET),
+    ['Valrano', 'arivioo', 'pull-engine'])
+})
+
+test('a tool with no recorded usage sites is not blocked by this rule', () => {
+  // It is held back by the separate `last_seen_in_code_at` test instead; this rule must not
+  // silently become a second, permanent veto on every tool the scan has never matched.
+  assert.deepEqual(orphanBlockers(undefined, FLEET), [])
+  assert.deepEqual(orphanBlockers(new Set(), FLEET), [])
+})
+
+test('the exact 2026-08-31 false alarm cannot be filed again', () => {
+  // The real recorded state: these are the only repos each of the three was ever seen in.
+  const prior = { Zyte: new Set(['arivioo']), Browserless: new Set(['arivioo']), 'Google Search Console API': new Set(['pull-engine']) }
+  const hostWithoutThem = new Set([...FLEET, 'Valrano', 'BoatBuddy', 'predivo', 'launchready',
+    'Distribution-OS', 'ScoutCopilot', 'gate-kit', 'ci-runner', 'standards', 'APIs'])   // 16 repos: clears the count floor
+  assert.ok(hostWithoutThem.size >= 14, 'the false-alarm host clears the repo-count floor')
+  for (const [tool, repos] of Object.entries(prior)) {
+    assert.ok(orphanBlockers(repos, hostWithoutThem).length > 0, `${tool} must not be judged on this host`)
+  }
+  // ...and on a complete checkout the scan regains its opinion.
+  const complete = new Set([...hostWithoutThem, 'arivioo', 'pull-engine'])
+  for (const repos of Object.values(prior)) assert.deepEqual(orphanBlockers(repos, complete), [])
 })

@@ -276,6 +276,30 @@ export function isReportableHostname(host) {
   return false
 }
 
+/**
+ * Can this scan HONESTLY judge whether a tool is unused?
+ *
+ * THE 2026-08-31 FALSE ALARM, which is the whole reason this exists. The page declared Zyte,
+ * Browserless and Google Search Console API dead. All three were live: Zyte and Browserless are
+ * the 2nd and 3rd tiers of arivioo's scraper chain across 14 edge functions, and the GSC API is
+ * pull-engine's weekly Search Console pull. What those three have in common is not disuse — it
+ * is that each is used in EXACTLY ONE repo, `arivioo` or `pull-engine`, and the host that runs
+ * the daily scan does not have those two repos checked out. Every other tool in the register
+ * lives in a repo that host does have, so only these three could ever go quiet.
+ *
+ * The repo-COUNT floor could not catch it: the host clears the floor comfortably while missing
+ * the two repos that mattered. A count answers "did I look at enough places", never "did I look
+ * in THE place". So the test is per tool and by NAME: a tool may only be called orphaned when
+ * every repo it was last seen in was actually scanned this run. If one is missing, this scan has
+ * no opinion — that is not a failure, it is the honest answer, and it must be said out loud.
+ *
+ * `priorRepos` is the set of repos the tool's recorded usage sites sit in; `scannedRepos` is what
+ * this run walked. Returns the missing repos — empty means the verdict is trustworthy.
+ */
+export function orphanBlockers(priorRepos, scannedRepos) {
+  return [...(priorRepos || [])].filter((r) => !scannedRepos.has(r)).sort()
+}
+
 export function isReportable(fp) {
   if (fp.kind === 'hostname') return isReportableHostname(fp.pattern)
   if (fp.kind === 'npm_package') return false                          // far too many to be a signal
@@ -388,12 +412,29 @@ async function main() {
     console.log(`::warning::only ${repos.length} repo(s) present (floor is ${MIN_REPOS_FOR_ORPHANS}) — usage recorded, orphan detection SKIPPED. A partial checkout cannot tell "unused" from "not checked out".`)
   } else {
   const tools = await boGet(secret, 'api_entries?select=id,name,status,retired_at,code_ref_count,last_seen_in_code_at&status=eq.active&retired_at=is.null')
+
+  // Where each tool was LAST SEEN. The count floor above asks "enough repos?"; this asks the
+  // only question that decides an absence claim — "was THIS tool's repo among them?".
+  const priorSites = await boGet(secret, 'tool_usage_sites?select=api_entry_id,repo')
+  const priorReposByTool = new Map()
+  for (const s of priorSites) {
+    if (!priorReposByTool.has(s.api_entry_id)) priorReposByTool.set(s.api_entry_id, new Set())
+    priorReposByTool.get(s.api_entry_id).add(s.repo)
+  }
+  const scannedRepos = new Set(repos)
+
   for (const t of tools) {
     if (seenToolIds.has(t.id)) continue
     // Never scanned yet is not the same as unused. Only a tool that HAS been seen before and
     // has now gone quiet can be an orphan; otherwise the first run would declare half the
     // register dead.
     if (!t.last_seen_in_code_at) continue
+    // Nor is "gone from the repos I happen to have" the same as unused.
+    const missing = orphanBlockers(priorReposByTool.get(t.id), scannedRepos)
+    if (missing.length) {
+      console.log(`::warning::cannot judge ${t.name}: last seen in ${missing.join(', ')}, which this checkout does not have — no orphan verdict (a missing repo is not an unused tool)`)
+      continue
+    }
     const key = `orphaned:${t.name}`
     const prev = byKey.get(key)
     if (!prev) {
