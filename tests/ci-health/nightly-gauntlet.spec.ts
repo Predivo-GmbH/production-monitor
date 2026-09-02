@@ -105,9 +105,28 @@ for (const repo of TIERED_REPOS) {
       }
     }
 
+    // NAME THE ACTUALLY-FAILING GATE, don't hardcode E2E wording. A red nightly can be ANY gate
+    // (gate-security/audit, gate-integration, gate-edge-typecheck, gate-e2e). Hardcoding
+    // "real-login / integration / E2E gate regressed" masked a browserslist advisory that only
+    // failed gate-security for hours and pointed at the wrong subsystem (Valrano run 33592350429,
+    // 2026-09-02: gate-integration/edge-typecheck/e2e all green, only gate-security red).
+    // Defensive: any error resolving the job list → fall back to a generic phrasing, never block
+    // the alert or SKIP on it.
+    let failedGates = 'one or more gates';
+    const jobsRes = await request.get(
+      `https://api.github.com/repos/${repo}/actions/runs/${latest.id}/jobs?per_page=100`,
+      { headers: { Authorization: `Bearer ${ghToken}`, Accept: 'application/vnd.github.v3+json' } },
+    );
+    if (jobsRes.ok()) {
+      const failed = ((await jobsRes.json()).jobs ?? [])
+        .filter((j: { conclusion: string }) => ['failure', 'timed_out'].includes(j.conclusion))
+        .map((j: { name: string }) => j.name);
+      if (failed.length) failedGates = `the ${failed.join(', ')} gate(s)`;
+    }
+
     expect(
       isFail && persistent,
-      `${repo} NIGHTLY GAUNTLET PERSISTENTLY FAILING — a real-login / integration / E2E gate regressed against staging and the auto-retry did NOT recover it (attempt ${attempt}, ${ageHours.toFixed(1)}h, ${latest.html_url}). Do NOT promote ${repo} to production until fixed.`,
+      `${repo} NIGHTLY GAUNTLET PERSISTENTLY FAILING — ${failedGates} regressed against staging and the auto-retry did NOT recover it (attempt ${attempt}, ${ageHours.toFixed(1)}h, ${latest.html_url}). Do NOT promote ${repo} to production until fixed.`,
     ).toBe(false);
   });
 }
