@@ -8,7 +8,8 @@
  * Run: node test/check-edge-code-live.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
-import { compareInventories, describeBehind, summarise, loadBaseline, HOUR_MS }
+import { readdirSync, readFileSync } from 'node:fs'
+import { compareInventories, describeBehind, summarise, loadBaseline, verdict, HOUR_MS }
   from '../scripts/check-edge-code-live.mjs'
 
 let n = 0
@@ -271,6 +272,85 @@ t('a clone failure never leaks the token into the message', () => {
       { exists: () => false, exec: () => { throw new Error(`fatal: https://x-access-token:${token}@github.com/x`) } }),
     (e) => !e.message.includes(token) && e.message.includes('***'),
   )
+})
+
+// ── THE VERDICT MUST NAME THE SLICE IT IS ABOUT ──────────────────────────────
+// Added 2026-09-02 after this check red the hourly monitor on its first scheduled run. The
+// token bug that caused the red was one line; the defect these tests pin is the one it exposed.
+
+const clean = (repo) => ({ repo, stale: [], neverDeployed: [], orphan: [] })
+
+t('DEFECT: a clean read of a SLICE must not print itself as a clean fleet', () => {
+  // Nine repos read and current, one unreadable. The old code printed the bare word "OK" and
+  // returned 0; the unreadable repo existed only as a console line nobody reads. That is
+  // precisely the "absent read as fine" hole this whole check was written to close.
+  const v = verdict({
+    findings: Array.from({ length: 9 }, (_, i) => clean(`r${i}`)),
+    unreadable: ['BackOffice (no token can see xoecpzfsskalvjrtcbbl)'],
+  })
+  assert.equal(v.state, 'PARTIAL')
+  assert.equal(v.level, 'warning')          // visible in the run, not a silent OK
+  assert.equal(v.code, 0)                   // but a flaked clone must not red the monitor
+  assert.equal(v.file, false)               // and must not page
+  assert.match(v.headline, /NOT a clean fleet/)
+  assert.match(v.headline, /9 of 10 product\(s\) read/)
+  assert.match(v.headline, /1 COULD NOT BE READ/)
+})
+
+t('DEFECT: total blindness exits 1, and says how blind', () => {
+  // The exact shape of monitor run 33666028593: GH_TOKEN empty, every clonable repo unreadable.
+  const v = verdict({ findings: [], unproven: ['arivioo'], unreadable: ['replyflow (no local checkout and no GH_TOKEN to clone with)'] })
+  assert.equal(v.state, 'BLIND')
+  assert.equal(v.code, 1)
+  assert.match(v.headline, /0 of 2 product\(s\) read/)
+})
+
+t('a fully clean fleet still says how many products that was', () => {
+  const v = verdict({ findings: [clean('a'), clean('b')] })
+  assert.equal(v.state, 'OK')
+  assert.equal(v.code, 0)
+  assert.match(v.headline, /2 of 2 product\(s\) read/)
+})
+
+t('UNPROVEN coverage is named but is deliberately NOT a finding', () => {
+  // A baseline repo with prod:null is a recorded expectation, not a failure. Making it warn
+  // every hour would be an alarm nobody can close — the same ruling the cron heartbeat made
+  // for UNOBSERVED windows. It must still appear in the sentence.
+  const v = verdict({ findings: [clean('a')], unproven: ['Valrano', 'BoatBuddy'] })
+  assert.equal(v.state, 'OK')
+  assert.equal(v.level, 'log')
+  assert.match(v.headline, /2 UNPROVEN/)
+})
+
+t('a real finding still wins when something was also unreadable', () => {
+  const v = verdict({
+    findings: [{ repo: 'BackOffice', stale: [{ slug: 'sync-outreach', behindMs: 9 * 24 * HOUR_MS }], neverDeployed: [], orphan: [] }],
+    unreadable: ['signalscore (clone failed)'],
+  })
+  assert.equal(v.state, 'STALE')
+  assert.equal(v.file, true)                // the board hears about the stale fix
+  assert.match(v.headline, /sync-outreach/)
+})
+
+// ── WIRING: the token this check is handed must be one that EXISTS ────────────────────
+// FLEET_READ_TOKEN has never been created. `${{ secrets.MISSING }}` is not an error in GitHub
+// Actions — it is the empty string, so a step wired to it alone runs with no credentials and
+// every conclusion it reaches is about nothing. drift-check.yml discovered this in its own
+// comment; monitor.yml then did it again anyway. A comment is not a guard.
+
+t('WIRING: no workflow may use FLEET_READ_TOKEN without a fallback', () => {
+  const dir = new URL('../.github/workflows/', import.meta.url)
+  const offenders = []
+  for (const f of readdirSync(dir).filter((name) => /\.ya?ml$/.test(name))) {
+    const text = readFileSync(new URL(f, dir), 'utf-8')
+    text.split(/\r?\n/).forEach((line, i) => {
+      if (!line.includes('FLEET_READ_TOKEN')) return
+      if (line.trim().startsWith('#')) return             // prose about it is fine
+      if (/FLEET_READ_TOKEN\s*\|\|/.test(line)) return     // has a fallback
+      offenders.push(`${f}:${i + 1}`)
+    })
+  }
+  assert.deepEqual(offenders, [], `wired to a secret that does not exist: ${offenders.join(', ')}`)
 })
 
 console.log(`\n${n} passed (total)`)

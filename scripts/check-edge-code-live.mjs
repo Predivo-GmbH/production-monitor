@@ -148,6 +148,42 @@ export function summarise(findings) {
   return parts.join('. ') + '.'
 }
 
+/**
+ * The exit verdict, given what we actually managed to read.
+ *
+ * Pure and separate on purpose, because the REASSURING path is the dangerous one. This whole
+ * check exists because a sentence like "21 projects checked, 0 behind" was true about a slice
+ * and was read as a statement about the fleet. So a verdict must always carry the size of the
+ * slice it is about — the count is not decoration, it IS the finding.
+ *
+ *   BLIND    nothing could be read at all -> exit 1. "Could not tell" is never "fine".
+ *   STALE    a real finding -> exit 0 and FILE it; the board is the alert (fleet-signal.mjs).
+ *   PARTIAL  what we read is current, but something could NOT be read. Exit 0, because a clone
+ *            that flaked must not red the hourly monitor — but it must not be able to print
+ *            itself as a clean bill of health either. Before this existed, one unreadable repo
+ *            among ten clean ones produced the word "OK" and nothing else.
+ *   OK       everything readable is current, and the line says how many that was.
+ */
+export function verdict({ findings, unproven = [], unreadable = [] }) {
+  const read = findings.length
+  const slice = `${read} of ${read + unproven.length + unreadable.length} product(s) read` +
+    (unproven.length ? `, ${unproven.length} UNPROVEN` : '') +
+    (unreadable.length ? `, ${unreadable.length} COULD NOT BE READ` : '')
+
+  if (!read && unreadable.length) {
+    return { state: 'BLIND', code: 1, level: 'error', file: false,
+      headline: `edge-code currency could not be established for any product (${slice})` }
+  }
+  const summary = summarise(findings)
+  if (summary) return { state: 'STALE', code: 0, level: 'warning', file: true, headline: summary }
+  if (unreadable.length) {
+    return { state: 'PARTIAL', code: 0, level: 'warning', file: false,
+      headline: `every edge function we could read is current — but this is NOT a clean fleet: ${slice}` }
+  }
+  return { state: 'OK', code: 0, level: 'log', file: false,
+    headline: `every deployed edge function is at or ahead of its committed code (${slice})` }
+}
+
 // ── I/O ──────────────────────────────────────────────────────────────────────────────────
 
 export function loadBaseline(path = join(HERE, 'lib', 'edge-code-baseline.json')) {
@@ -350,21 +386,13 @@ async function main() {
   if (unproven.length) console.log(`  UNPROVEN coverage (no production ref established): ${unproven.join(', ')}`)
   if (unreadable.length) console.log(`  COULD NOT READ: ${unreadable.join('; ')}`)
 
-  // A read that failed is not a clean bill of health. Say so, loudly, and exit non-zero —
-  // the same rule the rest of this repo follows.
-  if (unreadable.length && !findings.length) {
-    console.error(`::error::edge-code currency could not be established for any product`)
-    return 1
-  }
+  // A read that failed is not a clean bill of health, and neither is a clean read of a slice.
+  const v = verdict({ findings, unproven, unreadable })
+  if (v.level === 'error') { console.error(`::error::${v.headline}`); return v.code }
+  if (v.level === 'warning') console.error(`::warning::${v.headline}`)
+  else console.log(`  OK  ${v.headline} (grace ${graceMs / HOUR_MS}h)`)
+  if (!v.file) return v.code
 
-  const summary = summarise(findings)
-  if (!summary) {
-    console.log(`  OK  every deployed edge function is at or ahead of its committed code ` +
-      `(${findings.length} product(s) checked, grace ${graceMs / HOUR_MS}h)`)
-    return 0
-  }
-
-  console.error(`::warning::${summary}`)
   if (dry) { console.log('  --dry: not filing'); return 0 }
 
   await fileSignal(boardSecret(), signal({
@@ -376,7 +404,7 @@ async function main() {
     // which has its own alarm.
     needsHuman: false,
     title: 'A fix exists in our code but production is still running the old version',
-    summary,
+    summary: v.headline,
     detail: {
       grace_hours: graceMs / HOUR_MS,
       checked_at: new Date().toISOString(),

@@ -464,7 +464,13 @@ jobs:
         if: always()
         run: node scripts/check-edge-code-live.mjs
         env:
-          GH_TOKEN: ${{ secrets.FLEET_READ_TOKEN }}   # clones the fleet blobless; no REST budget spent
+          # FLEET_READ_TOKEN HAS NEVER EXISTED. This repo already discovered that once and wrote it
+          # down in drift-check.yml: a step wired to it alone gets an EMPTY GH_TOKEN, and an empty
+          # token here is not a skip — every repo without a local checkout becomes unreadable, which
+          # is how this step red the monitor on run 33666028593 three milliseconds after it started.
+          # DASHBOARD_PAT is the fleet-wide read token its three siblings use (drift, gate-coverage,
+          # deploy-failures) and that mailer-config-check already clones supabase/functions with.
+          GH_TOKEN: ${{ secrets.FLEET_READ_TOKEN || secrets.DASHBOARD_PAT }}   # clones the fleet blobless; no REST budget spent
           BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
           SUPABASE_TOKEN_BACKOFFICE: ${{ secrets.SUPABASE_TOKEN_BACKOFFICE }}
           SUPABASE_TOKEN_CHANNELMOVER: ${{ secrets.SUPABASE_TOKEN_CHANNELMOVER }}
