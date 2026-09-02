@@ -8,7 +8,7 @@
  * Run: node test/check-drainer-progress.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
-import { judgeDrainer } from '../scripts/check-drainer-progress.mjs'
+import { judgeDrainer, summariseBoard } from '../scripts/check-drainer-progress.mjs'
 
 let n = 0
 const t = (name, fn) => { fn(); n++; console.log(`  ok - ${name}`) }
@@ -223,6 +223,189 @@ t('a real run that picked work up is still ok, and a real stall is still stalled
   const stalled = judgeDrainer({ heartbeat: hb({ dispatchable: 5, dispatched: 0, started_at: iso(-2), last_dispatch_at: iso(-60 * 72) }), now: NOW })
   assert.equal(ok.verdict, 'ok')
   assert.equal(stalled.verdict, 'stalled')
+})
+
+// ── ASSERTION 5 + 6: THE DENOMINATOR IS THE BOARD, AND THE PAGE MUST BE ABLE TO NAME THE
+//    ABANDONED (2026-09-02) ────────────────────────────────────────────────────────────────
+// Assertion 4 taught the alarm to count parked items. It kept taking its denominator from
+// `considered` — the drainer's count AFTER dropping every signal whose source it cannot write to.
+// Every case below was watched to FAIL against that version.
+
+const row = (source, key, detail = {}) => ({ source, key, severity: 'warning', state: 'open', detail })
+
+t('summariseBoard: out-of-reach excludes work-board rows, the drainer\'s own rows, and anything already routed', () => {
+  const b = summariseBoard([
+    row('commit-review', 'a'), row('production-monitor', 'b'),        // in reach
+    row('monitoring-hygiene', 'c'), row('external-tools-scan', 'd'),  // out of reach, nobody has them
+    row('monitoring-hygiene', 'e', { work_item: 'some-slug' }),       // out of reach BUT handed over
+    row('work-board', 'f'),                                           // IS the work board
+    row('board-drainer', 'run'),                                      // this machinery's own rows
+  ])
+  assert.equal(b.active, 7)
+  assert.equal(b.findings, 5, 'work-board and board-drainer rows are not findings')
+  assert.equal(b.inReach, 2)
+  assert.deepEqual(b.outOfReach, ['monitoring-hygiene/c', 'external-tools-scan/d'])
+})
+
+t('summariseBoard: parkedPublished counts exactly the rows carrying detail.parked=true', () => {
+  const b = summariseBoard([
+    row('commit-review', 'a', { parked: true }),
+    row('commit-review', 'b', { parked: false }),
+    row('commit-review', 'c'),
+  ])
+  assert.deepEqual(b.parkedPublished, ['commit-review/a'])
+})
+
+t('THE 2026-09-02 LIVE BOARD: 9 parked of 11 "considered" while 31 were never in the sum', () => {
+  // Verbatim heartbeat of 2026-09-02T19:36:57Z, and the board measured at 20:04Z the same evening.
+  // The old judge said given-up "9 of 11 (82%)". True and far too small: the real statement is
+  // 9 parked + 12 never tried out of 30 findings.
+  const heartbeat = {
+    last_seen_at: '2026-09-02T19:36:57.058996+00:00',
+    detail: {
+      dry: false, error: null, parked: 9, handoff: 1, skipped: null, escalated: 1,
+      considered: 11, dispatched: 0, dispatchable: 0, parked_retry: null,
+      last_dispatch_at: '2026-09-02T19:02:03.054Z',
+    },
+  }
+  const board = {
+    active: 42, findings: 24, inReach: 11,
+    outOfReach: Array.from({ length: 13 }, (_, i) => `monitoring-hygiene/x${i}`),
+    parkedPublished: ['commit-review/one', 'commit-review/two'],
+  }
+  const j = judgeDrainer({ heartbeat, board, now: Date.parse('2026-09-02T20:04:00.000Z') })
+  assert.equal(j.verdict, 'given-up')
+  assert.equal(j.severity, 'critical')
+  assert.match(j.summary, /22 of the 24/, 'the numerator is parked PLUS never-tried, over the board')
+  assert.match(j.summary, /9 PARKED/)
+  assert.match(j.summary, /13 NEVER TRIED/)
+  assert.match(j.summary, /cannot even be NAMED/, 'the 9-vs-2 publication gap rides along')
+})
+
+t('THE QUIET HALF ON ITS OWN: nothing parked, but the fixer cannot reach most of the board', () => {
+  // parked = 0, so every assertion up to and including the old assertion 4 reads this as healthy.
+  const j = judgeDrainer({
+    heartbeat: { last_seen_at: ago(10), detail: { considered: 4, parked: 0, dispatchable: 0, dispatched: 0, last_dispatch_at: ago(30) } },
+    board: { active: 30, findings: 30, inReach: 4, outOfReach: Array.from({ length: 26 }, (_, i) => `monitoring-hygiene/y${i}`), parkedPublished: [] },
+    now: NOW,
+  })
+  assert.equal(j.verdict, 'given-up')
+  assert.match(j.summary, /26 NEVER TRIED/)
+  assert.match(j.summary, /never tried: monitoring-hygiene\/y0/i, 'the alarm NAMES them, so nobody has to derive the list')
+})
+
+t('a board the fixer can fully reach, with a little parking, is still ok — and says its coverage', () => {
+  const j = judgeDrainer({
+    heartbeat: { last_seen_at: ago(10), detail: { considered: 40, parked: 3, dispatchable: 0, dispatched: 0, last_dispatch_at: ago(30) } },
+    board: { active: 40, findings: 40, inReach: 40, outOfReach: [], parkedPublished: ['a/1', 'a/2', 'a/3'] },
+    now: NOW,
+  })
+  assert.equal(j.verdict, 'ok')
+  assert.match(j.summary, /40 within the fixer's reach, 0 out of reach/)
+})
+
+t('ASSERTION 6 alone: the drainer knows it parked 6 and the board can name 1', () => {
+  // Nothing else is wrong — the board is fully in reach, 6 of 40 parked is a normal amount. The
+  // only fault is that five of those six abandonments exist nowhere a reader can see them.
+  const j = judgeDrainer({
+    heartbeat: { last_seen_at: ago(10), detail: { considered: 40, parked: 6, dispatchable: 0, dispatched: 0, last_dispatch_at: ago(30) } },
+    board: { active: 40, findings: 40, inReach: 40, outOfReach: [], parkedPublished: ['a/1'] },
+    now: NOW,
+  })
+  assert.equal(j.verdict, 'parks-unpublished')
+  assert.equal(j.severity, 'critical', 'a gap at or above the floor is critical, not a note')
+  assert.match(j.summary, /only 1 row\(s\)|only 1 row/)
+  assert.notEqual(j.verdict, 'ok')
+})
+
+t('a publication gap under the floor is a warning, not a crisis', () => {
+  const j = judgeDrainer({
+    heartbeat: { last_seen_at: ago(10), detail: { considered: 40, parked: 3, dispatchable: 0, dispatched: 0, last_dispatch_at: ago(30) } },
+    board: { active: 40, findings: 40, inReach: 40, outOfReach: [], parkedPublished: ['a/1'] },
+    now: NOW,
+  })
+  assert.equal(j.verdict, 'parks-unpublished')
+  assert.equal(j.severity, 'warning')
+})
+
+t('the page agreeing with the drainer is not an alarm', () => {
+  const j = judgeDrainer({
+    heartbeat: { last_seen_at: ago(10), detail: { considered: 40, parked: 2, dispatchable: 0, dispatched: 0, last_dispatch_at: ago(30) } },
+    board: { active: 40, findings: 40, inReach: 40, outOfReach: [], parkedPublished: ['a/1', 'a/2'] },
+    now: NOW,
+  })
+  assert.equal(j.verdict, 'ok')
+})
+
+t('MORE rows published than the drainer parked is not an alarm — a stale flag is a different bug', () => {
+  // The drainer clears published flags on prune, and a row can legitimately still carry the flag
+  // between the park leaving state and the clear landing. Only the direction that HIDES an
+  // abandonment fires here.
+  const j = judgeDrainer({
+    heartbeat: { last_seen_at: ago(10), detail: { considered: 40, parked: 1, dispatchable: 0, dispatched: 0, last_dispatch_at: ago(30) } },
+    board: { active: 40, findings: 40, inReach: 40, outOfReach: [], parkedPublished: ['a/1', 'a/2', 'a/3'] },
+    now: NOW,
+  })
+  assert.equal(j.verdict, 'ok')
+})
+
+t('an unreadable board is skipped, never guessed at, and the ok-summary admits it', () => {
+  const j = judgeDrainer({
+    heartbeat: { last_seen_at: ago(10), detail: { considered: 11, parked: 9, dispatchable: 0, dispatched: 0, last_dispatch_at: ago(30) } },
+    board: null,
+    now: NOW,
+  })
+  // 9 of 11 still fires on the drainer's own numbers — losing the board must never make the
+  // alarm quieter than it was before assertion 5 existed.
+  assert.equal(j.verdict, 'given-up')
+  assert.match(j.summary, /9 of 11/)
+})
+
+t('a stopped or crashed drainer still outranks every board-derived assertion', () => {
+  const board = { active: 40, findings: 40, inReach: 2, outOfReach: Array.from({ length: 38 }, (_, i) => `x/${i}`), parkedPublished: [] }
+  assert.equal(judgeDrainer({ heartbeat: { last_seen_at: ago(400), detail: {} }, board, now: NOW }).verdict, 'stopped')
+  assert.equal(judgeDrainer({ heartbeat: { last_seen_at: ago(5), detail: { error: 'boom', dispatchable: 0 } }, board, now: NOW }).verdict, 'stopped')
+  assert.equal(judgeDrainer({ heartbeat: { last_seen_at: ago(5), detail: { skipped: 'kill switch', dispatchable: 0 } }, board, now: NOW }).verdict, 'disabled')
+})
+
+// ── ASSERTION 7: A REHEARSAL IS NOT A REPORT (2026-09-02) ──────────────────────────────────
+t('THE LIVE SWAP: a dry heartbeat is unknown, not the stall its own numbers describe', () => {
+  // Verbatim, 2026-09-02T20:06:17Z. A dry run on a second machine replaced the 19:36Z real
+  // heartbeat; its last_dispatch_at came from that machine's 2026-08-25 state file, so the old
+  // judge returned `stalled ... none picked up for 199h` about a fixer that had dispatched an
+  // hour earlier.
+  const j = judgeDrainer({
+    heartbeat: {
+      last_seen_at: '2026-09-02T20:06:17.333578+00:00',
+      detail: {
+        dry: true, error: null, parked: 4, handoff: 1, skipped: null, escalated: 1,
+        considered: 11, dispatched: 0, dispatchable: 4, started_at: '2026-09-02T20:06:16.124Z',
+        parked_retry: 'commit-review/Cockpit:b4adebd:work-evidence-steals-claim',
+        last_dispatch_at: '2026-08-25T13:17:01.947Z',
+      },
+    },
+    now: Date.parse('2026-09-02T20:10:00.000Z'),
+  })
+  assert.equal(j.verdict, 'unknown')
+  assert.notEqual(j.verdict, 'stalled')
+  assert.notEqual(j.verdict, 'ok')
+  assert.match(j.summary, /rehearsal|dry=true/)
+})
+
+t('dry=false is judged exactly as before — the flag only disarms a rehearsal', () => {
+  const j = judgeDrainer({
+    heartbeat: { last_seen_at: ago(10), detail: { dry: false, dispatchable: 34, dispatched: 0, last_dispatch_at: ago(30 * 60) } },
+    now: NOW,
+  })
+  assert.equal(j.verdict, 'stalled')
+})
+
+t('a crashed dry run still reports the crash — the error outranks the rehearsal flag', () => {
+  const j = judgeDrainer({
+    heartbeat: { last_seen_at: ago(5), detail: { dry: true, error: 'board read HTTP 500', dispatchable: 0 } },
+    now: NOW,
+  })
+  assert.equal(j.verdict, 'stopped')
 })
 
 console.log(`\n${n} tests passed.`)

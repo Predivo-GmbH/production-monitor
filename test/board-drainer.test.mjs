@@ -5,7 +5,7 @@
  * Run: node test/board-drainer.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
-import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, parkedFields, gateFor, stripCode, actionOf, plainTitle, titleObjections, workItemSlugFor, handoffPrompt, routeToWorkBoard, prose, DEPLOY_DENY_TOOLS, agentToolFlags, signalObjects, signalPhrases, matchItem, findJoinTarget, joinMarker, expectedBusinessApplies, handedOverClearsCounter } from '../scripts/board-drainer.mjs'
+import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, parkedFields, gateFor, stripCode, actionOf, plainTitle, titleObjections, workItemSlugFor, handoffPrompt, routeToWorkBoard, prose, DEPLOY_DENY_TOOLS, agentToolFlags, signalObjects, signalPhrases, matchItem, findJoinTarget, joinMarker, expectedBusinessApplies, handedOverClearsCounter, parkedHandoverQueue } from '../scripts/board-drainer.mjs'
 
 let n = 0
 const t = (name, fn) => { fn(); n++; console.log(`  ok - ${name}`) }
@@ -1376,6 +1376,51 @@ t('joinMarker states the finding and is explicitly NOT a page for Roger', () => 
   assert.ok(m.includes('v_external_tools'), 'the finding is verbatim')
   assert.ok(/instead of opening a separate row/i.test(m), 'it says why it landed here, not as a new row')
   assert.ok(/your call whether it is in scope/i.test(m), 'the owning session decides scope; it is not blocked on Roger')
+})
+
+// ── PARKING IS A HANDOVER, NOT A LANE (2026-09-02) ─────────────────────────────────────────
+// A finding at the attempt ceiling is a finding three agent runs failed to close, which is the
+// definition of `cls.handoff`. It is routed to the work board like any other item needing a
+// person. These cases pin the ORDER and the CAP, because the order is the whole safeguard.
+const parkedEntry = (key) => ({ inc: { source: 'commit-review', key, title: key }, cls: { reason: 'stuck' } })
+
+t('parked findings are handed over OLDEST-PARKED FIRST, not in board order', () => {
+  const parked = [parkedEntry('newest'), parkedEntry('oldest'), parkedEntry('middle')]
+  const state = { stuck: {
+    newest: { at: '2026-09-02T10:00:00Z' },
+    oldest: { at: '2026-08-20T10:00:00Z' },
+    middle: { at: '2026-08-28T10:00:00Z' },
+  } }
+  const q = parkedHandoverQueue({ parked, state, max: 3 })
+  assert.deepEqual(q.map((e) => e.inc.key), ['oldest', 'middle', 'newest'])
+})
+
+t('an UNRECORDED park time sorts to the FRONT — it is the most neglected case, not the least', () => {
+  const parked = [parkedEntry('dated'), parkedEntry('undated')]
+  const state = { stuck: { dated: { at: '2026-08-20T10:00:00Z' }, undated: {} } }
+  assert.equal(parkedHandoverQueue({ parked, state, max: 1 })[0].inc.key, 'undated')
+})
+
+t('the per-run cap holds, so a backlog drains steadily instead of flooding the board', () => {
+  const parked = Array.from({ length: 9 }, (_, i) => parkedEntry(`k${i}`))
+  const state = { stuck: Object.fromEntries(parked.map((e, i) => [e.inc.key, { at: `2026-08-${10 + i}T00:00:00Z` }])) }
+  assert.equal(parkedHandoverQueue({ parked, state, max: 3 }).length, 3)
+  assert.deepEqual(parkedHandoverQueue({ parked, state, max: 3 }).map((e) => e.inc.key), ['k0', 'k1', 'k2'])
+})
+
+t('the suppression ships with its own off switch: max 0 hands over nothing', () => {
+  const parked = [parkedEntry('a')]
+  assert.deepEqual(parkedHandoverQueue({ parked, state: { stuck: { a: {} } }, max: 0 }), [])
+})
+
+t('hand-off disabled globally disables the parked hand-over too — one switch, not two', () => {
+  const parked = [parkedEntry('a')]
+  assert.deepEqual(parkedHandoverQueue({ parked, state: { stuck: { a: {} } }, handoff: false, max: 3 }), [])
+})
+
+t('an empty parked list is not an error and hands nothing over', () => {
+  assert.deepEqual(parkedHandoverQueue({ parked: [], state: {}, max: 3 }), [])
+  assert.deepEqual(parkedHandoverQueue({ parked: undefined, state: undefined, max: 3 }), [])
 })
 
 await Promise.all(pending)

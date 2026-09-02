@@ -57,6 +57,46 @@
  * Read-only against the board; the alarm itself is filed through signal-intake, so the page
  * policy, the self-heal window and the dedup all apply to it like any other signal.
  *
+ * -- ASSERTION 5, AND WHY ASSERTION 4 WAS STILL THE DRAINER MARKING ITS OWN HOMEWORK (2026-09-02)
+ *
+ * Assertion 4 fixed the NUMERATOR (parked items now count) and left the DENOMINATOR exactly where
+ * it was: `considered`, a number the drainer computes AFTER discarding every signal it has decided
+ * it cannot write to. `readBoard()` in board-drainer.mjs ends with
+ *
+ *     return rows.filter(writableToIncidentBoard)
+ *
+ * because the write still goes to `monitoring_incidents`, whose `source` CHECK accepts only six
+ * values. Everything else is logged as HELD BACK and dropped before `considered` is taken.
+ *
+ * Measured live 2026-09-02 20:04Z:
+ *
+ *     active signals on the board (open/acknowledged)   42
+ *     the drainer even LOOKS at                         11   <- `considered`
+ *     held back, never classified, never tried          31
+ *     of those held back, not on the work board         ~12
+ *     parked by the drainer's own count                  9
+ *     rows publishing detail.parked = true               2   <- the page can name 2 of the 9
+ *
+ * So the 82%-parked alarm was measuring nine abandoned findings against a board of eleven, while
+ * thirty-one others were not in the sum at all — the same shape as the bug assertion 4 removed,
+ * one layer out. NEVER TRIED IS WORSE THAN GIVEN UP, and it was the quieter of the two.
+ *
+ * THE RULE THIS FILE NOW ENFORCES: the denominator is the BOARD, and the numerator is everything
+ * NOBODY IS WORKING — parked (tried, abandoned) plus out-of-reach-and-unowned (never tried, and
+ * not attached to a work item either). Both halves are read here, from the board, not taken from
+ * the drainer's summary of itself. `writableToIncidentBoard` is IMPORTED from the drainer rather
+ * than copied, so the reach test cannot drift away from the filter it is testing; if that module
+ * fails to load the alarm throws, and a throw here is already "could not tell", never "fine".
+ *
+ * -- ASSERTION 6: THE PRIVATE COUNT AND THE PAGE MUST AGREE ----------------------------------
+ *
+ * Parking lives in `C:\Business\_board-drainer\state.json` on one machine, and is PUBLISHED onto
+ * the signal row as `detail.parked` exactly once, in the branch that first records an item stuck.
+ * Nothing ever re-asserts it. On 2026-09-02 the drainer's heartbeat said 9 parked and 2 rows on
+ * the whole board carried the flag: seven findings the machine had given up on could not be
+ * identified by any reader — not by /signals, not by a query, not by Roger. A count that only the
+ * abandoning process can see is not a report of an abandonment. Any gap is stated out loud.
+ *
  * Contract:  node scripts/check-drainer-progress.mjs
  *   env: BOARD_SUPABASE_SECRET (or the BackOffice Credentials.txt path, same as the drainer)
  *        DRAINER_STALE_MIN   (default 180)
@@ -64,6 +104,7 @@
  * Exit 0 = healthy or alarm filed successfully. Exit 1 = could not tell, which is never "fine".
  */
 import { readFileSync } from 'fs'
+import { writableToIncidentBoard } from './board-drainer.mjs'
 
 const BO_REF = 'xoecpzfsskalvjrtcbbl'
 const BO_BASE = `https://${BO_REF}.supabase.co`
@@ -93,12 +134,47 @@ function readBoSecret() {
 
 const minsSince = (iso, now) => (iso ? Math.round((now - new Date(iso).getTime()) / 60000) : null)
 
+/** Sources whose rows are not findings to be fixed and must never be counted as abandoned:
+ *  `work-board` rows ARE the work board (a person already has them by definition), and
+ *  `board-drainer` rows are this machinery's own heartbeat and this very alarm. Counting either
+ *  would make the alarm louder by measuring itself. */
+const NOT_A_FINDING = new Set(['work-board', 'board-drainer'])
+
+/**
+ * Turn the raw active board into the two numbers the verdict needs, and nothing else.
+ *
+ * Pure so it can be fault-injected: every case in the test file hands it rows it never saw live.
+ *
+ * `outOfReach` is the population the drainer's own `readBoard()` throws away — sources
+ * `monitoring_incidents` would reject — MINUS the rows that already have a person: anything whose
+ * source is the work board itself, and anything carrying `detail.work_item`, which is the pointer
+ * the drainer writes when it hands a finding over. What remains is findings that no machine will
+ * ever classify and no human has been given. That is the quietest failure on this page.
+ */
+export function summariseBoard(rows) {
+  const active = Array.isArray(rows) ? rows : []
+  const findings = active.filter((r) => !NOT_A_FINDING.has(r.source))
+  const inReach = findings.filter((r) => writableToIncidentBoard(r))
+  const outOfReach = findings.filter((r) => !writableToIncidentBoard(r) && !r?.detail?.work_item)
+  const parkedPublished = active.filter((r) => r?.detail?.parked === true)
+  const nameOf = (r) => `${r.source}/${r.key}`
+  return {
+    active: active.length,
+    findings: findings.length,
+    inReach: inReach.length,
+    outOfReach: outOfReach.map(nameOf),
+    parkedPublished: parkedPublished.map(nameOf),
+  }
+}
+
 /**
  * The whole decision, pure and testable. `heartbeat` is the fleet_signals row (or null when the
- * drainer has never reported). Never returns 'ok' for an input it could not interpret.
+ * drainer has never reported). `board` is summariseBoard()'s output, or null when the board could
+ * not be read — in which case every board-derived assertion is SKIPPED rather than guessed at, and
+ * the ok-summary says so. Never returns 'ok' for an input it could not interpret.
  */
 export function judgeDrainer({
-  heartbeat, now = Date.now(), staleMin = STALE_MIN, stallHours = STALL_HOURS,
+  heartbeat, board = null, now = Date.now(), staleMin = STALE_MIN, stallHours = STALL_HOURS,
   parkFloor = PARK_FLOOR, parkShare = PARK_SHARE,
 }) {
   if (!heartbeat) {
@@ -141,6 +217,32 @@ export function judgeDrainer({
       severity: 'critical',
       title: 'The fleet auto-fixer crashed on its last run',
       summary: `The last board-drainer run errored and fixed nothing: ${String(detail.error).slice(0, 200)}. Incidents are no longer being worked automatically until this is resolved.`,
+    }
+  }
+
+  // A REHEARSAL IS NOT A REPORT (2026-09-02, caught live while this file was being changed).
+  //
+  // `writeRunHeartbeat` is called from board-drainer.mjs's top-level `main().then()` handler,
+  // unconditionally — so a DRY run publishes over the production heartbeat, on whichever machine
+  // it happens to be run, from whichever local state file that machine happens to have. There is
+  // one row (`source=board-drainer, key=run`) and it is upserted, so the real run's report is not
+  // shadowed, it is DESTROYED.
+  //
+  // Watched happening: at 19:36Z the live heartbeat said `considered 11, dispatchable 0, parked 9`
+  // and this alarm returned given-up. At 20:06Z a dry run on a second machine — whose state file
+  // was last written 2026-08-25 — replaced it with `dry: true, dispatchable 4, parked 4,
+  // last_dispatch_at 2026-08-25`, and the same alarm returned `stalled ... none picked up for
+  // 199h`. Neither the parked count nor the stall clock described the live fixer, and nothing in
+  // the verdict said so. The flag needed to tell them apart was in the row all along: `dry`.
+  //
+  // A dry heartbeat is therefore not graded. It means the last thing the fixer published was a
+  // rehearsal, so its real state is UNKNOWN — which is not healthy, and is also not a stall.
+  if (detail.dry) {
+    return {
+      verdict: 'unknown',
+      severity: 'warning',
+      title: 'The fleet auto-fixer\'s last report was a rehearsal, not a run',
+      summary: `The newest board-drainer heartbeat is marked dry=true, so it was published by a DRY run and has overwritten the real one. Its counts (${Number(detail.dispatchable ?? NaN)} dispatchable, ${Number(detail.parked ?? NaN)} parked, last pickup ${detail.last_dispatch_at || 'never'}) describe a rehearsal on whichever machine ran it, not the live fixer. Whether the board is being worked cannot be established until the next real run publishes, and unknown is not healthy.`,
     }
   }
 
@@ -224,13 +326,39 @@ export function judgeDrainer({
     }
   } else {
     const parked = Number(parkedRaw)
-    if (parked >= parkFloor && considered > 0 && parked / considered >= parkShare) {
-      const pct = Math.round((parked / considered) * 100)
+    // THE DENOMINATOR IS THE BOARD WHEN THE BOARD IS KNOWN (assertion 5). `considered` is what the
+    // drainer looked at after discarding every source it cannot write to, so measuring against it
+    // asks "of the work it still attempts, how much has it abandoned?" — a question that stays
+    // reassuring as the discarded pile grows. Measuring against the active board asks the question
+    // the title claims to answer. When the board could not be read we fall back to `considered`
+    // and say which basis was used, because a silent change of basis is its own lie.
+    const neverTried = board ? board.outOfReach.length : 0
+    const unworked = parked + neverTried
+    const population = board ? board.findings : considered
+    if (unworked >= parkFloor && population > 0 && unworked / population >= parkShare) {
+      const pct = Math.round((unworked / population) * 100)
+      const basis = board
+        ? `${unworked} of the ${population} findings on the board (${pct}%) are being worked by nobody: ${parked} PARKED (the auto-fixer tried them, hit its attempt ceiling and will not pick them up again) and ${neverTried} NEVER TRIED (their source is one the fixer cannot write to, so it drops them before it classifies anything, and no work item has been opened for them either).`
+        : `${parked} of ${population} incidents (${pct}%) are PARKED: the auto-fixer tried them, hit its attempt ceiling and will not pick them up again.`
       return {
         verdict: 'given-up',
         severity: 'critical',
         title: 'The fleet auto-fixer has given up on most of the board',
-        summary: `${parked} of ${considered} incidents (${pct}%) are PARKED: the auto-fixer tried them, hit its attempt ceiling and will not pick them up again. Parked findings carry needs_human=false, so nothing alerts on them and they never reach the work board either — they exist only on the /signals page. These need a person, and until now the alarm reported "the fleet auto-fixer is working" because parked items were excluded from the count the alarm looked at.`,
+        summary: `${basis} These need a person. A parked or out-of-reach finding carries needs_human=false, so nothing pages on it and it never reaches the work board either — it exists only on the /signals page, and a page is PULL.${parkedGap(board, parked)}${board && board.outOfReach.length ? ` Never tried: ${board.outOfReach.slice(0, 12).join(', ')}${board.outOfReach.length > 12 ? `, +${board.outOfReach.length - 12} more` : ''}.` : ''}`,
+        abandoned: board ? board.outOfReach : [],
+      }
+    }
+
+    // ASSERTION 6, on its own. It sits after given-up because given-up is the more actionable
+    // fact, and its summary already carries the same sentence via parkedGap() — so the gap can
+    // never be hidden by a louder verdict, only re-reported under it.
+    const gap = board ? parked - board.parkedPublished.length : 0
+    if (board && gap > 0) {
+      return {
+        verdict: 'parks-unpublished',
+        severity: gap >= parkFloor ? 'critical' : 'warning',
+        title: 'The fleet auto-fixer cannot say WHICH findings it abandoned',
+        summary: `The drainer's own count says ${parked} finding(s) are parked, and only ${board.parkedPublished.length} row(s) on the board publish detail.parked=true. The other ${gap} exist as abandoned only inside the drainer's local state file on one machine: no query, no page and no person can name them. The flag is written once, in the branch that first records an item stuck, and nothing ever re-asserts it — so a park whose write failed, or one made before the flag existed, is invisible for ever.`,
       }
     }
   }
@@ -239,8 +367,20 @@ export function judgeDrainer({
     verdict: 'ok',
     severity: 'info',
     title: 'The fleet auto-fixer is working',
-    summary: `Last run ${age}m ago; ${dispatchable} dispatchable, last dispatch ${sinceDispatch === null ? 'never' : `${sinceDispatch}m ago`}; ${Number(parkedRaw || 0)} of ${considered} parked.`,
+    summary: `Last run ${age}m ago; ${dispatchable} dispatchable, last dispatch ${sinceDispatch === null ? 'never' : `${sinceDispatch}m ago`}; ${Number(parkedRaw || 0)} of ${considered} considered are parked.`
+      + (board
+        ? ` Board: ${board.findings} active finding(s), ${board.inReach} within the fixer's reach, ${board.outOfReach.length} out of reach and unowned.`
+        : ' The board itself could not be read this run, so only the drainer\'s own numbers were checked.'),
   }
+}
+
+/** One sentence, appended to any verdict that already knows `board`, so the publication gap of
+ *  assertion 6 is never swallowed by a louder verdict firing first. */
+function parkedGap(board, parked) {
+  if (!board) return ''
+  const gap = parked - board.parkedPublished.length
+  if (gap <= 0) return ''
+  return ` Worse: only ${board.parkedPublished.length} of those ${parked} parked findings publish detail.parked=true on their row, so ${gap} of them cannot even be NAMED from the board — they are abandoned only inside the drainer's local state file.`
 }
 
 async function boGet(secret, path) {
@@ -269,7 +409,28 @@ async function main() {
   const dry = process.argv.includes('--dry')
 
   const [heartbeat] = await boGet(secret, 'fleet_signals?source=eq.board-drainer&key=eq.run&select=last_seen_at,detail&limit=1')
-  const judgement = judgeDrainer({ heartbeat: heartbeat || null })
+
+  // THE SECOND READ IS THE POINT (assertion 5). Everything above this line came from the drainer's
+  // own summary of itself. The board is read here, independently, with the SAME state filter the
+  // drainer uses, so the denominator is the population and not the drainer's opinion of it.
+  //
+  // A failed board read is NOT fatal and must not be: the stall and stopped assertions are still
+  // worth publishing without it. It downgrades to `board = null`, every board-derived assertion is
+  // skipped, and the ok-summary says the board could not be read — an admitted gap, never a
+  // silent one.
+  let board = null
+  try {
+    const rows = await boGet(
+      secret,
+      'fleet_signals?select=source,key,severity,state,detail&state=in.(open,acknowledged)&limit=2000',
+    )
+    board = summariseBoard(rows)
+    console.log(`board: ${board.findings} active finding(s), ${board.inReach} in the fixer's reach, ${board.outOfReach.length} out of reach and unowned, ${board.parkedPublished.length} publishing parked=true`)
+  } catch (e) {
+    console.error(`::warning::the active board could not be read (${String(e.message).slice(0, 160)}); judging on the drainer's own numbers alone this run`)
+  }
+
+  const judgement = judgeDrainer({ heartbeat: heartbeat || null, board })
   console.log(`drainer: ${judgement.verdict} — ${judgement.summary}`)
 
   if (dry) { console.log('--dry: nothing written.'); return judgement.verdict === 'ok' ? 0 : 0 }
@@ -304,7 +465,17 @@ async function main() {
     needs_human: true,
     title: judgement.title,
     summary: judgement.summary,
-    detail: { verdict: judgement.verdict, heartbeat: heartbeat || null, checked_at: new Date().toISOString() },
+    // The abandoned keys ride ON the alarm. Before this, the alarm said "9 of 13" and named none
+    // of them, so the one row that DID reach Roger could not tell him which nine findings to pick
+    // up — he had to go and derive the list himself, which is the pull-not-push failure again.
+    detail: {
+      verdict: judgement.verdict,
+      heartbeat: heartbeat || null,
+      board: board || null,
+      never_tried: board ? board.outOfReach : null,
+      parked_published: board ? board.parkedPublished : null,
+      checked_at: new Date().toISOString(),
+    },
     link: 'https://cockpit.predivo.ch/signals',
   })
   console.error(`::error::${judgement.title} — ${judgement.summary}`)

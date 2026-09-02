@@ -141,6 +141,11 @@ export function meetsThreshold(inc, thresholdRank = THRESHOLD_RANK) {
 }
 const MAX_FREE_TIMEOUTS = 3    // consecutive agent timeouts on one key that do NOT cost an attempt
 const MAX_ATTEMPTS = 3         // dedup-stuck: after N failed attempts on a key, escalate as "auto-fix stuck"
+// How many PARKED findings are handed to the work board per run (2026-09-02, see 3a-bis).
+// Rate-limited so a backlog drains steadily instead of emptying onto Roger's board in one tick;
+// nine items clear inside an hour at the 20-minute cadence. `0` turns the hand-over off and
+// restores the pre-2026-09-02 behaviour, where a parked finding stayed a parked finding.
+const MAX_PARKED_HANDOVER_PER_RUN = Number(process.env.BOARD_DRAINER_PARKED_HANDOVER_PER_RUN ?? 3)
 
 /**
  * PLAN B, B3 part 2 (Cockpit/docs/PLAN-QUIET-BOARD-2026-08-27.md, approved 2026-08-27).
@@ -237,6 +242,10 @@ const runStats = {
   dispatched: 0,      // agents actually launched this run
   parked: 0,          // at the attempt ceiling: suppressed, deliberately (excludes the one revived below)
   parked_retry: null, // the one parked key handed back to the agent this run, or null (Plan B B3.2)
+  parked_handed_over: 0, // parked findings routed to the work board this run (2026-09-02, 3a-bis).
+                         // Without it, "parked: 0" cannot be told apart from a clean board, and
+                         // "the fixer abandoned nothing" would be indistinguishable from "the
+                         // fixer abandoned everything and gave it all away this hour".
   handoff: 0,         // items routed OFF the alarm surface onto the work board (Plan B B3.3)
   escalated: 0,       // recorded without an agent (notes + first-time stuck)
   dry: !LIVE || !!FIXTURE,
@@ -1333,6 +1342,26 @@ export function joinMarker(inc, cls, join) {
  * @param deps.supersedeSignal(inc, slug) => boolean
  * @returns {{created:boolean, slug:string, title:string, superseded:boolean, objections:string[], reason:string}}
  */
+/**
+ * WHICH PARKED FINDINGS ARE HANDED TO THE WORK BOARD THIS RUN, and in what order. Pure, because
+ * the ordering is the whole safeguard and an ordering nobody can test is an ordering nobody knows.
+ *
+ * OLDEST-PARKED FIRST, deliberately, and for the same reason the 24-hour retry picks that end: the
+ * one abandoned longest ago is the most neglected, not the one that happens to sort first by key.
+ * An item whose park time is missing or unparseable sorts to the very front — an unrecorded park
+ * is the most neglected case of all, so it must not sort to the back where nobody reaches it.
+ *
+ * `max = 0` (BOARD_DRAINER_PARKED_HANDOVER_PER_RUN=0) restores the old behaviour exactly: parked
+ * findings stay parked. The suppression ships with the switch that turns it off, like every other
+ * one in this file.
+ */
+export function parkedHandoverQueue({ parked, state, handoff = HANDOFF_ENABLED, max = MAX_PARKED_HANDOVER_PER_RUN }) {
+  if (!handoff || !(max > 0) || !parked?.length) return []
+  const stuck = state?.stuck || {}
+  const parkedAtOf = (k) => { const t = Date.parse(stuck[k]?.at || ''); return Number.isNaN(t) ? 0 : t }
+  return [...parked].sort((a, b) => parkedAtOf(a.inc.key) - parkedAtOf(b.inc.key)).slice(0, max)
+}
+
 export function handedOverClearsCounter(r) {
   // A signal that was HANDED OVER — superseded onto a freshly-minted item, freshly marked as
   // attached to a live job, or already attached to it on an earlier run — is off the drainer's
@@ -2317,7 +2346,11 @@ async function main() {
   if (parked.length) {
     log(`  PARKED at the attempt ceiling (${MAX_ATTEMPTS} failed tries), not dispatched and not re-escalated: ${parked.length}`)
     for (const { inc } of parked) log(`    ⏸ ${inc.source}/${inc.key} :: ${inc.title}`)
-    log(`    Each is published as detail.parked=true on its signal row, and one of them is retried every ${PARKED_RETRY_INTERVAL_MS / 3600_000}h. To jump that queue: press "Hand to Claude" on /signals, or run with BOARD_DRAINER_RESET_STUCK=<key> (or =all).`)
+    // The old version of this line said "Each is published as detail.parked=true on its signal
+    // row". Measured 2026-09-02 that was false for 7 of 9: the flag is written ONCE, in the branch
+    // that first records an item stuck, and nothing re-asserts it — so a park made before the flag
+    // existed, or one whose write failed, is invisible for ever. Say what actually happens.
+    log(`    Each was published as detail.parked=true at the moment it was parked (not re-asserted since), one is retried every ${PARKED_RETRY_INTERVAL_MS / 3600_000}h, and up to ${MAX_PARKED_HANDOVER_PER_RUN} are handed to the work board per run, oldest-parked first. To jump that queue: press "Hand to Claude" on /signals, or run with BOARD_DRAINER_RESET_STUCK=<key> (or =all).`)
   }
   // Clearing path 4 of 4, and the reason the board can now drain on its own. Named loudly with
   // WHY it was chosen, because "the machine picked one" is not an explanation anybody can audit.
@@ -2348,7 +2381,9 @@ async function main() {
   // In DRY-RUN or FIXTURE we stop here: classification only, nothing dispatched or written.
   if (!LIVE || FIXTURE) {
     const fixes = toWork.filter((r) => r.cls.mode === 'fix').length
-    log(`DRY-RUN: would FIX ${fixes}, VERIFY ${toWork.length - fixes}, RECORD-without-agent ${toEscalate.length} (of which HAND OVER to the work board ${handoffs.length}), PARK ${parked.length}, REVIVE ${parkedRetry ? 1 : 0}. No agent run, no write-back.`)
+    const wouldHandOverParked = parkedHandoverQueue({ parked, state })
+    log(`DRY-RUN: would FIX ${fixes}, VERIFY ${toWork.length - fixes}, RECORD-without-agent ${toEscalate.length} (of which HAND OVER to the work board ${handoffs.length}), PARK ${parked.length}, HAND OVER PARKED ${wouldHandOverParked.length}, REVIVE ${parkedRetry ? 1 : 0}. No agent run, no write-back.`)
+    for (const { inc } of wouldHandOverParked) log(`  DRY-RUN would hand the PARKED finding ${inc.source}/${inc.key} to the work board as ${workItemSlugFor(inc)} (parked ${state.stuck?.[inc.key]?.at || 'at an unrecorded time'})`)
     for (const { inc, cls } of handoffs) {
       const { title, objections } = plainTitle(inc)
       log(`  DRY-RUN would mint ${workItemSlugFor(inc)} :: ${title}${objections.length ? `  ⚠ title objections: ${objections.join('; ')}` : ''}`)
@@ -2440,6 +2475,78 @@ async function main() {
       log(`  ${inc.key}: ERRORED while recording (${String(e).slice(0, 160)}) — will retry next run, not parked.`)
     }
   }
+
+  // ── 3a-bis. PARKING IS A HANDOVER, NOT A LANE (2026-09-02) ───────────────────────────────
+  //
+  // Everything above this block was about making parking VISIBLE — publish the flag, name the
+  // keys in the log, count them in the heartbeat, alarm on the share. All of it true, and all of
+  // it still PULL: a parked finding sat on /signals carrying needs_human=false, so nothing paged,
+  // nothing reached the work board, and the only way anybody learned about it was by going and
+  // looking. Roger did, on 2026-09-02, and the top item on the page was the alarm saying 9 of 13
+  // findings had been abandoned — with no way to act on any of them.
+  //
+  // The class already exists and this file already routes it correctly. `cls.handoff` means "no
+  // agent run can close this; it needs a person", and such an item is minted on the work board in
+  // Roger's lane with a paste-ready prompt and then leaves the alarm surface. An item at the
+  // attempt ceiling has PROVED it belongs to that class: three separate agent runs were dispatched
+  // and none of them closed it. So it is routed the same way, for the same reason.
+  //
+  // WHAT THIS REPLACES, and why the replacement is better than what it removes: the 24-hour
+  // scheduled retry (B3 part 2) existed because a parked item had no other way out. A handed-over
+  // item has a better one — a person — and if that person concludes the machine should try again,
+  // "Hand to Claude" on /signals gives it straight back with the attempt counter reset. The retry
+  // is NOT deleted here: it still runs for whatever is parked at the moment a run starts, and it
+  // stays the safety net for any item whose hand-over fails.
+  //
+  // RATE-LIMITED, OLDEST-PARKED FIRST. Not because minting is expensive but because a queue that
+  // empties itself onto Roger's board in one tick is the graveyard moved, not drained. Three per
+  // run drains a nine-item backlog inside an hour and can never flood.
+  //
+  // THE CEILING ITSELF IS NOT THE BUG AND IS NOT CHANGED. Retrying forever is the 2026-08-24
+  // deadlock, where three unfixable items ate the whole per-run budget for 30 hours. Three failed
+  // autonomous attempts is enough evidence that this particular fault is not one the machine can
+  // close. What was wrong was never the giving up — it was giving up QUIETLY. Giving up is now the
+  // loudest thing the drainer does with an item: it hands it to a person and says so.
+  const handedOverParked = []
+  const queue = parkedHandoverQueue({ parked, state, handoff: HANDOFF_ENABLED })
+  if (queue.length) {
+    log(`  ⏏ handing ${queue.length} of ${parked.length} PARKED finding(s) to the work board (oldest-parked first, max ${MAX_PARKED_HANDOVER_PER_RUN} per run) — the fixer gave up on these, so a person gets them:`)
+    for (const { inc, cls } of queue) {
+      try {
+        // Same exclusion as the handoff branch above: a scout REPORT is not an alarm and must not
+        // become a task either. It is recorded on the report itself and stays there.
+        if (isScoutDerived(inc)) { log(`    ${inc.key}: scout-derived — left on the report, not handed to the work board`); continue }
+        const r = await routeToWorkBoard(inc, { ...cls, reason: `auto-fix gave up after ${state.stuck[inc.key]?.attempts ?? MAX_ATTEMPTS} attempts` }, wbDeps)
+        if (r.joined) {
+          log(`    ${inc.key}: joined live in-progress item ${r.slug} (tier ${r.tier}) — signal ${(r.marked || r.alreadyAttached) ? 'marked as attached' : 'NOT MARKED (join write failed)'}`)
+        } else {
+          const how = r.adopted ? `ADOPTED (${r.adopted.via}, no second row minted)` : (r.created ? 'created' : 'already existed')
+          log(`    ${inc.key}: ${how} ${r.slug} — signal ${r.superseded ? 'superseded (off the alarm surface, now a task)' : 'LEFT OPEN (supersede failed — it stays parked and visible, which is the safe direction)'}`)
+        }
+        // Only a hand-over that actually landed un-parks the item. A mint that failed, or a
+        // supersede that failed, leaves BOTH the local marker and the published flag exactly where
+        // they were: a signal quietly un-parked into a work item that does not exist is the one
+        // outcome worse than leaving it parked.
+        if (handedOverClearsCounter(r)) {
+          // The PUBLISHED flag has to go too, and it has to go here. `detail` merges (migration
+          // 136), and the prune that normally clears it only fires for keys still in state.stuck —
+          // which this one is about to leave. A `parked: true` left standing on a superseded row
+          // comes straight back the next time the same check goes down, and the item would be born
+          // parked: it would never be dispatched even once. Same reasoning as the prune's own call.
+          await clearParkedOnSignal(secret, inc.source, inc.key)
+          delete state.attempts[inc.key]; delete state.stuck[inc.key]
+          saveState(state)
+          handedOverParked.push(`${inc.source}/${inc.key}`)
+        }
+      } catch (e) {
+        log(`    ${inc.key}: ERRORED while handing over (${String(e).slice(0, 160)}) — still parked, retried next run.`)
+      }
+    }
+  }
+  // Published in the heartbeat so the alarm can tell "nothing is parked because the board is
+  // clean" from "nothing is parked because everything was handed to a person this hour".
+  runStats.parked_handed_over = handedOverParked.length
+  runStats.parked = Math.max(0, parked.length - handedOverParked.length)
 
   // 3b. LIVE: dispatch + write back. Only genuinely workable items reach here — the `note`
   // and stuck-escalation branches that used to live inline now run in 3a, OUTSIDE the
