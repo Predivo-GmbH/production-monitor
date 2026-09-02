@@ -1324,6 +1324,14 @@ t('stuckRootCause CANNOT COMPOUND — re-parking does not stack stubs', () => {
   assert.equal((second.match(/auto-fix STUCK/g) || []).length, 1, 'exactly one stub, however many passes')
   assert.ok(/after 5 attempts/.test(second), 'and it is the CURRENT attempt count')
   assert.ok(second.includes('the real finding'), 'the finding is still there after two passes')
+  // The HEADING stacks separately from the stub, and only an end-to-end run through the real RPC
+  // showed it: the first version of the stripper ate the blank line before the optional heading
+  // could match, so a re-parked row rendered "WHAT WAS FOUND …:" twice.
+  assert.equal((second.match(/WHAT WAS FOUND/g) || []).length, 1, 'exactly one heading, too')
+  const third = stuckRootCause({ root_cause: second, title: 'x' }, 7, 24)
+  assert.equal((third.match(/WHAT WAS FOUND/g) || []).length, 1, 'still one after a third pass')
+  assert.equal((third.match(/auto-fix STUCK/g) || []).length, 1, 'still one stub after a third pass')
+  assert.ok(third.includes('the real finding'))
 })
 t('stuckRootCause fits the 2000-char column upsert_incident slices to', () => {
   const out = stuckRootCause({ root_cause: 'x'.repeat(5000), title: 'y' }, 3, 24)

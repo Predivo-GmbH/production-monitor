@@ -44,7 +44,7 @@ the current attempt count, and still carries its diagnosis. Output is capped at 
 
 ## Proof
 
-`test/board-drainer.test.mjs`, six new assertions inside the existing suite (152 total, green):
+`test/board-drainer.test.mjs`, ten new assertions inside the existing suite (152 total, green):
 the finding survives the stub and sits under it; the title is used when there is no diagnosis; no
 empty "WHAT WAS FOUND" heading when there is nothing to keep; two passes produce one stub with the
 later count and the finding intact; the 2000-character cap holds; and an ordinary diagnosis is
@@ -57,3 +57,15 @@ The eight rows already gutted are **not** back-filled by this change. Their orig
 overwritten in place and is not stored anywhere else on the row; recovering it means reading the
 producer's own log for the run that first filed it. Six of the eight are already resolved or
 superseded, so the loss is historical; the two open ones are named above.
+
+## What the unit test did NOT catch, and how it was found
+
+The first version of `stripStuckAnnotation` wrote `on /signals\.\s*(?:\n+WHAT WAS FOUND…)?`. `\s*`
+is greedy, so it ate the blank line the optional heading needed, and the heading could never match.
+The unit assertions all passed: one stub, the finding present, the right attempt count. Then the
+whole park path was run **twice against the real board**, through the real `upsert_incident`, and
+the row came back with **"WHAT WAS FOUND (the diagnosis this row already carried, kept):" twice**.
+
+Fixed by moving `\s*` after the optional group, and the suite now counts the heading and runs a
+third pass. The end-to-end probe (`__migration_probe__/stuck-keeps-root-cause`, deleted afterwards)
+now renders one stub, one heading and the finding, at attempt 5 after two parks.

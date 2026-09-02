@@ -1722,7 +1722,11 @@ export function stuckRootCause(inc, attempts, retryHours = PARKED_RETRY_INTERVAL
  *  named, so re-parking never stacks stubs. Anything else is returned untouched. */
 export function stripStuckAnnotation(rootCause) {
   return String(rootCause || '')
-    .replace(/^\[board-drainer\] auto-fix STUCK after \d+ attempts[\s\S]*?on \/signals\.\s*(?:\n+WHAT WAS FOUND \(the diagnosis this row already carried, kept\):\n)?/i, '')
+    // The `\s*` MUST come last. Written as `on /signals\.\s*(?:\n+WHAT WAS FOUND…)?` it ate the
+    // blank line first, so the optional heading could never match and a second park stacked a
+    // second "WHAT WAS FOUND" line. Found by running the real park path twice against the real
+    // board, not by reading this expression.
+    .replace(/^\[board-drainer\] auto-fix STUCK after \d+ attempts[\s\S]*?on \/signals\.(?:\s*WHAT WAS FOUND \(the diagnosis this row already carried, kept\):)?\s*/i, '')
     .trim()
 }
 
