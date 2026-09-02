@@ -23,10 +23,11 @@
  * Env knobs: LOCAL_TRIAGE_DRY_RUN=1 (pass a dry run through), LOCAL_TRIAGE_HOME / _REPO overrides.
  */
 import { execFileSync, execSync } from 'child_process'
-import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, rmSync } from 'fs'
 import { join } from 'path'
 import { pingUrl } from './lib/hc-ping.mjs'
 import { agentToolFlags, DEPLOY_DENY_POLICY_NOTE } from './lib/deploy-deny-tools.mjs'
+import { triageRunVerdict, guardVerdictProof } from './lib/triage-run-verdict.mjs'
 
 const REPO = process.env.LOCAL_TRIAGE_REPO || 'Arivioo/production-monitor'
 const BRANCH = 'master'
@@ -53,6 +54,12 @@ const SWITCHED_OFF_EXIT = 76
 // outcome the skip exists to prevent.
 const NO_CAPACITY = 77
 let switchedOff = false
+/**
+ * One entry per thing this run TRIED to triage, and whether it came back with the artefact that
+ * proves it was actually triaged. The healthcheck ping is derived from this and nothing else -
+ * see lib/triage-run-verdict.mjs for why `main()` resolving was never evidence of work.
+ */
+const attempts = []
 
 function sh(cmd, opts = {}) {
   const out = execSync(cmd, {
@@ -120,9 +127,18 @@ function triageMonitor(state) {
   const env = { ...process.env, AGENT_TRIAGE_ENABLED: '1', AGENT_TRIAGE_LOCAL: '1' }
   delete env.ANTHROPIC_API_KEY
   if (DRY) env.AGENT_TRIAGE_DRY_RUN = '1'
+  // The failure is still swallowed on purpose (see step 6), but it is no longer swallowed
+  // SILENTLY: it is recorded as an attempt that PROVED NOTHING, and that is what colours the
+  // healthcheck. Before this, a triage that timed out on every run for a week produced exactly
+  // the same green pings as a triage that fixed something every time.
   try {
     sh('node scripts/agent-triage.mjs', { cwd: WORKDIR, env, inherit: true, timeout: 15 * 60_000 })
-  } catch (e) { log(`agent-triage errored/timed out: ${e.message.split('\n')[0]}`) }
+    attempts.push({ what: `monitor run #${run.databaseId}`, proved: true })
+  } catch (e) {
+    const why = e.message.split('\n')[0]
+    log(`agent-triage errored/timed out: ${why}`)
+    attempts.push({ what: `monitor run #${run.databaseId}`, proved: false, reason: `agent errored/timed out: ${why}` })
+  }
 
   // 6. record (even on agent error — don't loop on the same broken run every tick)
   state.lastHandledRun = run.databaseId
@@ -176,6 +192,11 @@ function triageOneGuard(state, wf, run) {
     : GUARD_POLICY) + DEPLOY_DENY_POLICY_NOTE
   const env = { ...process.env, GIT_AUTHOR_NAME: 'Agent Triage', GIT_AUTHOR_EMAIL: 'noreply@predivo.ch', GIT_COMMITTER_NAME: 'Agent Triage', GIT_COMMITTER_EMAIL: 'noreply@predivo.ch' }
   delete env.ANTHROPIC_API_KEY // force the LOCAL subscription CLI, never a metered key
+  // Clear any verdict left by an earlier guard before this one runs. refreshClone() already
+  // git-cleans the tree, but the proof below is only worth anything if it cannot possibly be
+  // yesterday's - the same reason the BackOffice loop runners pre-stamp phase=pending.
+  const verdictFile = join(WORKDIR, 'guard-triage-verdict.json')
+  try { rmSync(verdictFile, { force: true }) } catch { /* noop */ }
   try {
     // execFileSync with an args ARRAY (no shell) — see agent-triage.mjs for why (Windows quoting).
     // process.execPath is the node already running this file, so the runner never hard-codes a
@@ -201,6 +222,14 @@ function triageOneGuard(state, wf, run) {
     }
     log(`guard-triage agent errored/timed out: ${e.message.split('\n')[0]}`)
   }
+  // FINAL ACTION of the policy above is to write guard-triage-verdict.json. That file, and only
+  // that file, is the evidence this guard was triaged: `claude -p` exits 0 on a weekly-limit
+  // stop and on an expired login, and both of those look identical to a clean run from here.
+  let raw = null
+  try { raw = existsSync(verdictFile) ? readFileSync(verdictFile, 'utf-8') : null } catch (e) { raw = null }
+  const proof = guardVerdictProof(raw)
+  attempts.push({ what: `guard ${wf} run #${run.databaseId}`, proved: proof.proved, reason: proof.reason })
+  log(`  proof: ${proof.proved ? 'OK' : 'MISSING'} - ${proof.reason}`)
   if (!state.handledGuards) state.handledGuards = {}
   state.handledGuards[wf] = run.databaseId
   saveState(state)
@@ -229,8 +258,21 @@ function main() {
 }
 
 // Heartbeat (2026-08-10 reliability plan): success ping / fail signal to healthchecks.io.
+//
+// The ping is decided by lib/triage-run-verdict.mjs, NOT by whether main() resolved. main()
+// resolves whether or not the agent inside it did anything, because both triage paths swallow the
+// agent's failure so one broken run cannot loop every twenty minutes. That dedup is right and it
+// stays; what changed is that a swallowed failure no longer arrives at the healthcheck dressed as
+// a success. A quiet run - nothing red, nothing to triage - is still GREEN, deliberately: an
+// alarm that fires on a quiet twenty minutes is an alarm that gets muted.
 const HC = pingUrl('agenttriage-localrunner')
 Promise.resolve().then(main).then(
-  () => (HC && !switchedOff ? fetch(HC).catch(() => {}) : undefined),
+  () => {
+    const v = triageRunVerdict(attempts, { switchedOff })
+    log(`verdict: ${v.verdict} - ${v.summary}`)
+    if (!HC || v.ping === 'none') return undefined
+    if (v.ping === 'fail') { process.exitCode = 1; return fetch(`${HC}/fail`).catch(() => {}) }
+    return fetch(HC).catch(() => {})
+  },
   (e) => Promise.resolve(HC ? fetch(`${HC}/fail`).catch(() => {}) : null).then(() => { console.error(e); process.exitCode = 1 }),
 )

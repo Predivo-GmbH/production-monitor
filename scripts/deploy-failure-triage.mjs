@@ -40,6 +40,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, rmS
 import { join } from 'path'
 import { getFleet } from '../lib/fleet.mjs'
 import { pingUrl } from './lib/hc-ping.mjs'
+import { triageRunVerdict } from './lib/triage-run-verdict.mjs'
 import { agentToolFlags, DEPLOY_DENY_POLICY_NOTE } from './lib/deploy-deny-tools.mjs'
 
 // Fleet: name/repo/deploy-branch from the DB-backed registry (fleet_products) via getFleet(). Filter
@@ -96,6 +97,13 @@ const SWITCHED_OFF_EXIT = 76
 // outcome the skip exists to prevent.
 const NO_CAPACITY = 77
 let switchedOff = false
+/**
+ * One entry per deploy failure this run TRIED to triage, and whether the agent came back with a
+ * verdict for it. The healthcheck ping is derived from this, not from main() resolving - see
+ * lib/triage-run-verdict.mjs. The zero-verdict case was already detected below and already
+ * escalated in the ALERT MAIL; what it never did was colour this job's own check.
+ */
+const attempts = []
 
 function sh(cmd, opts = {}) {
   return execSync(cmd, { encoding: 'utf-8', timeout: opts.timeout || 30_000, cwd: opts.cwd, stdio: opts.inherit ? 'inherit' : 'pipe' })?.toString() ?? ''
@@ -409,6 +417,9 @@ async function main() {
       log(`  [${v.class}] ${c.name} → ${v.action}${v.prUrl ? ' (' + v.prUrl + ')' : ''}${v.escalate ? ' — NEEDS ROGER' : ''}`)
       diagnoses.push({ project: c.name, step: c.step, runUrl: `https://github.com/${c.repo}/actions/runs/${c.runId}`, ...v })
     })
+    attempts.push(verdicts.length
+      ? { what: `${c.name} run #${c.runId}`, proved: true }
+      : { what: `${c.name} run #${c.runId}`, proved: false, reason: 'the agent produced no verdict' })
     if (verdicts.length === 0) {
       log(`  ${c.name}: agent produced no verdict (see output above)`)
       diagnoses.push({ project: c.name, step: c.step, runUrl: `https://github.com/${c.repo}/actions/runs/${c.runId}`, class: 'UNKNOWN', rootCause: 'The triage agent produced no verdict — see runner output.', action: 'none', escalate: true })
@@ -700,8 +711,20 @@ async function sendPromoEmail(items, { mode = 'alert' } = {}) {
 }
 
 // Heartbeat (2026-08-10 reliability plan): success ping / fail signal to healthchecks.io.
+//
+// Decided by lib/triage-run-verdict.mjs, not by main() resolving. A deploy failure whose agent
+// came back with NO verdict was already named in the alert mail as UNKNOWN/escalate - but this
+// check still went green, so the one signal that survives an unread inbox said the triage runner
+// was fine. A run with nothing to triage stays GREEN: that is most runs, and an alarm that fires
+// on a quiet twenty minutes is an alarm that gets muted.
 const HC = pingUrl('deploytriage-localrunner')
 Promise.resolve().then(main).then(
-  () => (HC && !switchedOff ? fetch(HC).catch(() => {}) : undefined),   // contract s7: a deliberate off pings NOTHING
+  () => {
+    const v = triageRunVerdict(attempts, { switchedOff })
+    log(`verdict: ${v.verdict} - ${v.summary}`)
+    if (!HC || v.ping === 'none') return undefined   // contract s7: a deliberate off pings NOTHING
+    if (v.ping === 'fail') { process.exitCode = 1; return fetch(`${HC}/fail`).catch(() => {}) }
+    return fetch(HC).catch(() => {})
+  },
   (e) => Promise.resolve(HC ? fetch(`${HC}/fail`).catch(() => {}) : null).then(() => { console.error(e); process.exitCode = 1 }),
 )
