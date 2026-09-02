@@ -12,14 +12,31 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      # CHECKOUT FIRST, BEFORE ANYTHING THAT CAN FAIL. This used to sit below the FTP
+      # pre-flight, on the reasoning that curl needs no lftp so the credential check could
+      # run before checkout. It could - and on 2026-09-02 (run 33643774410) it did, it
+      # failed, checkout was SKIPPED, and `Send alert on failure` then died with
+      # "Cannot find module .../scripts/send-alert.mjs". Nobody was emailed. The step
+      # written to make a dead FTP credential loud was the one failure that could not be
+      # reported. Checkout + npm ci are the alarm's own prerequisites, so they lead.
+      # Enforced across every workflow by test/alarm-steps-can-run.test.mjs.
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
       - name: Verify FTP credentials (fail fast on a stale secret)
         # A stale FTP secret used to surface late and confusingly. The site-id guard
         # tests `[ -n "$REMOTE_ID" ]`, and a 530 leaves REMOTE_ID empty - so the guard
         # printed "guard passed (remote='')" at the exact moment auth broke, and the run
         # only failed later inside the mirror, after up to 4 retries. This logs in once,
-        # up front, and names the failure. curl exit 67 == FTP login denied; curl needs
-        # no lftp, so this can run before checkout. (Added 2026-08-23 after the whole
-        # fleet's FTP_PASS went stale at once.)
+        # up front, and names the failure. curl exit 67 == FTP login denied. "Up front"
+        # now means before the dashboard build, not before checkout (see above).
+        # (Added 2026-08-23 after the whole fleet's FTP_PASS went stale at once.)
         env:
           FTP_HOST: ${{ secrets.FTP_HOST }}
           FTP_USER: ${{ secrets.FTP_USER }}
@@ -55,15 +72,6 @@ jobs:
             exit 1
           fi
           echo "FTP auth OK - $(printf '%s\n' "$OUT" | grep -c '') entries at the account root."
-
-      - uses: actions/checkout@v5
-
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 22
-          cache: npm
-
-      - run: npm ci
 
       - name: Update project dashboard data
         run: bash scripts/update-dashboard.sh
@@ -73,15 +81,22 @@ jobs:
           FTP_USER: ${{ secrets.FTP_USER }}
           FTP_PASS: ${{ secrets.FTP_PASS }}
 
+      # Dashboard-specific sender: names the STEP that actually failed. send-alert.mjs is
+      # shaped for the Playwright monitor and, on a job that runs no tests, renders
+      # "Run failed - no report produced / results.json missing" - which says nothing about
+      # a dead FTP password. It also dedups against monitor.yml's history, which would let
+      # an unrelated red monitor SUPPRESS this alarm. Same reasoning as drift-check.yml.
       - name: Send alert on failure
         if: failure()
-        run: node scripts/send-alert.mjs
+        run: node scripts/send-dashboard-alert.mjs
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: '465'
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           ALERT_EMAIL: rogmueller1976@gmail.com
+          GH_TOKEN: ${{ secrets.DASHBOARD_PAT }}
+          WORKFLOW_LABEL: Daily Dashboard Update
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
   # Collects per-workflow GitHub Actions status across all repos → automation-status.json
@@ -91,14 +106,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # Checkout leads here for the same reason as the job above: a failure in the FTP
+      # pre-flight must not strand the steps that report it. See that job's comment and
+      # test/alarm-steps-can-run.test.mjs.
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
       - name: Verify FTP credentials (fail fast on a stale secret)
         # A stale FTP secret used to surface late and confusingly. The site-id guard
         # tests `[ -n "$REMOTE_ID" ]`, and a 530 leaves REMOTE_ID empty - so the guard
         # printed "guard passed (remote='')" at the exact moment auth broke, and the run
         # only failed later inside the mirror, after up to 4 retries. This logs in once,
-        # up front, and names the failure. curl exit 67 == FTP login denied; curl needs
-        # no lftp, so this can run before checkout. (Added 2026-08-23 after the whole
-        # fleet's FTP_PASS went stale at once.)
+        # up front, and names the failure. curl exit 67 == FTP login denied.
+        # (Added 2026-08-23 after the whole fleet's FTP_PASS went stale at once.)
         env:
           FTP_HOST: ${{ secrets.FTP_HOST }}
           FTP_USER: ${{ secrets.FTP_USER }}
@@ -134,15 +160,6 @@ jobs:
             exit 1
           fi
           echo "FTP auth OK - $(printf '%s\n' "$OUT" | grep -c '') entries at the account root."
-
-      - uses: actions/checkout@v5
-
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 22
-          cache: npm
-
-      - run: npm ci
 
       - name: Collect automation status
         id: collect
@@ -187,3 +204,23 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           ALERT_EMAIL: rogmueller1976@gmail.com
+
+      # This job had NO failure alert at all (found 2026-09-02 while fixing the job above).
+      # Every mail it sends is gated on `steps.collect.outcome == 'success'`, so if collection
+      # itself broke, all three senders skipped and the job failed in total silence. That is
+      # worse than it sounds: this job publishes automation-status.json, the file the fleet
+      # escalation mail and the hourly auto-fix runbook both read. A silent failure here does
+      # not just lose one report - it freezes the fleet's view of itself at the last good run
+      # while every consumer keeps reading it as current.
+      - name: Send alert on failure
+        if: failure()
+        run: node scripts/send-dashboard-alert.mjs
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: '465'
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          ALERT_EMAIL: rogmueller1976@gmail.com
+          GH_TOKEN: ${{ secrets.DASHBOARD_PAT }}
+          WORKFLOW_LABEL: Daily Dashboard Update (fleet automation status)
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
