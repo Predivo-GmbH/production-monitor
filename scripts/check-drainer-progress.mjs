@@ -158,8 +158,43 @@ export function judgeDrainer({
     }
   }
 
-  const dispatchable = Number(detail.dispatchable || 0)
+  // AN ABSENT `dispatchable` IS NOT ZERO (2026-09-01 audit), for exactly the reason the parked
+  // counter below is not read as zero either: "the drainer stopped reporting how much work is
+  // waiting" is not evidence that none is. `Number(x || 0)` turned a renamed field, a heartbeat
+  // from an older drainer, or a run that died before it counted, into "no work waiting" - the one
+  // value that makes the stall test on the next line unreachable. Measured before changing this:
+  // the live heartbeat carries dispatchable, dispatched, started_at and last_dispatch_at, so an
+  // absence really does mean something is wrong.
+  const raw = detail.dispatchable
+  if (raw === undefined || raw === null || !Number.isFinite(Number(raw))) {
+    return {
+      verdict: 'unknown',
+      severity: 'warning',
+      title: 'The fleet auto-fixer stopped saying how much work is waiting',
+      summary: `The last board-drainer run published no usable count of dispatchable work (${String(raw)}), so whether it is working the board cannot be established. Unknown is not healthy, and the stall alarm cannot fire without this number.`,
+    }
+  }
+  const dispatchable = Number(raw)
   const sinceDispatch = minsSince(detail.last_dispatch_at, now)
+
+  // THE STALL CLOCK MUST NOT BE ONE THE DRAINER CAN RESTART. `last_dispatch_at` comes from a local
+  // state file, and board-drainer.mjs seeds it to now whenever that file holds no value - which
+  // includes every run after the file is deleted, moved with the machine, or left unparseable,
+  // because loadState() swallows the parse error and returns a fresh-looking object. A drainer
+  // that has dispatched nothing for a week then reports a dispatch "0 minutes ago" on every run
+  // and the test below can never fire. A clock stamped inside THIS run by a run that dispatched
+  // nothing was seeded, not earned.
+  const seededThisRun = detail.started_at && detail.last_dispatch_at
+    && Number(detail.dispatched || 0) === 0
+    && Date.parse(detail.last_dispatch_at) >= Date.parse(detail.started_at)
+  if (dispatchable > 0 && seededThisRun) {
+    return {
+      verdict: 'unknown',
+      severity: 'warning',
+      title: 'The fleet auto-fixer restarted its own progress clock',
+      summary: `${dispatchable} incident(s) are waiting, none was picked up this run, and yet the last-pickup time is stamped inside this very run - so the drainer's local memory was missing or unreadable and it re-seeded the clock. While that keeps happening the stall alarm can never fire.`,
+    }
+  }
   if (dispatchable > 0 && (sinceDispatch === null || sinceDispatch > stallHours * 60)) {
     const howLong = sinceDispatch === null ? 'ever' : `${Math.round(sinceDispatch / 60)}h`
     return {

@@ -197,4 +197,32 @@ t('a STALLED drainer that is also parked-out reports the stall — the more acti
   assert.equal(j.verdict, 'stalled')
 })
 
+const iso = (minsAgo) => new Date(NOW + minsAgo * 60000).toISOString()
+const hb = (detail) => ({ last_seen_at: iso(-1), detail })
+
+// ── AN ABSENT COUNT IS NOT ZERO, AND A SELF-RESET CLOCK IS NOT PROGRESS (2026-09-01 audit) ──
+// `Number(detail.dispatchable || 0)` turned a renamed field or a run that died before counting
+// into "no work waiting", which is the one value that makes the stall test unreachable. And
+// `last_dispatch_at` comes from the drainer's own local state file, which board-drainer.mjs
+// re-seeds to now whenever that file is missing or unreadable - so a stalled drainer restarted its
+// own stall clock on every run, for ever.
+
+t('a heartbeat with no dispatchable count is unknown, never ok', () => {
+  const j = judgeDrainer({ heartbeat: hb({ dispatched: 0, started_at: iso(-2) }), now: NOW })
+  assert.equal(j.verdict, 'unknown')
+  assert.notEqual(j.verdict, 'ok')
+})
+
+t('a last-pickup time stamped inside this very run, with work waiting and none picked up, is unknown', () => {
+  const j = judgeDrainer({ heartbeat: hb({ dispatchable: 5, dispatched: 0, started_at: iso(-2), last_dispatch_at: iso(-1) }), now: NOW })
+  assert.equal(j.verdict, 'unknown')
+})
+
+t('a real run that picked work up is still ok, and a real stall is still stalled', () => {
+  const ok = judgeDrainer({ heartbeat: hb({ dispatchable: 2, dispatched: 2, started_at: iso(-4), last_dispatch_at: iso(-2) }), now: NOW })
+  const stalled = judgeDrainer({ heartbeat: hb({ dispatchable: 5, dispatched: 0, started_at: iso(-2), last_dispatch_at: iso(-60 * 72) }), now: NOW })
+  assert.equal(ok.verdict, 'ok')
+  assert.equal(stalled.verdict, 'stalled')
+})
+
 console.log(`\n${n} tests passed.`)

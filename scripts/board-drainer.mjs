@@ -189,7 +189,20 @@ function log(msg) {
   console.log(line)
   try { appendFileSync(LOG, line + '\n') } catch { /* noop */ }
 }
-function loadState() { try { return JSON.parse(readFileSync(STATE, 'utf-8')) } catch { return { attempts: {} } } }
+/**
+ * A STATE FILE WE COULD NOT PARSE IS NOT A FRESH START (2026-09-01 audit). Returning
+ * `{ attempts: {} }` for both cases made an unreadable file byte-identical to a first run, and the
+ * bootstrap further down then re-stamped `lastDispatchAt` to now - every run, for ever - resetting
+ * the very stall clock check-drainer-progress.mjs reads. Absence IS a first run; a file that is
+ * present and unreadable is a fault, and it is marked so the bootstrap leaves the clock alone.
+ */
+function loadState() {
+  if (!existsSync(STATE)) return { attempts: {} }
+  try { return JSON.parse(readFileSync(STATE, 'utf-8')) } catch (e) {
+    console.error(`::warning::the drainer's state file is unreadable (${String(e.message).slice(0, 120)}); the progress clock will not be re-seeded from it`)
+    return { attempts: {}, unreadable: true }
+  }
+}
 function saveState(s) { try { writeFileSync(STATE, JSON.stringify(s, null, 2)) } catch { /* noop */ } }
 
 // ── BO secret (read from Credentials.txt at runtime — never inlined, never in env registration) ──
@@ -1853,7 +1866,9 @@ async function main() {
   // stall alarm reads "never dispatched" — which is true and useless — and cries wolf for its
   // first six hours of life, which is how an alarm gets switched off in week one. We can only
   // honestly measure non-progress from the moment we started measuring it.
-  if (!state.lastDispatchAt) { state.lastDispatchAt = new Date().toISOString(); saveState(state) }
+  // Bootstrap ONCE, on a genuine first run only: re-seeding on an unreadable file is what let a
+  // stalled drainer restart its own stall clock on every run.
+  if (!state.lastDispatchAt && !state.unreadable) { state.lastDispatchAt = new Date().toISOString(); saveState(state) }
   runStats.last_dispatch_at = state.lastDispatchAt || null
   log(`Board Drainer start — mode=${LIVE ? 'LIVE' : 'DRY-RUN'}${FIXTURE ? ' [FIXTURE]' : ''}`)
 
