@@ -7,6 +7,7 @@
  * Run: node test/ux-scout.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
+import { readFileSync } from 'node:fs'
 import { resolveProdRef, classify, dismissKey, buildDigest, verdict, escapeLiteral, SOURCES_FOR_TEST } from '../scripts/ux-scout.mjs'
 
 let n = 0
@@ -289,6 +290,52 @@ t('a reopened finding is LABELLED so the old judgement is not inherited', () => 
   }], 7)
   assert.match(d, /REOPENED/)
   assert.match(d, /PREVIOUSLY DISMISSED as anonymous/)
+})
+
+// ── the Kimi write root the narration spawn hands to agent-run ──────────────────
+// THE DEFECT (commit 1949082, 2026-08-31): the spawn gained `--add-dir C:/Business/_ux-scout/
+// kimi-workspace` because agent-run builds KIMI_JOB_WRITE_ROOTS from --add-dir and REFUSES a Kimi
+// launch without one - but nothing on the machine ever created that directory, and agent-run also
+// refuses a root that does not exist. So the moment Roger put the engine switch on Kimi, every
+// ux-scout narration would have died on a directory that had never been made. Fixed the next
+// commit (1e53d20) with an mkdirSync before the spawn; this pins it so it cannot silently rot.
+//
+// It is asserted against the SOURCE read back off disk rather than by running narrate(), because
+// narrate() spawns the real agent CLI. The two facts a reader cannot verify by eye are exactly the
+// two that broke: that the path is created AT ALL, and that it is the SAME path as the --add-dir.
+// Two string literals sitting five lines apart are free to drift, and drifting is the whole bug.
+const SCOUT_SRC = readFileSync(new URL('../scripts/ux-scout.mjs', import.meta.url), 'utf-8')
+
+t('the narration spawn still declares a Kimi write root with --add-dir', () => {
+  assert.match(SCOUT_SRC, /'--add-dir',\s*'[^']+'/,
+    'agent-run refuses a Kimi launch that passes no --add-dir; without this the job cannot move')
+})
+
+t('the write root it declares is CREATED before the spawn, not merely named', () => {
+  const addDir = SCOUT_SRC.match(/'--add-dir',\s*'([^']+)'/)
+  assert.ok(addDir, 'no --add-dir literal to check')
+  const mk = SCOUT_SRC.match(/mkdirSync\(\s*'([^']+)'\s*,\s*\{\s*recursive:\s*true\s*\}\s*\)/g) || []
+  const created = mk.map((m) => m.match(/'([^']+)'/)[1])
+  assert.ok(created.includes(addDir[1]),
+    `--add-dir points at ${addDir[1]} but nothing creates it; agent-run refuses a nonexistent root`)
+})
+
+t('the directory is created BEFORE the spawn that uses it, not after', () => {
+  const iAddDir = SCOUT_SRC.indexOf("'--add-dir'")
+  const iSpawn = SCOUT_SRC.lastIndexOf('spawnSync(', iAddDir)
+  const iMkdir = SCOUT_SRC.lastIndexOf('mkdirSync(', iSpawn)
+  assert.ok(iMkdir > 0 && iMkdir < iSpawn && iSpawn < iAddDir,
+    'the write root must be made before the process that is told to write in it starts')
+})
+
+t('the write root is its own directory, never the state dir with the logs and digests', () => {
+  const addDir = SCOUT_SRC.match(/'--add-dir',\s*'([^']+)'/)[1]
+  // STATE_DIR holds ux-scout.log, fatal.txt and the dismissal digests. A narration writes NOTHING,
+  // so handing it the state dir would grant a Kimi agent write access to this tool's own records.
+  // assert.notMatch lives on assert/strict only; this file imports the legacy namespace.
+  assert.ok(!/_ux-scout\/?$/.test(addDir),
+    'the narration must not be given the state dir as a write root')
+  assert.match(addDir, /_ux-scout\/.+/, 'it should be a dedicated subdirectory of the state dir')
 })
 
 console.log(`\n${n} tests passed`)
