@@ -188,36 +188,63 @@ const flipRows = flips
   .map((f) => `<li style="margin:4px 0">${esc(f)}</li>`)
   .join('')
 
-const html = `
-  <div style="font-family:system-ui,sans-serif;max-width:760px;margin:0 auto">
-    <div style="background:#b45309;color:white;padding:16px 24px;border-radius:8px 8px 0 0">
+// Subject and header MUST branch on whether anything actually MOVED (flips.length), not merely on
+// whether there is something to report (findings.length). The findings list also carries items that
+// moved nothing and cost nothing - most commonly a SINGLE MACHINE coverage warning (a repo served by
+// only one of our two machines), a queued-job notice, or a destroyed-job report. Announcing "fleet
+// moved to paid runners / it costs money again" for those is a lie: on 2026-09-02 runs 33652390568
+// and 33655781475 both logged "flips: none" yet mailed the paid-fallback copy for a coverage warning
+// on ScoutCopilot / Cursor_Arivioo / distribution-os. The console summary already gets this right
+// (check-ci-runners.mjs:320, 'FELL BACK TO GITHUB-HOSTED' vs 'ATTENTION'); the email now matches it.
+const subject = flips.length
+  ? `[CI RUNNERS] office PC not taking build jobs - fleet moved to paid runners`
+  : `[CI RUNNERS] fleet coverage warning - nothing moved to paid runners`
+
+const headerHtml = flips.length
+  ? `<div style="background:#b45309;color:white;padding:16px 24px;border-radius:8px 8px 0 0">
       <h2 style="margin:0;font-size:18px">CI runners: the office PC is not taking our build jobs</h2>
       <p style="margin:4px 0 0;font-size:14px;opacity:0.95">
         Nothing is broken and nothing is blocked. The fleet has been moved back onto GitHub's rented
         runners automatically, so deploys and tests still work. They just cost money again while this lasts.
       </p>
-    </div>
+    </div>`
+  : `<div style="background:#b45309;color:white;padding:16px 24px;border-radius:8px 8px 0 0">
+      <h2 style="margin:0;font-size:18px">CI runners: a coverage warning - nothing moved to paid runners</h2>
+      <p style="margin:4px 0 0;font-size:14px;opacity:0.95">
+        Nothing was switched to GitHub's rented runners and no extra money is being spent. The watchdog
+        flagged the items below - most often that a repository is being served by only one of our two
+        machines, so it has no backup if that machine goes down. Details are listed below.
+      </p>
+    </div>`
+
+const html = `
+  <div style="font-family:system-ui,sans-serif;max-width:760px;margin:0 auto">
+    ${headerHtml}
     <div style="padding:24px;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 8px 8px">
       ${flips.length ? `<p style="margin:0 0 12px;font-size:13px"><strong>Switched automatically:</strong></p><ul style="margin:0 0 16px;padding-left:20px;font-size:13px">${flipRows}</ul>` : ''}
       ${rows ? `<table style="width:100%;border-collapse:collapse"><tbody>${rows}</tbody></table>` : ''}
-      <p style="margin-top:16px;font-size:13px;color:#374151">
+      ${flips.length ? `<p style="margin-top:16px;font-size:13px;color:#374151">
         <strong>What usually causes this:</strong> the PC is off or asleep, or it rebooted and nobody has
         logged in yet (the runner host starts at logon, not at boot). Logging in normally fixes it, and the
         fleet moves itself back to the free runners within 10 minutes.
       </p>
       <p style="margin-top:8px;font-size:12px;color:#6b7280">
         Cost while it lasts: roughly $0.006 per build-minute. This is a bill problem, not an outage.
-      </p>
+      </p>` : ''}
       ${GITHUB_RUN_URL ? `<p style="margin-top:8px"><a href="${GITHUB_RUN_URL}" style="color:#2563eb">View full run logs</a></p>` : ''}
       <p style="margin-top:8px;font-size:12px;color:#6b7280">Sent by production-monitor at ${new Date().toISOString()}</p>
     </div>
   </div>
 `
 
+// Logged before the send so the chosen branch is visible in the run log (and testable) even if the
+// SMTP attempt then fails - the two branches say very different things to Roger.
+console.log(`CI runner alert subject line: ${subject}`)
+
 await (await mailer()).sendMail({
   from: `Production Monitor <${SMTP_USER}>`,
   to: ALERT_EMAIL,
-  subject: `[CI RUNNERS] office PC not taking build jobs - fleet moved to paid runners`,
+  subject,
   html,
 })
 

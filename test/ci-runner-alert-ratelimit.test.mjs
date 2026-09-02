@@ -134,5 +134,38 @@ check('the ordinary "moved to paid runners" report still pages', () => {
   assert.match(r.out, TRIED_TO_SEND, 'the benign fallback notice must still be sent')
 })
 
+// 2026-09-02: a findings list with NO flips (a SINGLE MACHINE coverage warning) was mailed under the
+// subject "office PC not taking build jobs - fleet moved to paid runners" and a body that said the
+// fleet "just cost money again" - both false, nothing had moved and nothing cost anything. The
+// subject/header/body-cost copy must branch on flips.length, not findings.length. Runs 33652390568
+// and 33655781475 are the real cases. The subject line is logged before the (failing) SMTP attempt.
+
+check('a coverage warning with ZERO flips does NOT claim the fleet moved to paid runners', () => {
+  const r = runReport({
+    generated_at: '2026-09-02T16:34:00.000Z',
+    repos_with_runners: 14,
+    flips: [], // nothing moved
+    findings: [
+      'SINGLE MACHINE: ScoutCopilot served only by DESKTOP',
+      'SINGLE MACHINE: Cursor_Arivioo served only by DESKTOP',
+      'SINGLE MACHINE: distribution-os served only by DESKTOP',
+    ],
+  })
+  assert.match(r.out, TRIED_TO_SEND, 'a coverage warning must still be sent')
+  assert.match(r.stdout, /nothing moved to paid runners/i, 'the subject must say nothing moved')
+  assert.doesNotMatch(r.stdout, /fleet moved to paid runners/i, 'it must NOT claim the paid fallback happened')
+})
+
+check('a report WITH flips still uses the paid-fallback subject', () => {
+  const r = runReport({
+    generated_at: '2026-09-02T16:34:00.000Z',
+    repos_with_runners: 7,
+    flips: ['cockpit -> ubuntu-latest'],
+    findings: ['cockpit: 1 runner(s) registered, NONE online -> falling back to GitHub-hosted'],
+  })
+  assert.match(r.stdout, /fleet moved to paid runners/i, 'a real flip must keep the paid-fallback subject')
+  assert.doesNotMatch(r.stdout, /coverage warning - nothing moved/i, 'a real flip is not a mere coverage warning')
+})
+
 console.log(`\n${passed} passed, ${failed} failed`)
 process.exit(failed ? 1 : 0)
