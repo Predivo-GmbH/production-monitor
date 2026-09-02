@@ -278,6 +278,123 @@ default-nobody-chose failure the design exists to prevent. The design assumed he
 question; the finding of this audit is that he does not. So the question now arrives by push and he
 still decides.
 
+### F20 — The fleet health monitor's edge-function check could not fail, ever · FIXED
+
+Found on 2026-09-02 by trying to make it fail. The whole point of the "Raise a cockpit signal on
+failure" step added in BackOffice `e2492d9` was that its predecessor had detected the real outage
+twice and could not tell anybody. That step had still never run against a real failure, so the
+first act of this pass was to inject one: a branch with one extra probe target that does not exist,
+dispatched for real. **The run came back green and the alert step was skipped.**
+
+The reason is four characters:
+
+```bash
+STATUS=$(curl -sf -o /dev/null -w "%{http_code}" ... || echo "000")
+if [[ "$STATUS" == "500" || "$STATUS" == "000" ]]; then
+```
+
+With `-f`, curl still writes the write-out and *also* exits non-zero on an HTTP error, so
+`|| echo "000"` appends to the code curl already printed. Measured against the live projects:
+
+| what happened | STATUS actually contained | flagged? |
+|---|---|---|
+| function does not exist (404) | `404000` | no |
+| host does not resolve | `000000` | no |
+| function crashed (5xx) | `500000` | no |
+| healthy function | `400000` | no |
+
+Every branch is unreachable. This step has printed `All edge functions healthy.` for ten functions
+across four products on every six-hourly run since it was written, and it would have printed it
+with all four projects deleted. It is the F1 shape — a probe that cannot see the failure it names —
+in its purest form: not a wrong threshold, a check with **no** reachable failure state at all.
+
+Two things follow from that, and the second is worse than the first.
+
+**Its list had rotted, invisibly.** With the verdict repaired, three of the ten slugs answer the
+platform's `NOT_FOUND`: ScoutCopilot `search-players` (the function is `search`), ChannelMover
+`check-quota` (no such slug among 35 deployed), ReplyFlow `check-new-reviews` (it is
+`fetch-reviews`). Read from each project's deployed-function list through the Management API. A
+third of what this monitor claimed to watch had not existed for an unknown length of time, and
+nothing could say so because nothing could fail.
+
+**And the "healthy" answers prove less than they look.** The probe sends no key, so `400`/`401` mean
+the function booted and rejected us — which is the honest, documented rule in
+`lib/edgeFunctions.ts`, not a defect. It is recorded here so the log line is read as what it is.
+
+Fixed on BackOffice `main`. The verdict rule is no longer hand-rolled: it is the fleet's canonical
+one from `production-monitor/lib/edgeFunctions.ts`, which this loop was always a copy of — no
+answer is DOWN, a 5xx that survives three attempts is DOWN (one 5xx is a cold isolate, not an
+outage), a 404 carrying the *platform's* NOT_FOUND body means the function is not deployed and is
+DOWN, a bare 404 from the function itself is ambiguous and is not a failure, and 400/401/403/422
+mean it booted. The step also counts its probes against its targets, because a loop that quietly
+probes nothing looks exactly like a loop where everything passed. The three dead slugs are
+corrected, and the next one to be renamed makes the step go red instead of vanishing.
+
+**Proven in both directions, live.** Corrected list against the real projects: 9 of 9 answered,
+exit 0. Injected missing function on a branch, run 33631348072: the step reports
+`Edge functions DOWN: BackOffice/drill-injected-failure-not-a-real-outage(not deployed)`, the job
+goes red, and — the thing that had never been shown — the alert step **ran**.
+
+### F21 — The alert path out of the health monitor works, and this is the first proof of it · PROVEN
+
+Same run, 33631348072. The raise-on-failure step answered:
+
+```json
+{"ok":true,"state":"open","occurrence_count":7,"will_page":true,
+ "page_due_at":"2026-09-02T12:57:39Z","suppressed":null}
+```
+
+Accepted, armed, and fifteen minutes from Roger's phone — through the real secrets, the real intake
+and the real key, on a failure that was really there. The drill branch then cleared the same key
+inside the same run:
+
+```json
+{"ok":true,"state":"resolved","page_due_at":null,"suppressed":"self-healed"}
+```
+
+so nothing rang and nothing was left standing on the board — the designed self-heal, doing exactly
+what a fault that repaired itself in under fifteen minutes would do. Read back from production
+`fleet_signals` afterwards: `state=resolved`, `paged_at=null`, `page_suppressed_reason=self-healed`.
+
+Worth stating plainly, because it is the one thing this whole audit was opened to establish: on
+2026-09-01 the monitor was right and mute. On 2026-09-02 the monitor is right and it can speak, and
+that sentence is now backed by a run rather than by a diff.
+
+### F22 — The one PUSH channel we have was describing a queue that was not his · FIXED
+
+F17 named the shape: the work board and `/signals` are both PULL, and a fact that only lives on a
+page reaches nobody. Measured again on 2026-09-02, the push side is now genuinely working — four
+open signals qualified to page and all four carry a real `paged_at`, including
+`check-alarm-reachability`'s own "2 critical finding(s) cannot ring your phone" at 21:57 the night
+before. Open signals are down from 52 to 38. Arrival is no longer the hole it was.
+
+Which moves the question one step along: the push channel exists, so **is what it pushes true?**
+Two numbers in the morning email were not.
+
+* *"The night shift started 48 items and finished none of them"* — the sentence Roger was handed on
+  2026-09-01, which became a fleet signal and the work-board row `monitor-night-shift-10ef8471`.
+  Run 33551468807 sent it with a 20-hour window; in that exact window the board holds 48
+  `work_evidence` rows titled "Started by the night shift" and **all 48 are on one item**
+  (`4cc9ed70`, the parked-branch item). One item was claimed overnight and none closed, so the
+  number matched nothing he could see. The label mattered more than the arithmetic: 48 items tried
+  and none finished is a bad night's throughput, while the same item picked up 48 times is a stuck
+  loop spending a full agent session every half hour — a different problem needing a different
+  answer, and the label hid it.
+* *"Still waiting for you: 154"* — every item in `next` plus every blocked one, whoever it was
+  blocked on. Twenty-three were actually his (16 blocked on him, 1 blocked on nobody, 7 awaiting his
+  sign-off); the other 131 are the queue agents pick from. And `awaiting_signoff`, the clearest case
+  of something waiting for his yes, was not in the query at all.
+
+Both fixed on Cockpit `main`, in `scripts/morning-report.mjs`. An item count is now a count of
+distinct items on both sides, the mail prints pick-ups under their own label and names the
+repetition when they exceed items, and the board section prints what he owes separately from what
+the queue holds. Six new defect-injected cases built from the measured nights, every one watched to
+fail against the previous version, and one of them reproduces the exact sentence that was sent.
+
+> **A number reaching him by push is not an improvement on a number he had to go and find, unless
+> its label names what it counts. The email is now the only thing that arrives without him asking;
+> that makes every word in it load-bearing.**
+
 ---
 
 ## Open leads from the 2026-09-01 parallel sweep

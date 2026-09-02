@@ -50,7 +50,20 @@ export function intervalMinutes(expr) {
   const every = /^\*\/(\d+)$/.exec(min)
   if (every && hour === '*' && dow === '*') return Number(every[1])
   if (/^\d+$/.test(min) && hour === '*' && dow === '*') return 60
-  if (/^\d+$/.test(min) && /^\d+$/.test(hour) && dow === '*') return 60 * 24
+  // A comma list of hours ('7 5,11 * * *'). What matters for "is it overdue" is the
+  // LONGEST legitimate wait between two runs, not the average: 5,11 fires 6h apart and
+  // then 18h apart, and calling that "every 12h" would make a perfectly normal overnight
+  // gap look late. A single hour is just this with one entry, and still means 24h.
+  if (/^\d+$/.test(min) && /^\d+(,\d+)*$/.test(hour) && dow === '*') {
+    const hs = [...new Set(hour.split(',').map(Number))].sort((a, b) => a - b)
+    if (hs.some((h) => h > 23)) return null
+    let widest = 0
+    for (let i = 0; i < hs.length; i++) {
+      const next = i + 1 < hs.length ? hs[i + 1] : hs[0] + 24
+      widest = Math.max(widest, next - hs[i])
+    }
+    return widest * 60
+  }
   if (/^\d+$/.test(min) && /^\d+$/.test(hour) && /^\d+$/.test(dow)) return 60 * 24 * 7
   return null
 }
