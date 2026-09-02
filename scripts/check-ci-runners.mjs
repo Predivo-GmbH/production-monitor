@@ -69,6 +69,8 @@ const H = {
   'X-GitHub-Api-Version': '2022-11-28',
   'User-Agent': 'ci-runner-watchdog',
 }
+import { decideReminder } from '../lib/paidRunnerReminder.mjs'
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 let apiErrors = 0
 // Set when a 403/429 is a genuine API RATE LIMIT (the shared hourly allowance emptied), NOT an
@@ -137,6 +139,9 @@ if (!repos.length) {
 
 const flipped = []
 const alerts = []
+// Repositories building on RENTED machines right now. The transition alert below fires once and
+// then clears the label, so from the next run onward this is the only place that state exists.
+const payingNow = []
 let migrated = 0
 // Kept so the per-MACHINE audit below can ask a question this loop structurally cannot: the loop
 // asks "does this repository have an online runner", and two machines share that one number.
@@ -180,6 +185,11 @@ for (const repo of repos) {
       const res = await gh(`repos/${OWNER}/${repo}/actions/variables/RUNNER_LABEL`, { method: 'DELETE' })
       flipped.push(`${repo} -> ubuntu-latest${res?.error ? ` (FAILED: ${res.error})` : ''}`)
     }
+  } else if (online === 0 && !isSet) {
+    // ALREADY on rented machines. This is the state the transition alert left behind and then
+    // never mentioned again, which is how the fleet could pay for a week behind a green watchdog.
+    // Not alerted here: the reminder below is fleet-wide and carries Roger's 12-hour quiet window.
+    payingNow.push(repo)
   } else if (online > 0 && !isSet) {
     if (APPLY) {
       const body = JSON.stringify({ name: 'RUNNER_LABEL', value: LABEL })
@@ -272,6 +282,35 @@ writeFileSync('ci-runner-findings.json', JSON.stringify({
   flips: flipped,
   findings: alerts,
 }, null, 2))
+
+// ── HOW LONG HAVE WE BEEN PAYING (Roger's answer, 2026-09-02: quiet 12h, then once a day) ────
+// State lives in ONE variable on this repository rather than one per product, so this costs a
+// single API read per run instead of fourteen. The shared GitHub allowance has been exhausted
+// twice this fleet's lifetime; a watcher that spends 2,900 calls a day to watch a bill would be
+// its own kind of expensive.
+{
+  const STATE_VAR = process.env.CI_RUNNER_PAID_STATE_VAR || 'RUNNER_PAID_STATE'
+  const SELF = process.env.CI_RUNNER_STATE_REPO || 'production-monitor'
+  let prior = {}
+  const raw = await gh(`repos/${OWNER}/${SELF}/actions/variables/${STATE_VAR}`, {}, { soft: true })
+  if (raw && !raw.notFound && typeof raw.value === 'string') {
+    try { prior = JSON.parse(raw.value) } catch { prior = {} }
+  }
+  const { state: nextState, changed, alert } = decideReminder({ paying: payingNow, state: prior, now: Date.now() })
+  if (alert) alerts.push(alert)
+  if (changed && APPLY) {
+    const body = JSON.stringify({ name: STATE_VAR, value: JSON.stringify(nextState) })
+    let res = await gh(`repos/${OWNER}/${SELF}/actions/variables/${STATE_VAR}`, { method: 'PATCH', body, headers: { 'Content-Type': 'application/json' } }, { soft: true })
+    if (res?.notFound || res?.error) {
+      res = await gh(`repos/${OWNER}/${SELF}/actions/variables`, { method: 'POST', body, headers: { 'Content-Type': 'application/json' } }, { soft: true })
+    }
+    // A write we could not make means the clock did not move, so say it rather than assume it did.
+    if (res?.notFound || res?.error) console.error(`::warning::could not record how long the fleet has been paying (${res?.error || 'HTTP 404'}); the reminder may repeat or reset`)
+  }
+  if (payingNow.length) {
+    console.log(`paying GitHub    : ${payingNow.length} repo(s) on rented machines${alert ? ' (said out loud this run)' : ' (inside the quiet window)'}`)
+  }
+}
 
 if (!alerts.length) {
   console.log('\nCI runner watchdog: PASS')
