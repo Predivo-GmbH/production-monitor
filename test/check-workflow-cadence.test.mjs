@@ -7,6 +7,7 @@
  * Run: node test/check-workflow-cadence.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
+import { readFileSync } from 'node:fs'
 import {
   intervalMinutes, cronsIn, verdictFor, coverageLine, OVERDUE_FACTOR,
 } from '../scripts/check-workflow-cadence.mjs'
@@ -111,6 +112,43 @@ t('the run says whether it judged everything it found', () => {
   assert.match(coverageLine(12, 12), /judged all 12/)
   assert.match(coverageLine(12, 9), /judged 9 of 12/)
   assert.match(coverageLine(12, 9), /not the same as fine/)
+})
+
+
+// ── a cron may fire more than once a day ──────────────────────────────────────────────────────
+
+t('a comma list of hours is measured by its WIDEST gap, not its average', () => {
+  // Regression for 2026-09-02: cron-heartbeat.yml went from '7 5 * * *' to '7 5,11 * * *'
+  // to stop layer 2 being blind for eighteen hours a day, and this guard immediately and
+  // correctly failed the monitor with "cron shape not understood" — it refuses to call a
+  // schedule healthy when it cannot say when the schedule should fire. Teaching it the
+  // shape is the fix; loosening it into a guess would not have been.
+  assert.equal(intervalMinutes('7 5,11 * * *'), 18 * 60)      // 5->11 is 6h, 11->5 is 18h
+  assert.equal(intervalMinutes('0 0,6,12,18 * * *'), 6 * 60)  // evenly spaced
+  assert.equal(intervalMinutes('7 5,11,23 * * *'), 12 * 60)   // widest of 6h / 12h / 6h
+  // The average would be 24/n and would call a normal overnight wait late: 5,11 averages
+  // 12h, so a run arriving 17h after the last one — perfectly on time — would look overdue.
+  assert.notEqual(intervalMinutes('7 5,11 * * *'), 12 * 60)
+  // One hour in the list is the same statement as no list at all.
+  assert.equal(intervalMinutes('7 5 * * *'), intervalMinutes('7 5,5 * * *'))
+})
+
+t('an hour outside 0-23 is still not understood, rather than averaged into something plausible', () => {
+  assert.equal(intervalMinutes('0 5,25 * * *'), null)
+  assert.equal(intervalMinutes('0 5, * * *'), null)
+  assert.equal(intervalMinutes('0 5,11 1 * *'), null)   // day-of-month still unsupported
+  assert.equal(intervalMinutes('0 5,11 * * 1'), null)   // weekly + list not claimed
+})
+
+t('THE LIVE SHAPE: the heartbeat schedule now on disk is one this guard can judge', () => {
+  // Not a hypothetical string — the actual file, so editing the cron without teaching the
+  // guard fails here instead of reddening the hourly monitor the way it did on 2026-09-02.
+  const yaml = readFileSync(new URL('../.github/workflows/cron-heartbeat.yml', import.meta.url), 'utf8')
+  const crons = cronsIn(yaml)
+  assert.ok(crons.length > 0, 'cron-heartbeat.yml must still be a scheduled workflow')
+  for (const c of crons) {
+    assert.notEqual(intervalMinutes(c), null, `cadence guard cannot read cron '${c}'`)
+  }
 })
 
 console.log(`\n${n} assertions passed.`)
