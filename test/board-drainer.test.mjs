@@ -5,7 +5,7 @@
  * Run: node test/board-drainer.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
-import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, parkedFields, gateFor, stripCode, actionOf, plainTitle, titleObjections, workItemSlugFor, handoffPrompt, routeToWorkBoard, prose, DEPLOY_DENY_TOOLS, agentToolFlags, signalObjects, signalPhrases, matchItem, findJoinTarget, joinMarker, expectedBusinessApplies, handedOverClearsCounter, parkedHandoverQueue } from '../scripts/board-drainer.mjs'
+import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, parkedFields, gateFor, stripCode, actionOf, plainTitle, titleObjections, workItemSlugFor, handoffPrompt, routeToWorkBoard, prose, DEPLOY_DENY_TOOLS, agentToolFlags, signalObjects, signalPhrases, matchItem, findJoinTarget, joinMarker, expectedBusinessApplies, handedOverClearsCounter, parkedHandoverQueue, mintOpenedAt } from '../scripts/board-drainer.mjs'
 
 let n = 0
 const t = (name, fn) => { fn(); n++; console.log(`  ok - ${name}`) }
@@ -1421,6 +1421,44 @@ t('hand-off disabled globally disables the parked hand-over too — one switch, 
 t('an empty parked list is not an error and hands nothing over', () => {
   assert.deepEqual(parkedHandoverQueue({ parked: [], state: {}, max: 3 }), [])
   assert.deepEqual(parkedHandoverQueue({ parked: undefined, state: undefined, max: 3 }), [])
+})
+
+// ── the clock an item is born with ────────────────────────────────────────────────────────
+
+t('a minted item carries the FIRST SIGHTING of the signal, not the moment it was minted', () => {
+  // Measured on production 2026-09-02: 18 of 36 open monitor-* items understated their own age,
+  // by 93h on average and 348h at worst, because this field was left to default to now().
+  assert.deepEqual(mintOpenedAt({ opened_at: '2026-08-19T10:00:00Z' }), { opened_at: '2026-08-19T10:00:00.000Z' })
+})
+
+t('NEVER FORWARD: a first sighting in the future is refused, not trusted', () => {
+  const now = Date.parse('2026-09-02T12:00:00Z')
+  assert.deepEqual(mintOpenedAt({ opened_at: '2026-09-09T00:00:00Z' }, now), {},
+    'an item must never be made to look younger than the column default would make it')
+})
+
+t('an absent or unparseable first sighting falls back to the column default', () => {
+  assert.deepEqual(mintOpenedAt({}), {})
+  assert.deepEqual(mintOpenedAt({ opened_at: null }), {})
+  assert.deepEqual(mintOpenedAt({ opened_at: 'not a date' }), {})
+  assert.deepEqual(mintOpenedAt(undefined), {})
+})
+
+ta('routeToWorkBoard actually PUTS it on the row it inserts', async () => {
+  const b = fakeBoard()
+  const inc = rogerInc({ opened_at: '2026-08-19T10:00:00Z' })
+  await routeToWorkBoard(inc, classify(inc), b.deps)
+  const [item] = [...b.items.values()]
+  assert.equal(item.opened_at, '2026-08-19T10:00:00.000Z',
+    'the age the closer prints and the order the drainer works come from this column')
+})
+
+ta('REGRESSION: a signal with no first sighting still mints, with no opened_at key at all', async () => {
+  const b = fakeBoard()
+  const inc = rogerInc({ opened_at: null })
+  await routeToWorkBoard(inc, classify(inc), b.deps)
+  const [item] = [...b.items.values()]
+  assert.ok(!('opened_at' in item), 'sending an explicit null would defeat the column default')
 })
 
 await Promise.all(pending)
