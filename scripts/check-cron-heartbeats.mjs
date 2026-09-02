@@ -168,7 +168,15 @@ const HTTP_FAILURE_ATTRIBUTION_SQL = `
   ),
   posts as (
     select j.jobid, j.jobname,
-           substring(j.command from 'https?://[^[:space:]'',)]+') as url
+           -- Two shapes, because the fleet uses both. BackOffice writes the URL as a
+           -- literal. ReplyFlow builds it at run time from a setting, so there is no
+           -- 'https://' in the command at all and the first pattern finds nothing —
+           -- measured on run 33643053842, where all nine ReplyFlow jobs came back
+           -- '(command names no url)'. The route is still there, so take that.
+           coalesce(
+             substring(j.command from 'https?://[^[:space:]'',)]+'),
+             substring(j.command from '/functions/v1/[A-Za-z0-9_-]+')
+           ) as url
       from cron.job j
      where j.active and j.command ilike '%http_post%'
   ),
@@ -227,7 +235,12 @@ export function attributionClause(rows, error) {
   if (orphan.length) {
     bits.push(`${orphan.join('; ')} had no cron run in the ${ATTRIBUTION_WINDOW_SEC}s before them, so something other than pg_cron on this database dispatched those`)
   }
-  return bits.length ? ` — WHICH JOB: ${bits.join('. ')}` : ''
+  // The scope is stated, because it is NOT the headline's scope. The headline counts one
+  // class (refused, or transient-past-the-threshold); this lists every non-2xx call in the
+  // window. Run 33643053842 read "1 of 191 were REFUSED" followed by three attributed
+  // calls — correct, each labelled with its own status, and still readable as "three were
+  // refused" by anyone who did not stop to check.
+  return bits.length ? ` — WHICH JOB (every call in this window that was not answered 2xx): ${bits.join('. ')}` : ''
 }
 
 /**

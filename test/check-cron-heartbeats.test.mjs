@@ -503,6 +503,24 @@ t('SAFETY: the attribution query reads the URL out of the command and never the 
   }
 })
 
+t('the naming states its own scope, because it is wider than the headline it follows', () => {
+  // Run 33643053842 read "1 of 191 were REFUSED" and then attributed three calls — a 500,
+  // a no-response and the 404. Each carried its own status, and it still read as "three
+  // were refused" at a glance. The headline counts one class; this lists every non-2xx.
+  const c = attributionClause([{ status: '500', candidate_count: 1, candidates: 'signal-sweep-5min -> https://x/functions/v1/signal-intake', n: 1 }])
+  assert.match(c, /every call in this window that was not answered 2xx/)
+})
+
+t('a job that builds its URL at run time is still given a route, not "(no url)"', () => {
+  // ReplyFlow composes the host from a setting, so the command contains no 'https://' and
+  // all nine of its jobs came back "(command names no url)" on run 33643053842. The route
+  // is in the command either way; the SQL falls back to it. Verified against real Postgres.
+  const src = readFileSync(new URL('../scripts/check-cron-heartbeats.mjs', import.meta.url), 'utf8')
+  const sql = src.slice(src.indexOf('const HTTP_FAILURE_ATTRIBUTION_SQL'), src.indexOf('export function attributionClause'))
+  assert.match(sql, /coalesce\(\s*\n\s*substring\(j\.command from 'https\?/)
+  assert.match(sql, /substring\(j\.command from '\/functions\/v1\//)
+})
+
 t('THE WIRING: the shipped script actually runs the attribution query, and only when there is a failure', () => {
   const src = readFileSync(new URL('../scripts/check-cron-heartbeats.mjs', import.meta.url), 'utf8')
   assert.match(src, /if \(stats && Number\(stats\.bad\) > 0\) \{/)
