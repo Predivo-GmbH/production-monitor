@@ -344,10 +344,31 @@ async function sentryGetOnce(token, path) {
     const msg = `Sentry GET ${path} -> HTTP ${res.status}`
     throw TRANSIENT_STATUS.has(res.status) ? transient(msg) : new Error(msg)
   }
-  return res.json()
+  // The Link header carries Sentry's pagination cursor. It used to be thrown away by res.json(),
+  // which is why the caller could not tell ONE PAGE from THE POPULATION (2026-09-02 audit).
+  return { body: await res.json(), link: res.headers.get('link') }
 }
 
-const sentryGet = (token, path) => readWithRetry(() => sentryGetOnce(token, path), 'sentry')
+const sentryGetPage = (token, path) => readWithRetry(() => sentryGetOnce(token, path), 'sentry')
+const sentryGet = async (token, path) => (await sentryGetPage(token, path)).body
+
+/**
+ * ONE PAGE IS NOT THE POPULATION (2026-09-02 audit). The issue query asked for `limit=100` and read
+ * whatever came back with no cursor, so issue 101 in an environment was simply absent from the
+ * covered set - and reconcile() auto-resolves everything this producer filed that it did not
+ * re-cover, posting "Sentry no longer lists this as an unresolved error" over a live one. There
+ * are nine live issues today so it has never bitten, but the number of unresolved errors is
+ * exactly the number this producer cannot bound, and what a truncated read produces here is a
+ * silent all-clear rather than a visible gap.
+ */
+export const MAX_ISSUE_PAGES = 10
+
+export function nextCursor(linkHeader) {
+  // Sentry: `<https://...>; rel="next"; results="true"; cursor="0:100:0"`
+  const next = String(linkHeader || '').split(',')
+    .find((p) => /rel="next"/.test(p) && /results="true"/.test(p))
+  return next ? (next.match(/cursor="([^"]+)"/) || [])[1] || null : null
+}
 
 const mapIssue = (i) => ({
   id: String(i.id),
@@ -386,10 +407,12 @@ export async function fetchLiveIssues(token) {
 
   const found = new Map()
   for (const env of envNames) {
-    const raw = await sentryGet(
+    let cursor = null
+    for (let page = 1; page <= MAX_ISSUE_PAGES; page++) {
+    const { body: raw, link } = await sentryGetPage(
       token,
       `/organizations/${SENTRY_ORG}/issues/?query=is:unresolved&statsPeriod=${STATS_PERIOD}` +
-      `&limit=100&environment=${encodeURIComponent(env)}`,
+      `&limit=100&environment=${encodeURIComponent(env)}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`,
     )
     // A 200 THAT IS NOT A LIST OF ISSUES IS A FAILED READ (2026-09-01 audit). `: []` turned any
     // body that was not an array into "this environment has no unresolved issues", and zero
@@ -402,6 +425,14 @@ export async function fetchLiveIssues(token) {
       const issue = mapIssue(i)
       issue.environments.push(env)
       found.set(issue.id, issue)
+    }
+      cursor = nextCursor(link)
+      if (!cursor) break
+      // Refusing to guess is this file's whole contract. A truncated read must never be allowed to
+      // auto-resolve rows it never looked at, so an unexpectedly deep list fails the run instead.
+      if (page === MAX_ISSUE_PAGES) {
+        throw new Error(`Sentry still had more unresolved issues for "${env}" after ${MAX_ISSUE_PAGES} pages of 100 - refusing to judge, and to auto-resolve, on a partial list`)
+      }
     }
   }
   return { issues: [...found.values()], liveEnvironments: envNames }
