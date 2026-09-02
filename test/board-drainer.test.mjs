@@ -5,7 +5,7 @@
  * Run: node test/board-drainer.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
-import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, parkedFields, gateFor, stripCode, actionOf, plainTitle, titleObjections, workItemSlugFor, handoffPrompt, routeToWorkBoard, prose, DEPLOY_DENY_TOOLS, agentToolFlags, signalObjects, signalPhrases, matchItem, findJoinTarget, joinMarker, expectedBusinessApplies, handedOverClearsCounter, parkedHandoverQueue, mintOpenedAt } from '../scripts/board-drainer.mjs'
+import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, workableFinding, parkedFields, gateFor, stripCode, actionOf, plainTitle, titleObjections, workItemSlugFor, handoffPrompt, routeToWorkBoard, prose, DEPLOY_DENY_TOOLS, agentToolFlags, signalObjects, signalPhrases, matchItem, findJoinTarget, joinMarker, expectedBusinessApplies, handedOverClearsCounter, parkedHandoverQueue, mintOpenedAt } from '../scripts/board-drainer.mjs'
 
 let n = 0
 const t = (name, fn) => { fn(); n++; console.log(`  ok - ${name}`) }
@@ -547,18 +547,77 @@ t('a null/absent detail does not throw — the mapping survives a row nothing ha
   assert.equal(signalToIncident({ source: 's', key: 'k', state: 'open' }).status, 'open')
 })
 
-t('WRITE-TARGET GUARD: only sources monitoring_incidents accepts may be worked', () => {
-  // Verified live against BOTH databases 2026-08-27: the source CHECK is
-  // healthchecks|sentry|production-monitor|cron|silent-failure|commit-review. fleet_signals has
-  // no such constraint and has carried __drill__ and board-drainer rows. Working one of those
-  // would 400 on upsert_incident and throw the item out of its own run — the fail-open class
-  // isScoutDerived() exists for.
-  for (const source of ['healthchecks', 'sentry', 'production-monitor', 'cron', 'silent-failure', 'commit-review']) {
-    assert.equal(writableToIncidentBoard({ source }), true, `${source} is on the incidents CHECK`)
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// FINDING GUARD (rewritten 2026-09-02, replacing the WRITE-TARGET GUARD)
+//
+// The old contract was "only the six sources monitoring_incidents.source accepts may be worked".
+// It stopped being true on 2026-09-01, when migration 142 made upsert_incident an adapter onto
+// upsert_signal: fleet_signals has no source CHECK, so nothing can 400 any more. Proved on
+// BackOffice staging 2026-09-02 — a direct insert of source='monitoring-hygiene' into the retired
+// table is still ERROR 23514, while upsert_incident with the same source answers 201 and lands the
+// row open in fleet_signals.
+//
+// The population is now defined by WHAT A FINDING IS, and the list is a DENY list so that a source
+// nobody has thought of yet is worked rather than silently dropped. That direction is the whole
+// point and has its own test below.
+// ══════════════════════════════════════════════════════════════════════════════════════════
+
+t('FINDING GUARD: the twelve sources held back before are workable now', () => {
+  // Exactly the sources measured as HELD BACK on production 2026-09-02, plus the six that were
+  // always allowed. Every one of these is a real fault sensor.
+  for (const source of [
+    'healthchecks', 'sentry', 'production-monitor', 'cron', 'silent-failure', 'commit-review',
+    'monitoring-hygiene', 'external-tools-scan', 'external-tools-freshness',
+    'deploy', 'github', 'github-api-budget', 'health-monitor', 'monitor', 'store-merge',
+  ]) {
+    assert.equal(workableFinding({ source }), true, `${source} is a finding and must be worked`)
   }
-  for (const source of ['__drill__', 'board-drainer', 'scout-ux', 'kb-learning', undefined]) {
-    assert.equal(writableToIncidentBoard({ source }), false, `${source} would 400 on upsert_incident`)
+})
+
+t('FINDING GUARD: rows that are not findings stay out, each for its own reason', () => {
+  // The work board IS a person's queue; board-drainer rows are this machine's own heartbeat;
+  // the rest are drills and delivery receipts (migration 159: "a report IS a delivery").
+  for (const source of [
+    'work-board', 'board-drainer',
+    'test', 'probe', 'wrapper', '__drill__', '__migration_probe__',
+    'report', 'closer-digest', 'notification-closer', 'notification-hc-up', 'notification-report',
+  ]) {
+    assert.equal(workableFinding({ source }), false, `${source} is not a finding`)
   }
+})
+
+t('FINDING GUARD: an UNKNOWN source is worked, never silently dropped', () => {
+  // The defect this replaced: an allow list makes every future producer invisible by default.
+  // A source nobody has classified must reach the queue loudly, not vanish before `considered`.
+  for (const source of ['kb-learning', 'pull-engine', 'a-producer-invented-next-month', 'stripe']) {
+    assert.equal(workableFinding({ source }), true, `${source} must not be dropped for being unknown`)
+  }
+})
+
+t('FINDING GUARD: a row with no source at all is refused — that is malformed, not new work', () => {
+  assert.equal(workableFinding({ source: undefined }), false)
+  assert.equal(workableFinding({ source: null }), false)
+  assert.equal(workableFinding({ source: '' }), false)
+  assert.equal(workableFinding({}), false)
+  assert.equal(workableFinding(null), false)
+  assert.equal(workableFinding(undefined), false)
+})
+
+t('FINDING GUARD: scout-ux is refused by isScoutDerived, not by this list', () => {
+  // Deliberate: isScoutDerived also catches a scout-derived row filed under ANY other source,
+  // and removing one guard must not quietly disarm the other. So scout-ux passes the source test
+  // and is stopped one step later — the structural guard, not the naming one.
+  assert.equal(workableFinding({ source: 'scout-ux' }), true, 'the source test does not own this')
+  assert.equal(isScoutDerived({ source: 'scout-ux' }), true, 'the structural guard does')
+  assert.equal(isScoutDerived({ source: 'production-monitor', scoutReportId: 'abc' }), true,
+    'and it catches a scout report filed under a normal source, which a name list never could')
+})
+
+t('the deprecated writableToIncidentBoard alias still answers, and answers the NEW contract', () => {
+  // Kept only so an out-of-tree caller does not break silently. It must not become a second,
+  // divergent opinion about the population — that is how the two counts disagreed in the first place.
+  assert.equal(writableToIncidentBoard, workableFinding)
+  assert.equal(writableToIncidentBoard({ source: 'monitoring-hygiene' }), true)
 })
 
 // ══════════════════════════════════════════════════════════════════════════════════════════

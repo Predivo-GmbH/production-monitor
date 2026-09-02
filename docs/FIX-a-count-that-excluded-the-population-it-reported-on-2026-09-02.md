@@ -145,10 +145,18 @@ fails, and "Hand to Claude" still gives an item straight back with the attempt c
 
 ## 6. Still open
 
-- **The 31 held-back signals are not fixed, only counted.** `monitoring_incidents` remains the write
-  target and its `source` CHECK still rejects `monitoring-hygiene`, `external-tools-scan` and
+- ~~**The 31 held-back signals are not fixed, only counted.** `monitoring_incidents` remains the
+  write target and its `source` CHECK still rejects `monitoring-hygiene`, `external-tools-scan` and
   `external-tools-freshness`. Removing that limit is Plan A step 2 (write to both stores) in
-  `docs/PLAN-ONE-STORE-2026-08-27.md`. Until then the alarm reports the hole rather than hiding it.
+  `docs/PLAN-ONE-STORE-2026-08-27.md`.~~
+  **CLOSED THE SAME DAY, and the sentence above was already wrong when written.**
+  `monitoring_incidents` stopped being the write target on 2026-09-01: migration 142 made
+  `upsert_incident` an adapter onto `upsert_signal`, and `fleet_signals` has no source CHECK. The
+  400 the guard existed to avoid could no longer happen. The allow list is gone, replaced by a deny
+  list of rows that genuinely are not findings — see
+  `FIX-the-auto-fixer-worked-a-population-defined-by-a-retired-table-2026-09-02.md`. Plan A step 2
+  as written (dual-write for a week) was dropped by Roger on 2026-08-27 and never existed to wait
+  for.
 - **A dry run still overwrites the live heartbeat.** The alarm now refuses to grade one, which stops
   it lying; it does not stop the overwrite. The fix belongs in `writeRunHeartbeat` — skip the write
   when `runStats.dry`, or write dry runs to a separate key — and is briefed at

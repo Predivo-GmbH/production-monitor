@@ -233,18 +233,37 @@ t('a real run that picked work up is still ok, and a real stall is still stalled
 
 const row = (source, key, detail = {}) => ({ source, key, severity: 'warning', state: 'open', detail })
 
-t('summariseBoard: out-of-reach excludes work-board rows, the drainer\'s own rows, and anything already routed', () => {
+t('summariseBoard: findings exclude the work board, the drainer own rows, drills and receipts', () => {
   const b = summariseBoard([
-    row('commit-review', 'a'), row('production-monitor', 'b'),        // in reach
-    row('monitoring-hygiene', 'c'), row('external-tools-scan', 'd'),  // out of reach, nobody has them
-    row('monitoring-hygiene', 'e', { work_item: 'some-slug' }),       // out of reach BUT handed over
+    row('commit-review', 'a'), row('production-monitor', 'b'),
+    row('monitoring-hygiene', 'c'), row('external-tools-scan', 'd'),
+    row('monitoring-hygiene', 'e', { work_item: 'some-slug' }),
     row('work-board', 'f'),                                           // IS the work board
     row('board-drainer', 'run'),                                      // this machinery's own rows
+    row('report', 'nightly'),                                         // a delivery, not a fault
+    row('__drill__', 'fire'),                                         // a drill
   ])
-  assert.equal(b.active, 7)
-  assert.equal(b.findings, 5, 'work-board and board-drainer rows are not findings')
-  assert.equal(b.inReach, 2)
-  assert.deepEqual(b.outOfReach, ['monitoring-hygiene/c', 'external-tools-scan/d'])
+  assert.equal(b.active, 9)
+  assert.equal(b.findings, 5, 'the work board, the drainer, drills and receipts are not findings')
+  assert.equal(b.inReach, 5, 'THE FIX: every real finding is in reach now, whatever its source')
+  assert.deepEqual(b.outOfReach, [], 'nothing real is dropped before the fixer ever looks at it')
+})
+
+t('REGRESSION GUARD: re-introducing a source allow list makes out-of-reach non-empty again', () => {
+  // The defect, reproduced as a mutation. summariseBoard() takes the drainer filter as an
+  // injectable so this test can hand it the OLD guard -- the six values monitoring_incidents.source
+  // accepted -- and watch the alarm go loud again. This is the whole reason assertion 5 exists.
+  const oldAllowList = new Set(['healthchecks', 'sentry', 'production-monitor', 'cron', 'silent-failure', 'commit-review'])
+  const b = summariseBoard([
+    row('commit-review', 'a'), row('production-monitor', 'b'),
+    row('monitoring-hygiene', 'c'), row('external-tools-scan', 'd'),
+    row('monitoring-hygiene', 'e', { work_item: 'some-slug' }),
+    row('work-board', 'f'),
+  ], { isWorkable: (r) => oldAllowList.has(r?.source) })
+  assert.equal(b.findings, 5)
+  assert.equal(b.inReach, 2, 'the old guard reached only two of the five')
+  assert.deepEqual(b.outOfReach, ['monitoring-hygiene/c', 'external-tools-scan/d'],
+    'and the alarm names exactly the findings nobody would ever have looked at')
 })
 
 t('summariseBoard: parkedPublished counts exactly the rows carrying detail.parked=true', () => {
