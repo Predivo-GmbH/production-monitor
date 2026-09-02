@@ -527,4 +527,92 @@ t('THE WIRING: the shipped script actually runs the attribution query, and only 
   assert.match(src, /await query\(ref, pat, HTTP_FAILURE_ATTRIBUTION_SQL\)/)
 })
 
+
+// -- the caller's own deadline is not the call failing --------------------------------
+// Measured on ReplyFlow prod 2026-09-02 (branch diag/replyflow-process-queue-timeouts,
+// runs 33655149692 / 33655720477): 27 of 239 calls read as failures and every one of them
+// was `Timeout of 5000 ms reached` -- pg_net's DEFAULT timeout_milliseconds, not a fault at
+// the far end. Every answered call was 200; api_job_queue held 0 rows in 'processing' and
+// 90 of 90 jobs completed on attempt 1; error_log had no process-queue row in 24h.
+
+const RF = (over = {}) => httpDeliveryVerdict({
+  stats: {
+    calls: 239, ok: 212, bad: 27, refused: 0, timed_out: 27, errored: 27, bad_codes: 'no-response',
+    deadline: 27, deadline_ms: '5000', deadline_slow_answer: 23, ...over,
+  },
+  queryError: null, httpPostJobs: [{ jobname: 'process-queue-every-2min', schedule: '*/2 * * * *' }],
+  nowMs: AT_0524,
+})
+
+t('an all-timeout window is reported as the CALLER hanging up, not as delivery failing', () => {
+  // Defect injected: the pre-2026-09-02 wording, which called this "HTTP calls ... failed".
+  // It sent two separate sessions to hunt a broken edge function that was answering 200.
+  const v = RF()
+  assert.equal(v.verdict, 'deadline', 'a caller-side deadline has its own verdict')
+  assert.doesNotMatch(v.detail, /REFUSED/, 'nothing was refused - every answer received was 200')
+  assert.match(v.detail, /5000 ms/, 'the budget that was exceeded has to be in the text')
+  assert.match(v.detail, /timeout_milliseconds/, 'and the knob that fixes it')
+  assert.match(v.detail, /not in the edge function/, 'and which end NOT to go looking at')
+})
+
+t('a deadline finding still FAILS the run - naming it correctly is not excusing it', () => {
+  // Defect injected: "it is only a timeout" -> verdict 'ok'. That would be a blindfold:
+  // a dispatch nobody waits for is a dispatch whose outcome nothing can see.
+  assert.notEqual(RF().verdict, 'ok')
+  assert.notEqual(RF().verdict, 'not-applicable')
+})
+
+t('the deadline count is never printed twice under two different names', () => {
+  // Defect injected (the shipped bug): `${timed_out} timed out, ${errored} errored` over
+  // rows where a timeout sets BOTH columns. 27 rows were printed as "27 timed out, 27
+  // errored", which reads as 54 problems.
+  assert.doesNotMatch(RF().detail, /27 timed out, 27 errored/)
+  const mixed = RF({ bad: 30, ok: 209, deadline: 27 })
+  assert.doesNotMatch(mixed.detail, /30 timed out, 30 errored/)
+})
+
+t('a REAL failure mixed in with deadlines is never relabelled as a deadline', () => {
+  // Defect injected: `deadline > 0` alone as the branch condition, which would hide three
+  // genuine 502s behind "the caller hung up". The deadlines are still named, but the
+  // verdict stays dead because something at the far end really did answer badly.
+  const v = RF({ bad: 30, ok: 209, bad_codes: '502, no-response', deadline: 27 })
+  assert.equal(v.verdict, 'dead')
+  assert.match(v.detail, /27 were the caller's own 5000 ms timeout, 3 were something else/)
+})
+
+t('a refused credential still outranks a deadline', () => {
+  // Defect injected: ordering the new branch above the 401 branch. The 3-in-106 fault this
+  // whole layer exists for must never be softened into "we did not wait long enough".
+  const v = RF({ bad: 28, ok: 211, refused: 1, bad_codes: '401, no-response' })
+  assert.equal(v.verdict, 'dead')
+  assert.match(v.detail, /REFUSED/)
+})
+
+t('deadlines under the persistence threshold are still just a blip', () => {
+  const v = RF({ calls: 200, ok: 198, bad: 2, deadline: 2, deadline_slow_answer: 2 })
+  assert.equal(v.verdict, 'ok')
+  assert.match(v.detail, /transient failure/)
+})
+
+t('the finding says whether the wait was spent on DNS or on the answer', () => {
+  // The two have different repairs, and the numbers to tell them apart are already in
+  // pg_net's own message - 4 of ReplyFlow's 27 never got past name resolution.
+  assert.match(RF({ deadline_slow_answer: 27 }).detail, /had not answered yet/)
+  assert.match(RF({ deadline_slow_answer: 0 }).detail, /DNS, not a slow worker/)
+  assert.match(RF({ deadline_slow_answer: 23 }).detail, /23 of them .* the other 4 never got past name resolution/)
+})
+
+t('THE WIRING: the shipped SQL actually selects the deadline columns the verdict reads', () => {
+  // Defect injected: the verdict branch ships while HTTP_OUTCOME_SQL never selects
+  // `deadline`, so stats.deadline is undefined on every real run and the branch is dead
+  // code that no unit test would notice - the exact shape of the guard that agreed with
+  // itself on 2026-09-02.
+  const src = readFileSync(new URL('../scripts/check-cron-heartbeats.mjs', import.meta.url), 'utf8')
+  const sql = src.slice(src.indexOf('const HTTP_OUTCOME_SQL'), src.indexOf('WHICH JOB was refused'))
+  for (const col of ['as deadline', 'as deadline_ms', 'as deadline_slow_answer']) {
+    assert.ok(sql.includes(col), `HTTP_OUTCOME_SQL must select ${col}`)
+  }
+  assert.match(sql, /Timeout of \[0-9\]\+ ms reached/, 'and match pg_net 0.20.4 own wording')
+})
+
 console.log(`\n${n} assertions passed.`)

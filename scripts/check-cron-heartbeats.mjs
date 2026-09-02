@@ -45,6 +45,19 @@
  *   1. pg_cron stops firing          → layer 1, the last-success age above.
  *   2. pg_net enqueues, nothing sends → layer 2, zero responses in the window.
  *   3. the call is made and REFUSED   → layer 2, a non-2xx status code.
+ *   4. the call is made and ANSWERED,
+ *      but not before OUR OWN deadline → layer 2, the `deadline` verdict.
+ *
+ * (4) was added 2026-09-02 and is the odd one out, because nothing is broken at the far
+ * end. `net.http_post` defaults `timeout_milliseconds` to 5000; a worker that takes longer
+ * gets its answer thrown away, and pg_net records a statusless row saying so. For a year
+ * this check folded those in with 502s and refused connections and reported them as "HTTP
+ * calls ... failed". On ReplyFlow that read as 27 of 239 dead, on a database where every
+ * answer received was 200, no job was stranded and nothing was in error_log — and it cost
+ * two sessions a full diagnosis each before anyone read the error_msg column that had said
+ * `Timeout of 5000 ms reached` all along. It still fires, because an unwaited-for dispatch
+ * has an outcome nobody can see; it just no longer sends the reader after a healthy
+ * function. The repair is in the cron definition, not the code it calls.
  *
  * Two disciplines carried over deliberately:
  *   * A FAILED READ IS NEVER A CLEAN RESULT. If the response table cannot be read,
@@ -122,6 +135,18 @@ const HTTP_OUTCOME_SQL = `
          count(*) filter (where status_code in (401, 403, 404))::int as refused,
          count(*) filter (where timed_out)::int as timed_out,
          count(*) filter (where error_msg is not null)::int as errored,
+         -- The CALLER's own deadline, told apart from a call that genuinely failed.
+         -- pg_net writes 'Timeout of <n> ms reached. Total time: ... (DNS time: ...,
+         -- TCP/SSL handshake time: ..., HTTP Request/Response time: ...)'. That row means
+         -- pg_net stopped waiting — NOT that the far end refused, errored or was unreachable.
+         count(*) filter (where error_msg ~ 'Timeout of [0-9]+ ms reached')::int as deadline,
+         (select string_agg(distinct substring(error_msg from 'Timeout of ([0-9]+) ms'), ', ')
+            from net._http_response
+           where error_msg ~ 'Timeout of [0-9]+ ms reached') as deadline_ms,
+         -- Where the budget actually went, so the finding says which end to fix.
+         count(*) filter (where error_msg ~ 'Timeout of [0-9]+ ms reached'
+           and (substring(error_msg from 'HTTP Request/Response time: ([0-9]+)'))::numeric > 1000
+         )::int as deadline_slow_answer,
          min(created) as oldest, max(created) as newest,
          (select string_agg(distinct coalesce(status_code::text, 'no-response'), ', ')
             from net._http_response
@@ -447,8 +472,47 @@ export function httpDeliveryVerdict({ stats, queryError, httpPostJobs, httpPostS
     // that hid for weeks: 3 × 401 among 106 × 200, every job reporting 'succeeded'.
     return { verdict: 'dead', detail: `${refused} of ${stats.calls} HTTP calls this database dispatched were REFUSED (status ${stats.bad_codes ?? 'unknown'}). A refused credential or a wrong route does not recover on its own, and cron.job_run_details still reports these as 'succeeded'. If signal-sweep-5min is among them, the fleet pager is not delivering.${attr}${cov}` }
   }
+  // ── THE CALLER HUNG UP IS NOT THE CALL FAILED ────────────────────────────────
+  // `net.http_post` takes `timeout_milliseconds` and DEFAULTS IT TO 5000. When a worker
+  // takes longer than that, pg_net records a row with no status code and the message
+  // 'Timeout of 5000 ms reached' — which this check used to fold in with 502s and refused
+  // connections and report as "HTTP calls ... failed". They are not the same fact. A 5xx
+  // is the far end answering badly; this is OUR end walking away mid-sentence, and the
+  // function usually finished the work fine a moment later.
+  //
+  // Measured on ReplyFlow production 2026-09-02: 27 of its 239 calls read as failures, and
+  // ALL 27 were this. Every call that WAS answered returned 200, `api_job_queue` held zero
+  // rows stuck in processing (90 of 90 jobs created in the window completed on attempt 1),
+  // and error_log had no process-queue entry in 24h. Nothing was broken except the wait.
+  // The wording cost two sessions a full diagnosis each, the second of which named
+  // process-queue-every-2min as "the culprit" — it was the victim of a 5-second deadline.
+  //
+  // It still FIRES, and deliberately so: a dispatch nobody waits for is a dispatch whose
+  // outcome this monitor cannot see, and the repair (raise `timeout_milliseconds` in the
+  // cron definition) is real work that will not happen if the run goes green. What changes
+  // is that the finding now names the caller, the budget and the end to fix — instead of
+  // sending the reader to hunt a healthy function.
+  const deadline = stats.deadline || 0
+  if (deadline > 0 && deadline >= transient && transient >= PERSISTENT_FAILURES) {
+    const budget = stats.deadline_ms ?? 'unknown'
+    const slow = stats.deadline_slow_answer || 0
+    const where = slow >= deadline
+      ? 'in every case the connection was made and the far end simply had not answered yet'
+      : slow > 0
+        ? `${slow} of them had the connection open and were still waiting on the answer; the other ${deadline - slow} never got past name resolution`
+        : 'none of them got past name resolution, so this is DNS, not a slow worker'
+    return { verdict: 'deadline', detail: `${deadline} of ${stats.calls} HTTP calls this database dispatched got no answer within THE CALLER'S OWN ${budget} ms timeout — ${where}. This is not a refused call and not a failing function: net.http_post defaults timeout_milliseconds to 5000, and past that pg_net stops listening and throws the answer away, so cron.job_run_details AND this check both lose the outcome. Fix it in the cron job definition (pass timeout_milliseconds), not in the edge function.${attr}${cov}` }
+  }
   if (transient >= PERSISTENT_FAILURES) {
-    return { verdict: 'dead', detail: `${transient} of ${stats.calls} HTTP calls this database dispatched failed (status ${stats.bad_codes ?? 'unknown'}; ${stats.timed_out || 0} timed out, ${stats.errored || 0} errored). Past ${PERSISTENT_FAILURES} in one window this is no longer a blip.${attr}${cov}` }
+    // Count the ROWS, not the columns. `timed_out` and `error_msg is not null` overlap
+    // almost completely — a timeout sets both — so printing "27 timed out, 27 errored"
+    // for 27 rows read as 54 problems on the 2026-09-02 run. Say what is left after the
+    // deadline rows are named above, and say it once.
+    const other = transient - deadline
+    const breakdown = deadline > 0
+      ? `${deadline} were the caller's own ${stats.deadline_ms ?? '?'} ms timeout, ${other} were something else`
+      : `status ${stats.bad_codes ?? 'unknown'}`
+    return { verdict: 'dead', detail: `${transient} of ${stats.calls} HTTP calls this database dispatched failed (${breakdown}). Past ${PERSISTENT_FAILURES} in one window this is no longer a blip.${attr}${cov}` }
   }
   if (transient > 0) {
     return { verdict: 'ok', detail: `${stats.ok} of ${stats.calls} dispatched HTTP calls answered 2xx; ${transient} transient failure(s) (${stats.bad_codes}), under the ${PERSISTENT_FAILURES} needed to count${cov}` }
