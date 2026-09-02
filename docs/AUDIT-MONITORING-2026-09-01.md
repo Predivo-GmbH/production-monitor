@@ -397,6 +397,24 @@ fail against the previous version, and one of them reproduces the exact sentence
 
 ---
 
+## Continued on 2026-09-02
+
+Findings F23-F30 are in
+[AUDIT-MONITORING-2026-09-02-jobs-that-report-success-for-doing-nothing.md](./AUDIT-MONITORING-2026-09-02-jobs-that-report-success-for-doing-nothing.md).
+Two corrections in it apply directly to this document and are recorded here so this one cannot be
+read alone and believed:
+
+* **F5 above is out of date.** It says "PARKED, on the board". A fix was written and applied on
+  2026-09-01 (Cockpit `FIX-three-logins-nobody-checked-2026-09-01.md` + `sql/093`). Its migration
+  is still not on Cockpit `main`, and the design fault underneath it - `check-products-down.mjs`
+  returning `ok: true` rather than `null` for a product with no registered backend - is untouched.
+  See F29.
+* **The "Scheduled-job checks" lead about an orphan heartbeat is wrong.** `ci-runner-host` has a
+  findable sender, in a repository, with a documented restore procedure. It was measured, not
+  grepped. See F26.
+
+---
+
 ## Open leads from the 2026-09-01 parallel sweep
 
 Four agents read every sensor script, all 21 spec files, all 13 workflow alert paths and all 28
