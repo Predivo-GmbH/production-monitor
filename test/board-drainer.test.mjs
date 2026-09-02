@@ -5,7 +5,7 @@
  * Run: node test/board-drainer.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
-import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, parkedFields, gateFor, stripCode, actionOf, plainTitle, titleObjections, workItemSlugFor, handoffPrompt, routeToWorkBoard, prose, DEPLOY_DENY_TOOLS, agentToolFlags, signalObjects, signalPhrases, matchItem, findJoinTarget, joinMarker, expectedBusinessApplies } from '../scripts/board-drainer.mjs'
+import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, parkedFields, gateFor, stripCode, actionOf, plainTitle, titleObjections, workItemSlugFor, handoffPrompt, routeToWorkBoard, prose, DEPLOY_DENY_TOOLS, agentToolFlags, signalObjects, signalPhrases, matchItem, findJoinTarget, joinMarker, expectedBusinessApplies, stuckRootCause, stripStuckAnnotation } from '../scripts/board-drainer.mjs'
 
 let n = 0
 const t = (name, fn) => { fn(); n++; console.log(`  ok - ${name}`) }
@@ -1295,6 +1295,43 @@ t('joinMarker states the finding and is explicitly NOT a page for Roger', () => 
   assert.ok(m.includes('v_external_tools'), 'the finding is verbatim')
   assert.ok(/instead of opening a separate row/i.test(m), 'it says why it landed here, not as a new row')
   assert.ok(/your call whether it is in scope/i.test(m), 'the owning session decides scope; it is not blocked on Roger')
+})
+
+
+// ── a parked row keeps the diagnosis it cost three attempts to find ──────────────
+// Signal: production-monitor/board-drainer-stuck-stub-erases-root-cause (x15, open since
+// 2026-08-23). upsert_incident maps p_root_cause onto the signal's `summary`, and summary is the
+// one field that REPLACES rather than merges — so the stuck stub was written OVER the finding.
+// Measured on production 2026-09-02: 8 rows whose whole root cause is the stub, 2 still open.
+t('stuckRootCause KEEPS the diagnosis under the stub', () => {
+  const out = stuckRootCause({ root_cause: 'send-auth-email accepts unsigned requests', title: 'x' }, 3, 24)
+  assert.ok(/auto-fix STUCK after 3 attempts/.test(out), 'the stub still says what happened to the FIX')
+  assert.ok(out.includes('send-auth-email accepts unsigned requests'), 'and the finding survives it')
+  assert.ok(out.indexOf('auto-fix STUCK') < out.indexOf('send-auth-email'), 'stub first, finding under it')
+})
+t('stuckRootCause falls back to the title when there is no diagnosis at all', () => {
+  const out = stuckRootCause({ root_cause: null, title: 'the nightly job reports success for doing nothing' }, 3, 24)
+  assert.ok(out.includes('the nightly job reports success for doing nothing'))
+})
+t('stuckRootCause writes the stub alone when there is nothing to keep', () => {
+  const out = stuckRootCause({ root_cause: '', title: '' }, 3, 24)
+  assert.ok(/auto-fix STUCK after 3 attempts/.test(out))
+  assert.ok(!/WHAT WAS FOUND/.test(out), 'no empty "what was found" heading')
+})
+t('stuckRootCause CANNOT COMPOUND — re-parking does not stack stubs', () => {
+  const first = stuckRootCause({ root_cause: 'the real finding', title: 'x' }, 3, 24)
+  const second = stuckRootCause({ root_cause: first, title: 'x' }, 5, 24)
+  assert.equal((second.match(/auto-fix STUCK/g) || []).length, 1, 'exactly one stub, however many passes')
+  assert.ok(/after 5 attempts/.test(second), 'and it is the CURRENT attempt count')
+  assert.ok(second.includes('the real finding'), 'the finding is still there after two passes')
+})
+t('stuckRootCause fits the 2000-char column upsert_incident slices to', () => {
+  const out = stuckRootCause({ root_cause: 'x'.repeat(5000), title: 'y' }, 3, 24)
+  assert.ok(out.length <= 2000)
+})
+t('stripStuckAnnotation leaves an ordinary diagnosis completely alone', () => {
+  const real = '[closer 2026-08-26T19:50Z] RE-OWNED Claude -> Roger. This row and the next one...'
+  assert.equal(stripStuckAnnotation(real), real)
 })
 
 await Promise.all(pending)

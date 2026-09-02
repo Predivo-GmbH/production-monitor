@@ -1691,6 +1691,41 @@ export function stuckWhoMustAct(whoMustAct) {
   return { owner, priorAction, value: `${owner} - ${priorAction}` }
 }
 
+/**
+ * THE ROOT CAUSE A PARKED ROW KEEPS. Pure, exported for tests.
+ *
+ * `upsert_incident` maps p_root_cause onto the signal's `summary`, and summary REPLACES — it is
+ * the one field on the row that does not merge. So the stuck-escalation stub was not added to the
+ * diagnosis, it was written OVER it, and the finding that had cost a fix run three attempts was
+ * gone from the only page it existed on. Measured on production 2026-09-02: EIGHT rows whose whole
+ * root cause is the stub, two of them still open, and a superseded ninth whose text records the
+ * needs-Roger closer having had to RESTORE one by hand ("The board-drainer had replac…").
+ *
+ * Writing the stub only once (2026-08-27) stopped it happening 138 times a day. It did not stop it
+ * happening the first time, which is the time that costs the diagnosis.
+ *
+ * Shape mirrors the EXPECTED branch a few lines up (`[board-drainer] ${inc.root_cause || inc.title}
+ * — vendor plan expired …`): the drainer's note is an ANNOTATION on the finding, never a
+ * replacement for it.
+ *
+ * IT CANNOT COMPOUND. A row that is parked, retried and parked again would otherwise grow a stub
+ * per pass; the previous annotation is stripped before the new one is written, the same way
+ * stuckWhoMustAct() strips its own prefixes.
+ */
+export function stuckRootCause(inc, attempts, retryHours = PARKED_RETRY_INTERVAL_MS / 3600_000) {
+  const stub = `[board-drainer] auto-fix STUCK after ${attempts} attempts — the action below still stands, it just could not be applied automatically. It is retried automatically within ${retryHours}h, or immediately with "Hand to Claude" on /signals.`
+  const kept = stripStuckAnnotation(inc?.root_cause) || String(inc?.title || '').trim()
+  return (kept ? `${stub}\n\nWHAT WAS FOUND (the diagnosis this row already carried, kept):\n${kept}` : stub).slice(0, 2000)
+}
+
+/** Remove a stuck annotation this function wrote on an earlier pass, however many attempts it
+ *  named, so re-parking never stacks stubs. Anything else is returned untouched. */
+export function stripStuckAnnotation(rootCause) {
+  return String(rootCause || '')
+    .replace(/^\[board-drainer\] auto-fix STUCK after \d+ attempts[\s\S]*?on \/signals\.\s*(?:\n+WHAT WAS FOUND \(the diagnosis this row already carried, kept\):\n)?/i, '')
+    .trim()
+}
+
 /** Returned by dispatchAgent when the agent never got to produce a verdict at all — a 12-minute
  *  execFileSync timeout or a spawn failure. Distinct from `null`, which means the agent RAN and
  *  chose to say nothing. */
@@ -2081,7 +2116,10 @@ async function main() {
       }
       // why === 'stuck': escalate ONCE, then park. The old code rewrote this row on every run
       // (138 times on 2026-08-24), stamping a stub over the real diagnosis each time — incident
-      // `board-drainer-stuck-stub-erases-root-cause`. Writing it once is the fix for that too.
+      // `board-drainer-stuck-stub-erases-root-cause`. Writing it once was HALF the fix: the first
+      // stamp still erased the diagnosis, and eight rows on production were measured carrying the
+      // stub as their whole root cause on 2026-09-02, two of them still open. stuckRootCause()
+      // keeps the finding.
       const attempts = state.attempts[inc.key] || MAX_ATTEMPTS
       const { owner: stuckOwner, priorAction, value: stuckWho } = stuckWhoMustAct(inc.who_must_act)
       const needsRogersHands = stuckOwner === 'Roger'
@@ -2097,7 +2135,7 @@ async function main() {
           // not a promotion of the PROBLEM to critical — a warning item that could not be
           // auto-fixed is still a warning.
           p_source: inc.source, p_key: inc.key, p_title: inc.title, p_severity: inc.severity || 'warning', p_status: 'blocked',
-          p_root_cause: `[board-drainer] auto-fix STUCK after ${attempts} attempts — the action below still stands, it just could not be applied automatically. It is retried automatically within ${PARKED_RETRY_INTERVAL_MS / 3600_000}h, or immediately with "Hand to Claude" on /signals.`,
+          p_root_cause: stuckRootCause(inc, attempts),
           p_who_must_act: stuckWho,
           p_evidence: {
             by: 'board-drainer', stuck: true, attempts, stuckOwner, needsRogersHands,
