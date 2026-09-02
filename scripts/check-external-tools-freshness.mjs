@@ -134,8 +134,13 @@ async function main() {
 }
 
 if (process.argv[1] && process.argv[1].endsWith('check-external-tools-freshness.mjs')) {
-  main().then((c) => process.exit(c)).catch((e) => {
+  // Set process.exitCode and let the event loop drain naturally instead of calling process.exit().
+  // On Windows + Node 24, process.exit() while an undici/fetch handle is still closing aborts with
+  // the libuv assertion `!(handle->flags & UV_HANDLE_CLOSING)` (src\win\async.c) and a bogus exit
+  // 127 — a healthy fleet read as a hard failure by any Windows runner. (House standard; see the
+  // same fix in engine/run-station.mjs and check-ci-watchdog-alive.mjs.)
+  main().then((c) => { process.exitCode = c }).catch((e) => {
     console.error(`::error::freshness check failed: ${e.message}`)
-    process.exit(1)
+    process.exitCode = 1
   })
 }
