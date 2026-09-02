@@ -1325,6 +1325,16 @@ export function joinMarker(inc, cls, join) {
  * @param deps.supersedeSignal(inc, slug) => boolean
  * @returns {{created:boolean, slug:string, title:string, superseded:boolean, objections:string[], reason:string}}
  */
+export function handedOverClearsCounter(r) {
+  // A signal that was HANDED OVER — superseded onto a freshly-minted item, freshly marked as
+  // attached to a live job, or already attached to it on an earlier run — is off the drainer's
+  // auto-fix hook, so its attempt counter and parked marker must be dropped. b9f5ff2 moved the
+  // join path from returning `superseded` to returning `marked`/`alreadyAttached`, but the consumer
+  // in main() still read only `superseded`, so a joined signal's counter was never cleared and
+  // drifted toward the MAX_ATTEMPTS breaker on a later run instead of starting clean.
+  return Boolean(r && (r.superseded || r.marked || r.alreadyAttached))
+}
+
 export async function routeToWorkBoard(inc, cls, deps) {
   const slug = workItemSlugFor(inc)
   const { title, objections, from } = plainTitle(inc)
@@ -2134,11 +2144,11 @@ async function main() {
         log(`  ${inc.key}: needs a person (${cls.reason}) — routing to the work board.`)
         const r = await routeToWorkBoard(inc, cls, wbDeps)
         if (r.joined) {
-          log(`    joined live in-progress item ${r.slug} (tier ${r.tier}) — no new row, no owner touched; signal ${r.superseded ? 'superseded onto it' : 'LEFT OPEN (supersede failed)'}`)
+          log(`    joined live in-progress item ${r.slug} (tier ${r.tier}) — no new row, no owner touched; signal ${(r.marked || r.alreadyAttached) ? 'marked as attached — still on /signals until a person ticks it off' : 'NOT MARKED (join write failed)'}`)
         } else {
           log(`    ${r.created ? 'created' : 'already existed'}: ${r.slug} — signal ${r.superseded ? 'superseded (off the alarm surface)' : 'LEFT OPEN (supersede failed)'}`)
         }
-        if (r.superseded) { delete state.attempts[inc.key]; delete state.stuck[inc.key]; saveState(state) }
+        if (handedOverClearsCounter(r)) { delete state.attempts[inc.key]; delete state.stuck[inc.key]; saveState(state) }
         continue
       }
       if (why === 'note') {

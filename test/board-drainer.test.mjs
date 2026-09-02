@@ -5,7 +5,7 @@
  * Run: node test/board-drainer.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
-import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, parkedFields, gateFor, stripCode, actionOf, plainTitle, titleObjections, workItemSlugFor, handoffPrompt, routeToWorkBoard, prose, DEPLOY_DENY_TOOLS, agentToolFlags, signalObjects, signalPhrases, matchItem, findJoinTarget, joinMarker, expectedBusinessApplies } from '../scripts/board-drainer.mjs'
+import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, parkedFields, gateFor, stripCode, actionOf, plainTitle, titleObjections, workItemSlugFor, handoffPrompt, routeToWorkBoard, prose, DEPLOY_DENY_TOOLS, agentToolFlags, signalObjects, signalPhrases, matchItem, findJoinTarget, joinMarker, expectedBusinessApplies, handedOverClearsCounter } from '../scripts/board-drainer.mjs'
 
 let n = 0
 const t = (name, fn) => { fn(); n++; console.log(`  ok - ${name}`) }
@@ -1280,6 +1280,31 @@ ta('a JOINED signal is attached ONCE, however many times the drainer sees it aga
   assert.equal(board.creates(), 0, 'and still no row is minted on either run')
   assert.deepEqual(board.superseded, [], 'and it is never superseded on any run')
   assert.equal(board.joined.length, 1, 'nor is the signal re-marked once it already carries the item')
+})
+
+ta('a JOINED signal drops its auto-fix attempt counter — both the first attach and a later re-sighting', async () => {
+  // b9f5ff2 moved the join path from returning `superseded` to `marked`/`alreadyAttached`, but the
+  // consumer in main() cleared the counter only `if (r.superseded)` — unreachable on a join. So a
+  // handed-over signal kept its counter forever and drifted toward the MAX_ATTEMPTS breaker. The
+  // clear-decision is now handedOverClearsCounter(r); assert it fires on the ACTUAL return objects
+  // routeToWorkBoard produces on both join branches, so the missing clear cannot come back.
+  const board = fakeBoard()
+  board.live.push(liveExternalTools())
+  const inc = securitySignal()
+
+  const first = await routeToWorkBoard(inc, classify(inc), board.deps)
+  assert.equal(first.marked, true, 'the first run attaches and marks the signal')
+  assert.equal(handedOverClearsCounter(first), true, 'a freshly-marked join clears the attempt counter')
+
+  const seenAgain = { ...inc, joined_to: 'list-every-external-tool-we-use-and-why' }
+  const second = await routeToWorkBoard(seenAgain, classify(seenAgain), board.deps)
+  assert.equal(second.alreadyAttached, true, 'a re-sighting reports it is already attached')
+  assert.equal(handedOverClearsCounter(second), true, 'an already-attached join also clears the counter')
+
+  // The create/supersede contract is unchanged, and a genuine join-write FAILURE must NOT clear it.
+  assert.equal(handedOverClearsCounter({ created: true, superseded: true }), true, 'a superseded create clears')
+  assert.equal(handedOverClearsCounter({ joined: true, marked: false }), false, 'a failed join write leaves the counter armed')
+  assert.equal(handedOverClearsCounter(null), false, 'a missing result never clears')
 })
 
 t('signalToIncident carries the item a finding is already attached to', () => {
