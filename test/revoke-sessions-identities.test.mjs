@@ -52,14 +52,28 @@ t('every project is crossed with every identity, not just the first', () => {
 })
 
 // --- behaviour of testIdentities(), run for real ----------------------------
-// Node 24 strips TypeScript types on import, so the real function is loaded and run rather
-// than a second copy of its logic that would drift from it.
+// Node strips TypeScript types on import, so the real function is loaded and run rather than a
+// second copy of its logic that would drift from it.
+//
+// BUT the module also imports @supabase/supabase-js, and .github/workflows/test.yml runs this
+// suite straight after checkout with NO `npm ci` - so in CI there is no node_modules and the
+// import cannot resolve. That is not this file's regression to report: a missing dependency is
+// skipped loudly, and the structural cases above still pin the defect without needing to load
+// anything. Any OTHER load error is a real failure and is reported as one.
+//
+// Found the hard way: this suite passed locally, where node_modules exists, and failed in a
+// clean checkout. Local green is not CI green.
 let testIdentities = null
 try {
   ;({ testIdentities } = await import(`file://${path.join(root, 'lib', 'revokeSessions.ts').replace(/\\/g, '/')}`))
 } catch (e) {
-  console.log(`  FAIL  the module could not be loaded: ${e.message.split('\n')[0]}`)
-  fail++
+  const msg = e.message.split('\n')[0]
+  if (/Cannot find package|ERR_MODULE_NOT_FOUND/.test(msg)) {
+    console.log(`  SKIP  dependencies are not installed here, so only the structural cases ran (${msg})`)
+  } else {
+    console.log(`  FAIL  the module could not be loaded: ${msg}`)
+    fail++
+  }
 }
 
 if (testIdentities) {
