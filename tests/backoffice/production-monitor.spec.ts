@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test'
 import { loginViaMagicLink, ensureTestUser } from '../../lib/auth'
-import { waitForOtpEmail } from '../../lib/imap'
+import { waitForOtpEmail, describeOtpFailure, MailboxUnreachableError } from '../../lib/imap'
 import { createClient } from '@supabase/supabase-js'
 import {
   projectRefFromUrl,
@@ -118,8 +118,14 @@ test.describe('BackOffice — Production Monitor', () => {
     let email: Awaited<ReturnType<typeof waitForOtpEmail>>
     try {
       email = await waitForOtpEmail(IMAP_OPTS, { timeoutMs: 90_000, deleteAfter: true, subjectFilter: 'BackOffice' })
-    } catch {
-      test.skip(true, 'OTP email not delivered within 90s — Supabase SMTP delay (not a code bug)')
+    } catch (err) {
+      // A mailbox we cannot OPEN is not an SMTP delay. Skipping on it deleted this
+      // check silently: on 2026-09-02 both BackOffice OTP tests reported "skipped"
+      // for 45 minutes while the monitor was locked out of the inbox entirely.
+      if (err instanceof MailboxUnreachableError) {
+        throw new Error(describeOtpFailure(err, 'BackOffice'))
+      }
+      test.skip(true, 'OTP email not delivered within 90s — mailbox was readable, email never arrived (Supabase SMTP delay)')
       return
     }
     expect(email.otp, 'Email should contain a 6-digit OTP code').toBeTruthy()
@@ -191,8 +197,14 @@ test.describe('BackOffice — Production Monitor', () => {
     let email: Awaited<ReturnType<typeof waitForOtpEmail>>
     try {
       email = await waitForOtpEmail(IMAP_OPTS, { timeoutMs: 90_000, deleteAfter: true, subjectFilter: 'BackOffice' })
-    } catch {
-      test.skip(true, 'OTP email not delivered within 90s — Supabase SMTP delay (not a code bug)')
+    } catch (err) {
+      // A mailbox we cannot OPEN is not an SMTP delay. Skipping on it deleted this
+      // check silently: on 2026-09-02 both BackOffice OTP tests reported "skipped"
+      // for 45 minutes while the monitor was locked out of the inbox entirely.
+      if (err instanceof MailboxUnreachableError) {
+        throw new Error(describeOtpFailure(err, 'BackOffice'))
+      }
+      test.skip(true, 'OTP email not delivered within 90s — mailbox was readable, email never arrived (Supabase SMTP delay)')
       return
     }
 

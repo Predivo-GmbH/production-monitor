@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test'
 import { loginViaMagicLink, ensureTestUser, setUserPlan } from '../../lib/auth'
-import { waitForOtpEmail } from '../../lib/imap'
+import { waitForOtpEmail, describeOtpFailure } from '../../lib/imap'
 import { createClient } from '@supabase/supabase-js'
 import {
   projectRefFromUrl,
@@ -669,13 +669,11 @@ test.describe('ReplyFlow — Production Monitor', () => {
     let email: Awaited<ReturnType<typeof waitForOtpEmail>>
     try {
       email = await waitForOtpEmail(IMAP_OPTS, { timeoutMs: 90_000, deleteAfter: true, subjectFilter: 'ReplyFlow' })
-    } catch {
-      // This is the CRITICAL failure case this test was built to catch:
-      // If the email never arrives, the send-auth-email chain is broken
-      throw new Error(
-        'OTP email NOT delivered within 90s — send-auth-email chain is broken. ' +
-        'Check: pg_net Authorization header, edge function signature guard, SMTP credentials.'
-      )
+    } catch (err) {
+      // describeOtpFailure separates "the email never came" from "we could not open the
+      // mailbox". Both used to print the first sentence, which sent Roger after ReplyFlow's
+      // send chain on 2026-09-02, when the shared inbox password had simply stopped working.
+      throw new Error(describeOtpFailure(err, 'ReplyFlow'))
     }
 
     // 4. Verify OTP format (6-digit code)

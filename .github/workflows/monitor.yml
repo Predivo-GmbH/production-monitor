@@ -96,13 +96,31 @@ jobs:
         run: npx playwright install --with-deps chromium
 
       - name: Clear shared OTP test inbox (keeps IMAP search fast -> prevents run timeouts)
+        # continue-on-error stays: a transient IMAP blip must not kill the whole monitor
+        # before a single product test has run. What is NOT allowed is being quiet about
+        # it. On 2026-09-02 this step failed with [AUTHENTICATIONFAILED] from 20:18 UTC
+        # onward and printed only a Python traceback; the OTP specs then reported
+        # "send-auth-email chain is broken" against ReplyFlow, SignalScore, Valrano and
+        # ChannelMover. The step that knew the real cause was the one nobody could see.
         continue-on-error: true
         run: |
           python3 - <<'PY'
-          import imaplib, ssl, os
+          import imaplib, ssl, os, sys
+          host = os.environ['IMAP_HOST']
           ctx = ssl._create_unverified_context()
-          m = imaplib.IMAP4_SSL(os.environ['IMAP_HOST'], int(os.environ.get('IMAP_PORT') or 993), ssl_context=ctx)
-          m.login(os.environ['IMAP_USER'], os.environ['IMAP_PASS'])
+          try:
+              m = imaplib.IMAP4_SSL(host, int(os.environ.get('IMAP_PORT') or 993), ssl_context=ctx)
+              m.login(os.environ['IMAP_USER'], os.environ['IMAP_PASS'])
+          except Exception as e:
+              # ::error:: surfaces on the run summary page even though the step is
+              # continue-on-error, so this cause is visible without opening the log.
+              print(f'::error title=Monitor cannot read its own OTP test mailbox::IMAP login failed: {e}')
+              print('MONITOR FAULT, NOT A PRODUCT FAULT. Every OTP delivery test in this run is')
+              print('UNABLE TO VERIFY - it cannot look in the inbox. Do NOT read the OTP failures')
+              print('below as evidence that any product stopped sending email.')
+              print('Fix: repo secrets IMAP_HOST / IMAP_USER / IMAP_PASS, or the mailbox at the')
+              print('mail provider (password changed, expired, or the account is locked out).')
+              sys.exit(1)
           m.select('INBOX')
           ids = m.search(None, 'ALL')[1][0].split()
           if ids:
