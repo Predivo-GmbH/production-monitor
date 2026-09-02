@@ -224,3 +224,82 @@ measure again. **Where an experiment is possible, run it before reporting, and p
 before-and-after in the report.** And a comparison already sitting in the fleet beats any
 theory: SignalScore held 11,956 of the same abandoned sessions with zero symptom, which killed
 the login theory on hour one, and I did not look for it.
+
+---
+
+# Correction and second closing record, 2026-09-02
+
+**Every disk figure printed above this line is an undercount, and the 2 MB/s warn line drawn
+from those figures was drawn for half a machine.** Both faults were found and fixed today.
+This section is the correction; the numbers above are kept, not deleted, because the whole
+point of the "process lesson" further up is that a wrong published number has to be visibly
+corrected rather than quietly replaced.
+
+## 1. The published fleet table was measured with a parser that read one disk
+
+`node_disk_read_bytes_total` and `node_disk_written_bytes_total` are emitted **once per block
+device**. The parser used a non-global `.match()`, so it returned the FIRST device and dropped
+the rest of the machine. On ReplyFlow, 88% of the writes lived on the second device. Fixed in
+`7bf492c`; the fixture `test/fixtures/supabase-metrics-two-device.prom` is a verbatim capture of
+a live 200 from the BackOffice metrics endpoint, and the old parser is re-run against it and
+shown to drop 46% of that machine's writes.
+
+So the table under "Fleet outcome, measured 2026-08-30" (BackOffice 1.67, ReplyFlow 1.05,
+fleet total 6.33 MB/s) measured part of each machine. The corrected equivalents, from 216
+samples (12 machines x 18 consecutive runs, 2026-09-01T21:07Z -> 2026-09-02T10:54Z):
+
+| | p50 | p75 | p90 | p95 | p99 | max |
+|---|---|---|---|---|---|---|
+| fleet, all-device | 1.21 | 2.52 | 4.33 | 4.86 | 6.27 | 9.09 MB/s |
+
+## 2. Ten products "wearing out their disk allowance" were a threshold, not a fault
+
+The 2.0 warn / 4.0 fail pair was calibrated on the undercounted readings, so when the sum was
+corrected the whole fleet stepped over a line drawn for half a machine: **68 of 216 normal
+samples (31.5%) crossed the old warn line.** A line a third of normal traffic crosses is a
+metronome, not a line — and Supabase, who actually meter and bill this allowance, sent **zero**
+disk warnings across the 21 days covering that traffic.
+
+Re-derived in `cc5e097` to **WARN 8.0 / FAIL 12.0**, anchored on the only occasion the vendor
+did complain (ScoutCopilot at 7.74 MB/s on 2026-08-29, itself a lower bound because that figure
+came off the one-device parser). Reached by 1 of 216 measured samples. A sustained-sample
+debounce was added in the same commit: over the line once files a board row, only two
+consecutive runs may page.
+
+Result, Production Monitor run 33626469210 at 2026-09-02T11:57Z, the first run on the corrected
+line: **12 machines checked, 0 over the line, 0 unreadable.**
+
+## 3. One database was counted as two products
+
+ChannelMover was formerly YTMigration and `monitor.yml` still wires both
+`CHANNELMOVER_SUPABASE_URL` and `YTMIGRATION_SUPABASE_URL` into the machine-health step. They
+are the same project, `qswluvqunswggfmesdcs`, so it was sampled twice every hour. The step
+printed "12 machines checked" beside its own "coverage: 11/11 expected projects watched" —
+twelve readings, eleven machines — and filed a board row titled *"Ytmigration is wearing out its
+disk allowance"* for a product that does not exist.
+
+It also poisoned the diagnosis of the alarm. The 2026-09-01 hygiene signal
+`supabase-disk-pressure-rotates-across-projects` argued the metric could not be per-project
+because "YTMIGRATION and CHANNELMOVER keep reporting BYTE-IDENTICAL figures", and treated that
+as the decisive tell. **Those two names are one machine, so identical readings were the correct
+answer.** Other same-run collisions named in that signal (SCOUTCOPILOT also landing on
+1.05 MB/s) are NOT explained by this and remain open on board item 62512b15.
+
+`discover()` now collapses prefixes resolving to the same project ref. A usable entry beats a
+keyless twin, so a watched machine can never be reported blind under its legacy name; among
+equals the alphabetically-first prefix wins, so the signal key stays stable across runs.
+Collapsed names travel as `aliases` and the CLI prints the collapse. 8 new assertions, 56 in
+`test/check-supabase-machine-health.test.mjs`, 36 of 36 suites green in CI run 33628838269.
+
+## 4. What this cost, and the lesson
+
+Ten "is wearing out its disk allowance" work items, a critical hygiene signal, and — the
+expensive part — a **spend decision put in front of Roger twice** (~$9.68/month per project for
+Micro compute) off a number that was both undercounted and double-attributed. Nothing was
+bought, both times because somebody measured instead of arguing.
+
+**Comparing two numbers means comparing two identical methods.** The 2026-08-30 table and the
+2026-09-01 readings were the same code measuring different fractions of the same machines, and
+every conclusion drawn across that boundary — "the fleet degraded", "the metric flips within
+half an hour", "these two unrelated products cannot really match" — was an artefact of the
+change in method, not an observation about the fleet.

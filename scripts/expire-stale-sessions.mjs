@@ -66,11 +66,41 @@
  */
 import { boardSecret, fileSignal, signal } from './lib/fleet-signal.mjs'
 import { coverageGaps, coverageLine, loadBaseline, managementApiOnly, outOfManagementApiReach, outOfReachLine } from './lib/supabase-coverage.mjs'
+// ONE definition of "which environment variables are management tokens", shared with
+// check-supabase-build-currency.mjs. See the note above TOKEN_KEYS below.
+import { managementTokenKeys } from './lib/supabase-token.mjs'
 
 export const IDLE_DAYS = Number(process.env.SESSION_IDLE_DAYS || 30)
 export const ABSOLUTE_DAYS = Number(process.env.SESSION_ABSOLUTE_DAYS || 180)
 
-const TOKEN_KEYS = (env) => Object.keys(env).filter((k) => /^SUPABASE_TOKEN_|_SUPABASE_ACCESS_TOKEN$/.test(k) && env[k])
+/**
+ * WHY THIS IS AN IMPORT AND NOT A REGEX (2026-09-02).
+ *
+ * This sweep and check-supabase-build-currency.mjs are graded against the SAME written-down
+ * inventory, scripts/lib/supabase-projects-baseline.json, through the same coverageGaps() —
+ * f11a065 unified that half on 2026-08-30 and left this half duplicated. Each script then
+ * carried its own answer to "what is a management token", and the two answers differed:
+ *
+ *   this file                          /^SUPABASE_TOKEN_|_SUPABASE_ACCESS_TOKEN$/ && env[k]
+ *   check-supabase-build-currency.mjs  /^SUPABASE_TOKEN_|_SUPABASE_ACCESS_TOKEN$|^SUPABASE_ACCESS_TOKEN$/
+ *
+ * The narrower list is the one being graded, and the inventory it is graded against is written
+ * BY the wider one: only the build check prints the "observed project inventory (ground truth
+ * for supabase-projects-baseline.json)" block, and the baseline's own `sourceOfTruth` /
+ * `capturedFrom` fields name a build-currency workflow run.
+ *
+ * So the day anyone adds a bare `SUPABASE_ACCESS_TOKEN` — a name the sibling check already
+ * supports — its projects enter the baseline through the build check and are invisible to this
+ * one. This sweep would then report them as a coverage gap every hour: an alarm about products
+ * it never looked at, caused entirely by its own narrower list, and pointing at nothing anyone
+ * could fix. Latent when it was written up on 2026-08-30 (no bare token exists in the repo's 80
+ * secrets today) and closed here before it could fire.
+ *
+ * managementTokenKeys() is the union, plus the emptiness guard this file already had — an unset
+ * GitHub secret expands to '' and a blank Bearer token is not a token — plus a sort, so the
+ * order a run reads tokens in does not depend on env ordering.
+ */
+const TOKEN_KEYS = (env) => managementTokenKeys(env)
 
 /**
  * Counts first, then deletes, so a dry run reports exactly what a real run would remove and

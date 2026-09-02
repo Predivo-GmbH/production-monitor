@@ -34,10 +34,17 @@ import { boardSecret, fileSignal, signal } from "./lib/fleet-signal.mjs"
 // same signature and needed the same answer. Re-exported so this module's public surface
 // (and its test) is unchanged by the move.
 import { coverageGaps, coverageLine, loadBaseline, managementApiOnly, outOfManagementApiReach, outOfReachLine } from './lib/supabase-coverage.mjs'
+// ONE definition of "which environment variables are management tokens", shared with
+// expire-stale-sessions.mjs, which carries the full note on why the two used to differ and what
+// that would have cost. Short version: the two hourly sweeps are graded against the SAME
+// baseline inventory, that inventory is written by THIS script, and the other one used a
+// narrower list — so a bare SUPABASE_ACCESS_TOKEN would have put projects into the baseline
+// that the session sweep could never see, and it would have alarmed about them every hour.
+import { managementTokenKeys } from './lib/supabase-token.mjs'
 
 export { coverageGaps, loadBaseline, managementApiOnly, outOfManagementApiReach }
 
-const TOKEN_KEYS = (env) => Object.keys(env).filter((k) => /^SUPABASE_TOKEN_|_SUPABASE_ACCESS_TOKEN$|^SUPABASE_ACCESS_TOKEN$/.test(k))
+const TOKEN_KEYS = (env) => managementTokenKeys(env)
 
 export async function checkBuildCurrency(env = process.env) {
   const seen = new Map()
