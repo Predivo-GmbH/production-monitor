@@ -125,6 +125,17 @@ ok('a real verdict IS proof, and says how many', () => {
   assert.match(p.reason, /1 verdict/)
 })
 
+ok('the SAME shape check serves the monitor artefact, and names IT — not guard-triage-verdict.json', () => {
+  // The monitor path proves work with triage-verdict.json; the guard path with
+  // guard-triage-verdict.json. One function, two names, so a missing monitor verdict is not
+  // reported under the guard file's name.
+  const p = guardVerdictProof(null, 'triage-verdict.json')
+  assert.equal(p.proved, false)
+  assert.match(p.reason, /wrote no triage-verdict\.json/)
+  // default arg unchanged, so every guard caller and its assertions keep their wording
+  assert.match(guardVerdictProof(null).reason, /guard-triage-verdict\.json/)
+})
+
 ok('the verdict file is read as DATA — its contents can never decide the ping by themselves', () => {
   // A verdict file is written by an agent. If it could assert its own success in words, an agent
   // that stopped early could claim it had not. Only the SHAPE is inspected.
@@ -147,7 +158,46 @@ for (const rel of ['scripts/local-triage-runner.mjs', 'scripts/deploy-failure-tr
   })
   ok(`${rel} records an attempt that produced nothing instead of only logging it`, () => {
     assert.match(src, /attempts\.push\(/, 'a swallowed agent failure must still reach the register')
-    assert.match(src, /proved: false/, 'there must be a path that records an unproven attempt')
+    // Either a literal proved:false catch (deploy-failure-triage) OR proved:proof.proved derived
+    // from guardVerdictProof (local-triage-runner, both paths) — both record an unproven attempt.
+    assert.match(src, /proved: (false|proof\.proved)/, 'there must be a path that records an unproven attempt')
+  })
+}
+
+console.log('\n3b. THE SHAPE — local-triage-runner MONITOR path proves work by the artefact, not the exit code')
+
+{
+  const src = readFileSync(join(REPO, 'scripts/local-triage-runner.mjs'), 'utf-8')
+  ok('the monitor path derives its attempt from guardVerdictProof(the verdict file), like the guard sweep', () => {
+    // Two call sites now: the guard sweep AND the monitor run. Before this fix the monitor path had
+    // none — it trusted the mere non-throw of the agent process.
+    const calls = (src.match(/guardVerdictProof\(/g) || []).length
+    assert.ok(calls >= 2, `the monitor path must also call guardVerdictProof; found ${calls} call site(s)`)
+  })
+  ok('THE FIX: a bare non-throw of agent-triage no longer records proved:true for the monitor run', () => {
+    assert.doesNotMatch(
+      src,
+      /monitor run #\$\{run\.databaseId\}`, proved: true/,
+      'this is the exact line that pinged green when the agent did nothing; it must not come back',
+    )
+  })
+  ok('the monitor path deletes the stale verdict before the run, so a stale finish cannot count', () => {
+    assert.match(src, /rmSync\(verdictFile/, 'without the pre-run delete, yesterday\'s verdict proves today')
+  })
+  ok('a switched-off monitor run pings NOTHING — switchedOff is set on the monitor path too', () => {
+    // Before: only the guard path set switchedOff (agent-triage swallowed 76/77 to exit 0, so the
+    // monitor path never saw it). After: both paths honour the cockpit off switch.
+    const sets = (src.match(/switchedOff = true/g) || []).length
+    assert.ok(sets >= 2, `both triage paths must honour the cockpit off switch; found ${sets} site(s)`)
+  })
+}
+
+console.log('\n3c. THE SHAPE — agent-triage propagates the cockpit off switch instead of swallowing it as exit 0')
+
+{
+  const src = readFileSync(join(REPO, 'scripts/agent-triage.mjs'), 'utf-8')
+  ok('agent-triage re-exits with the switch code so the local runner can ping nothing, not green', () => {
+    assert.match(src, /process\.exitCode = e\.status/, 'an absorbed 76/77 that exits 0 reaches the runner as a healthy triage')
   })
 }
 

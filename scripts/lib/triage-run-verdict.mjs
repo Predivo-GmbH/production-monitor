@@ -85,22 +85,28 @@ export function triageRunVerdict(attempts, opts = {}) {
  *
  * Read as data, never trusted as instruction: only the SHAPE is inspected here.
  *
+ * The SAME shape check serves the guard path (guard-triage-verdict.json) and the monitor path
+ * (triage-verdict.json — agent-triage.mjs's FINAL ACTION, identical {verdicts:[…]} envelope), so
+ * the artefact name is a parameter only to keep the reason accurate; the default preserves the
+ * guard callers and their tests unchanged.
+ *
  * @param {string|null|undefined} raw  the file's contents, or null/undefined if it is not there
+ * @param {string} [artefact]  the file name, used only in the human reason
  * @returns {{ proved: boolean, reason: string }}
  */
-export function guardVerdictProof(raw) {
+export function guardVerdictProof(raw, artefact = 'guard-triage-verdict.json') {
   if (raw === null || raw === undefined) {
-    return { proved: false, reason: 'the agent wrote no guard-triage-verdict.json' }
+    return { proved: false, reason: `the agent wrote no ${artefact}` }
   }
   let parsed
   try { parsed = JSON.parse(raw) } catch {
-    return { proved: false, reason: 'guard-triage-verdict.json is not readable JSON' }
+    return { proved: false, reason: `${artefact} is not readable JSON` }
   }
   if (!parsed || !Array.isArray(parsed.verdicts)) {
-    return { proved: false, reason: 'guard-triage-verdict.json carries no verdicts array' }
+    return { proved: false, reason: `${artefact} carries no verdicts array` }
   }
   if (parsed.verdicts.length === 0) {
-    return { proved: false, reason: 'guard-triage-verdict.json carries an EMPTY verdicts array — an empty answer is not an answer' }
+    return { proved: false, reason: `${artefact} carries an EMPTY verdicts array — an empty answer is not an answer` }
   }
   return { proved: true, reason: `${parsed.verdicts.length} verdict(s) written` }
 }

@@ -249,6 +249,12 @@ function main() {
     // errored" - a false failure of exactly the kind this fleet exists to catch.
     if (e && (e.status === SWITCHED_OFF || e.status === NO_CAPACITY)) {
       console.log('agent-triage: the automations are switched off in the cockpit, so no agent was run. This is deliberate and not a failure.')
+      // PROPAGATE the switch to the caller. The local runner (scripts/local-triage-runner.mjs)
+      // reads this exit code to ping NOTHING rather than green; if we exited 0 here a deliberate
+      // off would reach the healthcheck dressed as a healthy triage — the exact false-green this
+      // tier was rebuilt to stop. Set the code and let main() return naturally (a mid-flight
+      // process.exit can abort the child's own in-flight I/O on Windows).
+      process.exitCode = e.status
       return
     }
     console.error('agent-triage: agent run errored/timed out:', e.message?.split('\n')[0])

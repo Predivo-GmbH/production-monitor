@@ -36,6 +36,9 @@ const WORKDIR = join(BASE, 'production-monitor')
 const STATE = join(BASE, 'state.json')
 const LOG = join(BASE, 'runner.log')
 const DRY = process.env.LOCAL_TRIAGE_DRY_RUN === '1'
+// The artefact agent-triage.mjs writes as its FINAL ACTION (its VERDICT_PATH). It, and not the
+// exit code, is the proof the monitor triage actually happened — same rule as the guard sweep.
+const TRIAGE_VERDICT_FILE = 'triage-verdict.json'
 
 // -- the one launcher every automation goes through (docs/CONTRACT-agent-run-2026-08-30.md) --
 // Nothing here spawns `claude` directly any more. agent-run reads the cockpit's automation
@@ -127,18 +130,36 @@ function triageMonitor(state) {
   const env = { ...process.env, AGENT_TRIAGE_ENABLED: '1', AGENT_TRIAGE_LOCAL: '1' }
   delete env.ANTHROPIC_API_KEY
   if (DRY) env.AGENT_TRIAGE_DRY_RUN = '1'
-  // The failure is still swallowed on purpose (see step 6), but it is no longer swallowed
-  // SILENTLY: it is recorded as an attempt that PROVED NOTHING, and that is what colours the
-  // healthcheck. Before this, a triage that timed out on every run for a week produced exactly
-  // the same green pings as a triage that fixed something every time.
+  // The proof is the ARTEFACT, never the exit code. agent-triage.mjs exits 0 on a weekly-limit
+  // stop, an expired login and a wall-clock timeout alike — the same three that gave the guard
+  // sweep its false greens — so a bare non-throw of the process below is NOT evidence the triage
+  // happened. What proves it is triage-verdict.json (the agent's FINAL ACTION, the same
+  // {verdicts:[…]} envelope guardVerdictProof already checks). Delete any stale one first, exactly
+  // as triageOneGuard does, so this run's proof can never be yesterday's.
+  const verdictFile = join(WORKDIR, TRIAGE_VERDICT_FILE)
+  try { rmSync(verdictFile, { force: true }) } catch { /* noop */ }
   try {
     sh('node scripts/agent-triage.mjs', { cwd: WORKDIR, env, inherit: true, timeout: 15 * 60_000 })
-    attempts.push({ what: `monitor run #${run.databaseId}`, proved: true })
   } catch (e) {
-    const why = e.message.split('\n')[0]
-    log(`agent-triage errored/timed out: ${why}`)
-    attempts.push({ what: `monitor run #${run.databaseId}`, proved: false, reason: `agent errored/timed out: ${why}` })
+    // agent-triage.mjs now RE-EXITS 76/77 when the cockpit switch is off / both engines are out of
+    // capacity. A deliberate off is neither success nor failure: set switchedOff (→ ping nothing)
+    // and return BEFORE the handled-run write — a run nobody looked at is not handled, same as the
+    // guard path. Before this, agent-triage swallowed 76/77 to exit 0 and the off pinged GREEN.
+    if (e?.status === SWITCHED_OFF_EXIT || e?.status === NO_CAPACITY) {
+      switchedOff = true
+      log('automations are switched off in the cockpit - monitor triage skipped (a deliberate off, not a failure)')
+      return
+    }
+    // Any other non-zero exit is still swallowed so one broken run cannot loop every tick; it is
+    // NOT proof of work, and the artefact check below is what records that.
+    log(`agent-triage errored/timed out: ${e.message.split('\n')[0]}`)
   }
+  // The ping is decided here and only here: absent / unparseable / empty verdicts → proved:false.
+  let raw = null
+  try { raw = existsSync(verdictFile) ? readFileSync(verdictFile, 'utf-8') : null } catch { raw = null }
+  const proof = guardVerdictProof(raw, TRIAGE_VERDICT_FILE)
+  attempts.push({ what: `monitor run #${run.databaseId}`, proved: proof.proved, reason: proof.reason })
+  log(`  proof: ${proof.proved ? 'OK' : 'MISSING'} - ${proof.reason}`)
 
   // 6. record (even on agent error — don't loop on the same broken run every tick)
   state.lastHandledRun = run.databaseId
