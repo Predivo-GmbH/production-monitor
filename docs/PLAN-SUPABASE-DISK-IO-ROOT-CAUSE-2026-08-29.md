@@ -210,9 +210,25 @@ withdrawn before anything was bought.
 
 ## 7. Left open, each needing its own session
 
-- `noreply@backoffice.predivo.ch` is STILL creating sessions inside BackOffice and never
+- ~~`noreply@backoffice.predivo.ch` is STILL creating sessions inside BackOffice and never
   signing out (1,682 cleared today, was still adding at 11:10). Not the production-monitor,
-  whose sign-out fix shipped in c55d376. The 30-day expiry now caps it, but the leak is real.
+  whose sign-out fix shipped in c55d376. The 30-day expiry now caps it, but the leak is real.~~
+  **CLOSED 2026-09-02 — and it WAS the production-monitor after all.** c55d376 was a real fix
+  and it worked, but it revoked exactly one identity, `TEST_EMAIL`. The suite signs in as two:
+  `tests/backoffice/production-monitor.spec.ts:177` performs a real magic-link login as
+  `OTP_TEST_EMAIL`, which `monitor.yml:237` sets to the `IMAP_USER` mailbox
+  (`noreply@backoffice.predivo.ch`) — a different address from the `TEST_EMAIL` on `:245`. The
+  spec even knows they differ; it calls `ensureTestUser()` for the second one at `:43-44`. So
+  the teardown tidied one account every hour while the other kept piling up, which is exactly
+  why this was written down as "not the production-monitor". The monitor did sign out — just
+  not as this user. `lib/revokeSessions.ts` now derives the identity list from the same env the
+  specs read (`testIdentities()`) and crosses every project with every identity, so a third
+  login added to a spec cannot silently restart the pile. Pinned by
+  `test/revoke-sessions-identities.test.mjs` (9 cases, green).
+
+  The lesson is the same one section 8 below is about, in a new costume: **"the monitor signs
+  out" was verified against the account we were thinking of, not against the account that was
+  leaking.** A fix is only as wide as the thing you measured after it.
 - ScoutCopilot's `error_log` holds 2,865 rows of one repeated `generate-photo` "Missing or
   invalid Authorization header", roughly 24/hour, steady.
 
