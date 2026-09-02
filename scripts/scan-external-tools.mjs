@@ -308,6 +308,49 @@ export function isReportable(fp) {
   return true
 }
 
+/**
+ * The repos a recorded finding was seen in. `evidence.paths` are "<repo>/<path>" strings, which
+ * is the only place a finding remembers WHERE it came from.
+ */
+export function findingRepos(finding) {
+  const paths = finding?.evidence?.paths || []
+  return [...new Set(paths.map((p) => String(p).split('/')[0]).filter(Boolean))]
+}
+
+/**
+ * Which open findings this scan is entitled to CLOSE — the half of the contract this scanner
+ * never had.
+ *
+ * WHY IT EXISTS. Until 2026-09-02 nothing in this file could ever say "fixed". A finding was
+ * created, confirmed on the second sighting, filed as a signal — and then no code path anywhere
+ * set it back to `resolved`. So the designed remedy (add the token to the tools list, or put it
+ * on the ignore list) silently did nothing visible: the finding stayed `confirmed` on the
+ * External Tools page and the signal stayed `open` on /signals forever, waiting for a human to
+ * click it away. Three such rows (BOARD_URL, BOARD_KEY, ALERT_EMAIL — our own board and our own
+ * alert address, all three registered as ignored the moment they were looked at) are what made
+ * this visible. An alarm that cannot go green teaches people to stop reading the board.
+ *
+ * THE SAFETY RULE is the same one `orphanBlockers` enforces, and for the same reason: absence is
+ * only evidence when you looked where the thing was. A finding is cleared only when every repo it
+ * was recorded in was actually walked this run. A finding that remembers no repo at all is never
+ * cleared — "I cannot tell" is not "it is gone".
+ *
+ * `open` is the stored findings (state open|confirmed); `reportableNow` is this run's still-
+ * unrecognised set; `seenToolIds` is every tool matched this run; `scannedRepos` is what was walked.
+ */
+export function clearedFindings(open, reportableNow, seenToolIds, scannedRepos) {
+  const stillUnregistered = new Set(reportableNow.map((u) => u.pattern))
+  return open.filter((f) => {
+    if (f.state !== 'open' && f.state !== 'confirmed') return false
+    if (f.kind === 'orphaned') return seenToolIds.has(f.api_entry_id)   // referenced again = alive again
+    if (f.kind !== 'unregistered') return false
+    if (stillUnregistered.has(f.fingerprint)) return false
+    const repos = findingRepos(f)
+    if (!repos.length) return false                       // no memory of where = no opinion
+    return repos.every((r) => scannedRepos.has(r))        // only judge where we actually looked
+  })
+}
+
 function signalForFinding(f) {
   const where = (f.evidence.paths || []).slice(0, 3).join(', ')
   return {
@@ -324,6 +367,30 @@ function signalForFinding(f) {
       ? `Found in ${where || 'the fleet'}. Either add it to the tools list with the reason we use it, or find out who wired it in.`
       : `The tools list still says we depend on it, but ${ORPHAN_AFTER_SCANS} scans in a row found no reference to it anywhere. If it is paid for, it may be cancellable.`,
     detail: { finding_kind: f.kind, fingerprint: f.fingerprint, ...f.evidence },
+    link: 'https://cockpit.predivo.ch/external-tools',
+  }
+}
+
+/**
+ * The same signal, said in the past tense. Posted through the SAME intake and the SAME key, which
+ * is how every other sensor in this folder recovers (check-deploy-failures.mjs, check-drainer-
+ * progress.mjs): a resolve is a re-statement of the identical row, never a second row.
+ */
+function resolvedSignalFor(f) {
+  return {
+    source: SOURCE,
+    key: `${f.kind}:${f.fingerprint}`,
+    kind: 'finding',
+    severity: 'info',
+    state: 'resolved',
+    needs_human: false,
+    title: f.kind === 'unregistered'
+      ? `Recognised now: ${f.fingerprint}`
+      : `${f.fingerprint} is referenced in the code again`,
+    summary: f.kind === 'unregistered'
+      ? `This scan no longer reports ${f.fingerprint} as an unknown outside service: it is now either on the tools list or deliberately ignored, and every repo it was found in was walked again this run.`
+      : `${f.fingerprint} was matched in the code again this run, so it is not unused after all.`,
+    detail: { finding_kind: f.kind, fingerprint: f.fingerprint, cleared_by: 'external-tools-scan' },
     link: 'https://cockpit.predivo.ch/external-tools',
   }
 }
@@ -382,7 +449,7 @@ async function main() {
   }
 
   // 3. unregistered findings — two-scan confirmation before anything is said out loud
-  const existing = await boGet(secret, 'external_tool_findings?select=id,kind,fingerprint,seen_count,state')
+  const existing = await boGet(secret, 'external_tool_findings?select=id,kind,fingerprint,api_entry_id,evidence,seen_count,state')
   const byKey = new Map(existing.map((f) => [`${f.kind}:${f.fingerprint}`, f]))
   const confirmed = []
 
@@ -448,10 +515,24 @@ async function main() {
   }
   }
 
+  // 4b. RECOVERY — the half this scanner did not have until 2026-09-02. Registering a token or
+  //     putting it on the ignore list is the DESIGNED remedy, and until now it closed nothing:
+  //     the finding stayed `confirmed` and its signal stayed `open` forever. See clearedFindings
+  //     for why a repo that was not walked is never counted as evidence of absence.
+  const cleared = clearedFindings(existing, reportable, seenToolIds, new Set(repos))
+  for (const f of cleared) {
+    await boWrite(secret, `external_tool_findings?id=eq.${f.id}`,
+      { state: 'resolved', resolved_at: now, updated_at: now }, { method: 'PATCH' })
+    // A signal only exists once the finding was CONFIRMED, so only a confirmed one has anything
+    // to take back. Resolving a key that never rang would mint a row nobody ever saw open.
+    if (f.state === 'confirmed') await fileSignal(secret, resolvedSignalFor(f))
+    console.log(`  cleared: ${f.kind}:${f.fingerprint}${f.state === 'confirmed' ? ' (signal resolved)' : ''}`)
+  }
+
   // 5. one signal per newly-confirmed finding, through the SAME intake everything else uses.
   //    No second alert channel, no email: /signals is the one board.
   for (const f of confirmed) await fileSignal(secret, signalForFinding(f))
-  console.log(`findings: ${confirmed.length} newly confirmed and filed as signals`)
+  console.log(`findings: ${confirmed.length} newly confirmed and filed as signals, ${cleared.length} cleared`)
 
   const hc = pingUrl(HC_SLUG)
   if (hc) await fetch(hc, { method: 'POST', headers: { 'User-Agent': UA } }).catch(() => {})

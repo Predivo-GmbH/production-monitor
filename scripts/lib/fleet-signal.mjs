@@ -58,3 +58,42 @@ export function signal({ key, product, severity, needsHuman, title, summary, det
     link: 'https://cockpit.predivo.ch/signals',
   }
 }
+
+/**
+ * The row this producer last filed under `key`, or null if it never filed one.
+ *
+ * WHY A READ BELONGS IN A LIB THAT ONLY EVER WROTE. Every sensor here can say "it is broken";
+ * several cannot say "it is fixed". check-supabase-build-currency.mjs is the case that forced
+ * this: `outOfReachSignal` returns null when nothing is out of reach, so the run that PROVES the
+ * hole is closed files nothing at all and the open row stands forever. Recovery has to be an
+ * explicit write, and an explicit write needs to know whether there is anything to take back —
+ * re-posting "resolved" every hour would re-stamp a settled row and pollute the self-resolved
+ * tile (the same reason check-drainer-progress.mjs only writes on a TRANSITION).
+ */
+export async function readSignal(secret, source, key) {
+  const url = `${BO_BASE}/rest/v1/fleet_signals`
+    + `?select=id,state,key&source=eq.${encodeURIComponent(source)}&key=eq.${encodeURIComponent(key)}&limit=1`
+  const res = await fetch(url, {
+    headers: { apikey: secret, Authorization: `Bearer ${secret}`, 'User-Agent': 'supabase-watchdog/1.0' },
+  })
+  if (!res.ok) throw new Error(`read signal ${key} -> HTTP ${res.status}: ${(await res.text()).slice(0, 160)}`)
+  const rows = await res.json()
+  return rows[0] || null
+}
+
+/** The same row, said in the past tense. Same source, same key — a resolve is never a new row. */
+export function resolvedSignal({ key, product, title, summary, detail }) {
+  return {
+    source: 'production-monitor',
+    key,
+    kind: 'incident',
+    product,
+    severity: 'info',
+    needs_human: false,
+    state: 'resolved',
+    title,
+    summary,
+    detail,
+    link: 'https://cockpit.predivo.ch/signals',
+  }
+}

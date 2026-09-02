@@ -29,7 +29,7 @@
  *     red, because nothing has established what the sweep should have found.
  */
 
-import { boardSecret, fileSignal, signal } from "./lib/fleet-signal.mjs"
+import { boardSecret, fileSignal, readSignal, resolvedSignal, signal } from "./lib/fleet-signal.mjs"
 // Moved to scripts/lib/ on 2026-08-30 when expire-stale-sessions.mjs failed with the exact
 // same signature and needed the same answer. Re-exported so this module's public surface
 // (and its test) is unchanged by the move.
@@ -265,6 +265,30 @@ if (process.argv[1] && process.argv[1].endsWith('check-supabase-build-currency.m
   // not report its version, and the second one is the whole job. A board outage while
   // filing must not swallow the finding, so failures are printed per row and the exit
   // below stands regardless.
+  // RECOVERY, added 2026-09-02. outOfReachSignal() returns null when the hole is closed, so the
+  // run that PROVES it closed used to file nothing and the open row stood forever — the exact
+  // shape of "an alarm that cannot go green". Beize Jass Tour sat open with 57 sightings until
+  // its management token was added as SUPABASE_TOKEN_JASSTOUR and the baseline flag cleared, and
+  // even then nothing would have taken the row back. Written only on the TRANSITION: re-posting
+  // a resolve every hour re-stamps a settled row and lies to the self-resolved tile.
+  if (!unreachable.length) {
+    try {
+      const prior = await readSignal(boardSecret(), 'production-monitor', 'supabase-project-out-of-management-reach')
+      if (prior && prior.state !== 'resolved') {
+        await fileSignal(boardSecret(), resolvedSignal({
+          key: 'supabase-project-out-of-management-reach',
+          product: 'fleet',
+          title: "Every live Supabase project is now inside this monitor's management reach",
+          summary: `All ${fullBaseline.projects.length} projects in scripts/lib/supabase-projects-baseline.json are readable by a management token this repo holds, so the build-currency sweep and the stale-login sweep both cover the whole fleet again. Nothing is marked out of reach.`,
+          detail: { outOfReach: 0, projectsInBaseline: fullBaseline.projects.length },
+        }))
+        console.log('resolved on the board: supabase-project-out-of-management-reach')
+      }
+    } catch (e) {
+      console.error(`::error::could not clear the out-of-reach row: ${e.message}`)
+    }
+  }
+
   const housekeeping = deadTokenSignal(findings, gaps, baseline)
   const stillBlind = housekeeping ? findings.filter((f) => !(f.isToken && f.level === 'unreadable')) : findings
   for (const row of [housekeeping, outOfReachSignal(unreachable), stillBlind.some((f) => f.level === 'unreadable') ? blindSignal(stillBlind) : null].filter(Boolean)) {
