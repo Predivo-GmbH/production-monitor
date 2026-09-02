@@ -180,12 +180,61 @@ function refFromUrl(url) {
 // is unit-tested without the network or the 30s sample gap.
 export function discover(env = process.env) {
   const prefixes = Object.keys(env).filter((k) => k.endsWith('_SUPABASE_URL')).map((k) => k.slice(0, -'_SUPABASE_URL'.length))
-  return prefixes.map((p) => {
+  return dedupeByRef(prefixes.map((p) => {
     const ref = refFromUrl(env[`${p}_SUPABASE_URL`])
     const key = env[`${p}_SECRET_KEY`] || env[`${p}_SERVICE_ROLE_KEY`]
     const reason = !key ? 'no key configured' : !ref ? 'no usable project ref in the URL' : null
     return { product: p, ref, key, reason }
-  })
+  }))
+}
+
+/**
+ * ONE MACHINE, ONE ROW — collapse env prefixes that resolve to the SAME project ref.
+ *
+ * WHY (2026-09-02): a product that got RENAMED keeps its old secret names alive for the specs
+ * that still reference them. ChannelMover was YTMigration, and monitor.yml wires BOTH
+ * CHANNELMOVER_SUPABASE_URL and YTMIGRATION_SUPABASE_URL into this step. They are the same
+ * database. The check therefore sampled project qswluvqunswggfmesdcs twice, printed "12 machines
+ * checked" for 11 machines, and filed a second board row under the product name YTMIGRATION —
+ * a product that does not exist and that nobody can act on. Two of the ten "is wearing out its
+ * disk allowance" rows on the signals board were that one machine counted twice.
+ *
+ * It also poisoned the diagnosis of the alarm itself. The 2026-09-01 hygiene signal
+ * `supabase-disk-pressure-rotates-across-projects` argued the metric could not be per-project
+ * because "YTMIGRATION and CHANNELMOVER keep reporting BYTE-IDENTICAL figures", and treated that
+ * as the decisive tell. It is not a tell at all: those two names ARE one machine, so identical
+ * readings are the correct answer. (Other same-run collisions in that signal, e.g. SCOUTCOPILOT
+ * landing on the same 1.05 MB/s, are NOT explained by this and remain open on item 62512b15.)
+ *
+ * WHICH NAME SURVIVES is decided, never left to Object.keys order. A USABLE entry always beats an
+ * unusable one, and among equals the alphabetically-first prefix wins. Both halves matter:
+ *   - key preference: if CHANNELMOVER carries a working key and the legacy YTMIGRATION name does
+ *     not, the machine IS being watched. Letting the keyless twin survive would file "the disk
+ *     watchdog is blind for YTMIGRATION" — a blind alarm, naming a product that does not exist,
+ *     about a database that was in fact read this run.
+ *   - alphabetical tie-break: the same environment then always produces the same product name, so
+ *     the signal key `supabase-disk:<product>` is stable across runs instead of flapping between
+ *     two names and breeding a second board row every time the order changed.
+ *
+ * The losers are NOT dropped silently — they travel on the survivor as `aliases`, and the CLI
+ * prints the collapse, because "the count went down" with no reason printed is the same class of
+ * quiet blindness the rest of this file exists to prevent.
+ *
+ * An entry with NO parseable ref is never collapsed onto anything: it has no identity to be the
+ * same machine as, and it must still be reported as unreadable on its own.
+ */
+export function dedupeByRef(targets) {
+  const byRef = new Map()
+  const out = []
+  const order = [...(targets ?? [])].sort((a, b) =>
+    (a.reason ? 1 : 0) - (b.reason ? 1 : 0) || String(a.product).localeCompare(String(b.product)))
+  for (const t of order) {
+    if (!t.ref) { out.push(t); continue }
+    const kept = byRef.get(t.ref)
+    if (!kept) { byRef.set(t.ref, t); out.push(t); continue }
+    kept.aliases = [...(kept.aliases ?? []), t.product]
+  }
+  return out.sort((a, b) => String(a.product).localeCompare(String(b.product)))
 }
 
 export async function checkMachines(env = process.env) {
@@ -392,7 +441,14 @@ if (process.argv[1] && process.argv[1].endsWith('check-supabase-machine-health.m
   // reaches checkMachines() — it has no target to sample — so without this comparison it leaves
   // no trace whatsoever, which is the exact "Jass-Tour" gap the 2026-09-01 board item names.
   const baseline = productionOnly(loadBaseline())
-  const gaps = coverageGaps(discover(), baseline)
+  const discovered = discover()
+  const gaps = coverageGaps(discovered, baseline)
+
+  // Say out loud when two secret names turned out to be one database, so "12 machines" becoming
+  // "11 machines" is never a silent drop somebody has to reverse-engineer from a diff.
+  for (const t of discovered.filter((d) => d.aliases?.length)) {
+    console.log(`NOTE        ${t.product.padEnd(20)} also wired as ${t.aliases.join(', ')} — same project ${t.ref}, counted once`)
+  }
 
   const findings = [...await checkMachines(), ...missingFindings(gaps)]
   for (const f of findings) console.log(`${String(f.level).toUpperCase().padEnd(11)} ${String(f.product).padEnd(20)} ${f.detail}`)

@@ -127,7 +127,8 @@ export function runLane(run) {
  * actually OBSERVED. Recovery may only resolve a key some run judged; adding both lanes for every
  * file (what this did until 2026-09-02) meant a production row could be resolved by a repo whose
  * runs were all staging pushes - nothing looked at production, and the row cleared anyway. The
- * 'scheduled' lane judges neither: it ships nothing, so it certifies nothing.
+ * 'scheduled' lane certifies neither of the other two - it ships nothing - but it DOES certify
+ * itself, because a red nightly run files a row of its own and something has to be able to clear it.
  */
 export function observedLaneKeys(product, runs) {
   const keys = new Set()
@@ -137,6 +138,7 @@ export function observedLaneKeys(product, runs) {
     const lane = runLane(r)
     if (lane === 'production') keys.add(deployKey(product, r.path, true))
     else if (lane === 'staging') keys.add(deployKey(product, r.path, false))
+    else if (lane === 'scheduled') keys.add(deployKey(product, r.path, false, 'scheduled'))
   }
   return keys
 }
@@ -144,8 +146,14 @@ export function observedLaneKeys(product, runs) {
 /** The board key for one pipeline. Production keeps the historical `product:path` key so existing
  * open rows resolve cleanly on recovery; a staging failure of the same file gets its own suffix so
  * the two lanes never overwrite each other. */
-export function deployKey(product, path, production) {
+export function deployKey(product, path, production, lane) {
   const base = `${product}:${path}`
+  // EVERY LANE THAT CAN FILE A ROW MUST BE A LANE THAT CAN CLEAR IT. The scheduled lane was split
+  // out on 2026-09-02 without a key of its own, so a red nightly run filed under the PRODUCTION key
+  // while observedLaneKeys() refused to certify that lane - the row could then only be cleared by
+  // somebody manually dispatching a production deploy, which here is rare. A row that files itself
+  // and cannot resolve itself is the erasure bug wearing the opposite coat.
+  if (lane === 'scheduled') return `${base.slice(0, 48)}:nightly`
   return production ? base.slice(0, 56) : `${base.slice(0, 48)}:staging`
 }
 
@@ -299,16 +307,23 @@ export function isAlarm(classification) {
 
 /** What ONE red pipeline says on the cockpit. */
 export function signalFor({ product, run, classification }) {
-  const production = isProductionFailure(run, classification)
+  // The nightly scheduled run of a deploy file gets its OWN row, never the production one. It runs
+  // the gates and skips the deploy, so it says nothing about production and must not page as if it
+  // did - and, just as important, the row it files is one its own lane can clear on the next green
+  // night. The two real lanes keep exactly their old shape.
+  const nightly = runLane(run) === 'scheduled'
+  const production = !nightly && isProductionFailure(run, classification)
   const broken = classification.kind === 'workflow-file'
   const title = broken
     ? `${product}: the deploy file is broken, nothing can ship`
-    : production
-      ? `${product}: the production deploy is failing`
-      : `${product}: the staging deploy is failing`
+    : nightly
+      ? `${product}: the nightly check of the deploy pipeline is failing`
+      : production
+        ? `${product}: the production deploy is failing`
+        : `${product}: the staging deploy is failing`
   return {
     source: SOURCE,
-    key: deployKey(product, run.path, production),
+    key: deployKey(product, run.path, production, nightly ? 'scheduled' : undefined),
     kind: 'incident',
     severity: production ? 'critical' : 'warning',
     state: 'open',

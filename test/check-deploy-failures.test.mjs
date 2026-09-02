@@ -405,11 +405,44 @@ t('only the lanes a repo actually RAN may be resolved by a recovery', () => {
   assert.ok(both.has(deployKey('ScoutCopilot', '.github/workflows/deploy.yml', false)))
 })
 
-t('a scheduled run certifies NEITHER lane - it ships nothing, so it proves nothing', () => {
+t('a scheduled run certifies only ITSELF - never staging, never production', () => {
+  const path = '.github/workflows/deploy.yml'
   const keys = observedLaneKeys('ReplyFlow', [
     run({ id: 23, event: 'schedule', conclusion: 'success', created_at: '2026-09-02T04:50:00Z' }),
   ])
-  assert.equal(keys.size, 0, 'a green nightly gate must not be able to resolve a production row')
+  assert.ok(!keys.has(deployKey('ReplyFlow', path, true)), 'a green nightly gate must not resolve a production row')
+  assert.ok(!keys.has(deployKey('ReplyFlow', path, false)), 'nor a staging row')
+  assert.ok(keys.has(deployKey('ReplyFlow', path, false, 'scheduled')), 'but it must be able to clear its own')
+})
+
+t('EVERY ROW THE NIGHTLY LANE FILES IS A ROW IT CAN CLEAR', () => {
+  // The regression the first version of this fix introduced: the scheduled lane got its own lane
+  // for the newest-red decision but no key of its own, so a red nightly run filed under the
+  // PRODUCTION key - which only a manual production dispatch could ever resolve. Production
+  // promotions here are rare, so the row would have sat open indefinitely, paging.
+  const scheduled = run({ id: 24, event: 'schedule', conclusion: 'failure', created_at: '2026-09-02T04:50:00Z' })
+  const sig = signalFor({
+    product: 'ReplyFlow', run: scheduled,
+    classification: { kind: 'job', job: 'gate-e2e', step: null, why: 'it failed.' },
+  })
+  const clearable = observedLaneKeys('ReplyFlow', [scheduled])
+  assert.ok(clearable.has(sig.key), `the nightly lane filed ${sig.key} but cannot clear it`)
+  assert.notEqual(sig.key, deployKey('ReplyFlow', scheduled.path, true), 'it must not take the production key')
+  assert.equal(sig.needs_human, false, 'a run that deploys nothing must not page as a production outage')
+  assert.equal(sig.severity, 'warning')
+  assert.match(sig.title, /nightly/i)
+})
+
+t('a broken deploy FILE found by the nightly run still cannot claim the production key', () => {
+  // classifyFailure marks the zero-job shape production:true. That must not put a scheduled run
+  // back on the production key by the back door.
+  const scheduled = run({ id: 25, event: 'schedule', conclusion: 'failure', created_at: '2026-09-02T04:50:00Z' })
+  const sig = signalFor({
+    product: 'ReplyFlow', run: scheduled,
+    classification: { kind: 'workflow-file', job: null, step: null, production: true, why: 'the file is broken.' },
+  })
+  assert.ok(observedLaneKeys('ReplyFlow', [scheduled]).has(sig.key))
+  assert.notEqual(sig.key, deployKey('ReplyFlow', scheduled.path, true))
 })
 
 console.log(`\n${n} assertions passed.`)

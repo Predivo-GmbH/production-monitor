@@ -15,7 +15,7 @@
 import assert from 'node:assert'
 import fs2 from 'node:fs'
 import { spawnSync } from 'node:child_process'
-import { metricValue, exitDecision, discover, blindSignal, coverageGaps, missingFindings, productionOnly, loadBaseline, escalation, diskSignal, diskKey, recoveredKeys, recoverySignal } from '../scripts/check-supabase-machine-health.mjs'
+import { metricValue, exitDecision, discover, blindSignal, coverageGaps, missingFindings, productionOnly, loadBaseline, escalation, diskSignal, diskKey, recoveredKeys, recoverySignal, dedupeByRef } from '../scripts/check-supabase-machine-health.mjs'
 
 let passed = 0
 let failed = 0
@@ -502,6 +502,88 @@ check('recoverySignal closes the row and says what re-measurement proved it', ()
 
 check('diskKey is stable, so repeat sightings update one row instead of breeding duplicates', () => {
   assert.equal(diskKey('REPLYFLOW'), 'supabase-disk:REPLYFLOW')
+})
+
+
+// --- ONE MACHINE, ONE ROW: two secret names for the same renamed project ------------------
+// The live defect, read off Production Monitor run 33620858198 (2026-09-02T10:54Z): the step
+// printed "12 machines checked" while coverage said "11/11 expected projects watched", and
+// YTMIGRATION and CHANNELMOVER both reported 0.54 MB/s, 16 faults/s, 26.1 KB per fault - the
+// same three figures to three significant digits, because ChannelMover WAS YTMigration and
+// monitor.yml still wires both names at the same database. One machine was sampled twice,
+// counted twice, and filed a second board row under a product that no longer exists.
+
+check('two env prefixes pointing at ONE project are counted once', () => {
+  const d = discover({
+    CHANNELMOVER_SUPABASE_URL: 'https://qswluvqunswggfmesdcs.supabase.co',
+    CHANNELMOVER_SERVICE_ROLE_KEY: 'sb_secret_a',
+    YTMIGRATION_SUPABASE_URL: 'https://qswluvqunswggfmesdcs.supabase.co',
+    YTMIGRATION_SERVICE_ROLE_KEY: 'sb_secret_a',
+  })
+  assert.equal(d.length, 1, 'one database must produce one target, not two')
+  assert.equal(d[0].product, 'CHANNELMOVER', 'the alphabetically-first prefix survives, so the name is stable across runs')
+  assert.deepEqual(d[0].aliases, ['YTMIGRATION'], 'the collapsed name is carried, never silently dropped')
+})
+
+check('the surviving name does not depend on the order the env happens to be in', () => {
+  const a = discover({
+    YTMIGRATION_SUPABASE_URL: 'https://qswluvqunswggfmesdcs.supabase.co', YTMIGRATION_SERVICE_ROLE_KEY: 'k',
+    CHANNELMOVER_SUPABASE_URL: 'https://qswluvqunswggfmesdcs.supabase.co', CHANNELMOVER_SERVICE_ROLE_KEY: 'k',
+  })
+  assert.equal(a.length, 1)
+  assert.equal(a[0].product, 'CHANNELMOVER')
+})
+
+check('the signal key is therefore stable: one machine can never breed two disk rows', () => {
+  const d = discover({
+    CHANNELMOVER_SUPABASE_URL: 'https://qswluvqunswggfmesdcs.supabase.co', CHANNELMOVER_SERVICE_ROLE_KEY: 'k',
+    YTMIGRATION_SUPABASE_URL: 'https://qswluvqunswggfmesdcs.supabase.co', YTMIGRATION_SERVICE_ROLE_KEY: 'k',
+  })
+  assert.deepEqual(d.map((t) => diskKey(t.product)), ['supabase-disk:CHANNELMOVER'])
+})
+
+check('DIFFERENT projects are never collapsed', () => {
+  const d = discover({
+    REPLYFLOW_SUPABASE_URL: 'https://dqmhsdzldkxngwjrxois.supabase.co', REPLYFLOW_SERVICE_ROLE_KEY: 'k',
+    CHANNELMOVER_SUPABASE_URL: 'https://qswluvqunswggfmesdcs.supabase.co', CHANNELMOVER_SERVICE_ROLE_KEY: 'k',
+  })
+  assert.equal(d.length, 2)
+  assert.ok(d.every((t) => !t.aliases), 'no alias is recorded when nothing was collapsed')
+})
+
+check('two keyless prefixes for ONE database are one blind machine, not two', () => {
+  const d = discover({
+    CHANNELMOVER_SUPABASE_URL: 'https://qswluvqunswggfmesdcs.supabase.co',
+    YTMIGRATION_SUPABASE_URL: 'https://qswluvqunswggfmesdcs.supabase.co',
+  })
+  assert.equal(d.length, 1, 'one unwatched database is one unreadable finding')
+  assert.equal(d[0].reason, 'no key configured')
+  assert.deepEqual(d[0].aliases, ['YTMIGRATION'])
+})
+
+check('a USABLE entry beats its keyless twin, so no blind alarm is raised for a watched machine', () => {
+  const d = discover({
+    YTMIGRATION_SUPABASE_URL: 'https://qswluvqunswggfmesdcs.supabase.co', YTMIGRATION_SERVICE_ROLE_KEY: 'k',
+    CHANNELMOVER_SUPABASE_URL: 'https://qswluvqunswggfmesdcs.supabase.co',
+  })
+  assert.equal(d.length, 1)
+  assert.equal(d[0].product, 'YTMIGRATION', 'the one that can actually be read survives, alphabetical order notwithstanding')
+  assert.equal(d[0].reason, null, 'the machine is watched, so nothing may be reported blind for it')
+})
+
+check('collapsing does not hide a project from the coverage floor', () => {
+  const env = {
+    CHANNELMOVER_SUPABASE_URL: 'https://qswluvqunswggfmesdcs.supabase.co', CHANNELMOVER_SERVICE_ROLE_KEY: 'k',
+    YTMIGRATION_SUPABASE_URL: 'https://qswluvqunswggfmesdcs.supabase.co', YTMIGRATION_SERVICE_ROLE_KEY: 'k',
+  }
+  const base = { projects: [{ product: 'ChannelMover', ref: 'qswluvqunswggfmesdcs' }] }
+  assert.deepEqual(coverageGaps(discover(env), base), [], 'the surviving row still carries the ref that proves coverage')
+})
+
+check('dedupeByRef is pure and leaves a ref-less entry alone', () => {
+  const out = dedupeByRef([{ product: 'A', ref: null, reason: 'no usable project ref in the URL' }])
+  assert.equal(out.length, 1)
+  assert.equal(out[0].ref, null)
 })
 
 console.log(`\n${passed} passed, ${failed} failed`)
