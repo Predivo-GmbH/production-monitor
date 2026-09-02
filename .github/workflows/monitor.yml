@@ -450,6 +450,27 @@ jobs:
       # first signal it files will appear on /signals under "nobody ever decided whether these
       # may alert you", with the two buttons that settle it. A new pager that pages before
       # anyone chose it is the default-nobody-chose failure this whole system exists to remove.
+      # IS THE CODE WE COMMITTED THE CODE THAT IS RUNNING? (2026-09-02)
+      #
+      # Every other sensor here asks whether the running system is healthy. None asked whether the
+      # running system is the one we have. On 2026-09-01 the largest error on the board had been
+      # FIXED nine days earlier: the commit was on main, green and reviewed, and production was
+      # still serving the build from 2026-08-20, because BackOffice CI applies migrations but does
+      # not deploy edge functions. Nothing was blocking it and nothing said so.
+      #
+      # Files a signal and exits 0, like its neighbours — a filed alarm must not also red the run,
+      # or one event is reported twice (fleet-signal.mjs).
+      - name: A fix that exists in our code must actually be running
+        if: always()
+        run: node scripts/check-edge-code-live.mjs
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_READ_TOKEN }}   # clones the fleet blobless; no REST budget spent
+          BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
+          SUPABASE_TOKEN_BACKOFFICE: ${{ secrets.SUPABASE_TOKEN_BACKOFFICE }}
+          SUPABASE_TOKEN_CHANNELMOVER: ${{ secrets.SUPABASE_TOKEN_CHANNELMOVER }}
+          SUPABASE_TOKEN_DISTRIBUTIONOS: ${{ secrets.SUPABASE_TOKEN_DISTRIBUTIONOS }}
+          SUPABASE_TOKEN_MUELLER: ${{ secrets.SUPABASE_TOKEN_MUELLER }}
+          SUPABASE_TOKEN_REPLYFLOW: ${{ secrets.SUPABASE_TOKEN_REPLYFLOW }}
       - name: The fleet auto-fixer is still fixing things
         if: always()  # independent sensor — must run even if the monitor step above failed. check-drainer-progress.mjs exits 0 on a filed alarm (only a failed read reds the job), so this cannot double-red one event.
         run: node scripts/check-drainer-progress.mjs
