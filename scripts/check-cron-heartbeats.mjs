@@ -106,7 +106,12 @@ const PRODUCTS = [
 // job_run_details is bounded to 35 days so the aggregate stays cheap even on
 // */2-minute jobs; 35d still covers a monthly job's largest legitimate gap.
 const HEARTBEAT_SQL = `
-  select j.jobname, j.schedule,
+  select j.jobname, j.schedule, j.jobid,
+    -- Rescheduling a job gives it a NEW jobid and orphans its history, because
+    -- cron.job_run_details is keyed by jobid and carries no jobname. Without this the
+    -- check cannot tell a job that has never run from one that was re-created minutes
+    -- ago, and reports both as "NEVER RUN". See jobVerdict.
+    (select max(jobid) from cron.job_run_details) as max_jobid_with_history,
     (j.command ilike '%net.http_post%') as uses_http_post,
     max(d.start_time) filter (where d.status = 'succeeded') as last_success,
     max(d.start_time) as last_run,
@@ -585,6 +590,39 @@ export function jobVerdict(row, nowMs) {
   // Never attempted. Say that, rather than "last success never ago", which reads as a
   // job that has been failing forever and is the same sentence for a job added an hour ago.
   if (!row.last_run) {
+    // ── RE-CREATED IS NOT NEVER RUN ─────────────────────────────────────────────
+    // pg_cron keys cron.job_run_details by jobid and stores no jobname, so `cron.unschedule`
+    // + `cron.schedule` — the normal way a migration edits a job — hands the job a fresh
+    // jobid and strands every row of its history under the old one. From this table the
+    // result is indistinguishable from a job that has never fired.
+    //
+    // Seen on BackOffice production 2026-09-02: deploy 33644046336 applied migration 160 at
+    // 14:44 UTC, re-scheduling four daily jobs to read their token from the vault. The 14:39
+    // run had just called all four healthy ("last success 8.3h ago"); the 16:47 run called
+    // the same four "NEVER RUN". Nothing had changed except their jobids — and the very same
+    // run still said "last fired 9.4h ago" about them three lines further down, because that
+    // number is derived from the schedule rather than read from the table. A check that
+    // contradicts itself inside one run is worse than one that says nothing.
+    //
+    // jobids come from a sequence, so a job numbered ABOVE every jobid that has any recorded
+    // run was created after the most recent thing this database ran: it has not reached its
+    // first tick yet. That is genuinely unproven, not dead, and this deliberately does not
+    // fire — the four above would otherwise page tomorrow at 05:07 for jobs that go on to
+    // run normally at 06:23.
+    //
+    // It cannot hide a permanently dead job for long, which is the whole reason it is safe:
+    // the moment ANY newer job records a run, this one stops being the highest and goes
+    // straight back to DEAD. And if pg_cron itself has stopped, nothing new gets recorded,
+    // every other job on the database ages out, and layer 1 fires on all of them.
+    const jobid = Number(row.jobid)
+    const highestThatHasRun = Number(row.max_jobid_with_history)
+    if (Number.isFinite(jobid) && Number.isFinite(highestThatHasRun) && jobid > highestThatHasRun) {
+      return {
+        verdict: 'unproven',
+        neverRan: true,
+        detail: `NOT YET PROVEN — no run recorded, but this job (id ${jobid}) is newer than every job that has run on this database (highest with history: ${highestThatHasRun}), so it was created or re-scheduled since the last recorded run and has not reached its first tick. Re-scheduling a job gives it a new id and strands its old history, so this is what a migration that just edited it looks like. It will be judged normally from its next run; if it is still saying this tomorrow, it really is not firing.`,
+      }
+    }
     return {
       verdict: 'dead',
       neverRan: true,
@@ -653,6 +691,10 @@ async function main() {
       const v = jobVerdict(r, now)
       if (v.verdict === 'ok') {
         console.log(`  OK   ${r.jobname} [${r.schedule}] ${v.detail}${r.uses_http_post ? ' (dispatches HTTP — see delivery line below)' : ''}`)
+      } else if (v.verdict === 'unproven') {
+        // Printed loudly, deliberately not a finding: there is nothing here anyone could
+        // act on tonight, and paging on it trains people to skim the ones that matter.
+        console.log(`  NEW? ${r.jobname} [${r.schedule}] ${v.detail}`)
       } else {
         findings.push({ product: name, job: r.jobname, schedule: r.schedule, problem: 'dead', detail: v.detail })
         // The SAME detail that goes in the email goes in the log. An alert whose evidence

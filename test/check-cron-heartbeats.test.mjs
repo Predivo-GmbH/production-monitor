@@ -615,4 +615,72 @@ t('THE WIRING: the shipped SQL actually selects the deadline columns the verdict
   assert.match(sql, /Timeout of \[0-9\]\+ ms reached/, 'and match pg_net 0.20.4 own wording')
 })
 
+
+// -- re-created is not never-run -------------------------------------------------------
+// BackOffice prod 2026-09-02: deploy 33644046336 applied migration 160 at 14:44 UTC, which
+// unschedules and re-schedules four daily jobs. The 14:39 heartbeat called all four healthy;
+// the 16:47 one called the same four "NEVER RUN". Only their jobids had changed.
+
+const RESCHEDULED = {
+  jobname: 'ledger-invariant-monitor-daily', schedule: '23 6 * * *',
+  jobid: 41, max_jobid_with_history: 37, last_success: null, last_run: null,
+}
+
+t('a job re-scheduled by a migration is NOT reported as one that has never run', () => {
+  // Defect injected: the shipped behaviour. cron.job_run_details is keyed by jobid and holds
+  // no jobname, so unschedule+schedule strands the history and a healthy daily job reads as
+  // dead. Four of them would have paged at 05:07 for jobs that run normally at 06:23.
+  const v = jobVerdict(RESCHEDULED, NOW)
+  assert.equal(v.verdict, 'unproven')
+  assert.doesNotMatch(v.detail, /NEVER RUN/)
+  assert.match(v.detail, /newer than every job that has run/)
+})
+
+t('a job that really has never run, and is not the newest, still fires', () => {
+  // Defect injected: treating ANY history-less job as "probably just created". The jobid
+  // sequence is what carries the claim -- a job below something that HAS run was there
+  // while that run happened, so its silence is real.
+  const v = jobVerdict({ ...RESCHEDULED, jobid: 12 }, NOW)
+  assert.equal(v.verdict, 'dead')
+  assert.match(v.detail, /NEVER RUN/)
+})
+
+t('the newest job goes back to DEAD as soon as anything newer records a run', () => {
+  // This is the bound that makes the quiet safe: it cannot outlast the next recorded run.
+  assert.equal(jobVerdict({ ...RESCHEDULED, max_jobid_with_history: 41 }, NOW).verdict, 'dead')
+  assert.equal(jobVerdict({ ...RESCHEDULED, max_jobid_with_history: 99 }, NOW).verdict, 'dead')
+})
+
+t('a database that reports no jobid at all is judged exactly as before, not excused', () => {
+  // Defect injected: `undefined > undefined` is false, but a NaN comparison silently
+  // swallowing the branch in the other direction would mute every history-less job.
+  const v = jobVerdict({ ...RESCHEDULED, jobid: undefined, max_jobid_with_history: undefined }, NOW)
+  assert.equal(v.verdict, 'dead')
+  assert.match(v.detail, /NEVER RUN/)
+})
+
+t('a healthy job is untouched by any of this', () => {
+  const v = jobVerdict({ ...RESCHEDULED, last_success: agoMin(30), last_run: agoMin(30) }, NOW)
+  assert.equal(v.verdict, 'ok')
+})
+
+t('THE WIRING: the shipped SQL selects the jobid columns the verdict compares', () => {
+  // Defect injected: the branch ships while HEARTBEAT_SQL never selects jobid, so both
+  // sides are undefined on every real run and the branch is dead code.
+  const src = readFileSync(new URL('../scripts/check-cron-heartbeats.mjs', import.meta.url), 'utf8')
+  const sql = src.slice(src.indexOf('const HEARTBEAT_SQL'), src.indexOf('const HTTP_OUTCOME_SQL'))
+  assert.match(sql, /j\.jobid/)
+  assert.match(sql, /max\(jobid\) from cron\.job_run_details\) as max_jobid_with_history/)
+})
+
+t('THE WIRING: an unproven job is printed but never pushed as a finding', () => {
+  // Defect injected: falling through to the else branch, which would page anyway and make
+  // the whole distinction cosmetic.
+  const src = readFileSync(new URL('../scripts/check-cron-heartbeats.mjs', import.meta.url), 'utf8')
+  const at = src.indexOf("} else if (v.verdict === 'unproven') {")
+  assert.ok(at > 0, 'the call site must handle unproven before the dead branch')
+  const branch = src.slice(at, src.indexOf('} else {', at))
+  assert.doesNotMatch(branch, /findings\.push/)
+})
+
 console.log(`\n${n} assertions passed.`)
