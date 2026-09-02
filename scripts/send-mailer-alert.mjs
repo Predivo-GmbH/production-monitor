@@ -87,7 +87,11 @@ const rows = failures
 // A finding whose `what` is 'unaudited' means the send history could not be READ, not that a send
 // was proven to have failed. classifyMailerAlert reserves "cannot send email" for the proven case
 // and renders an unaudited-only run as unaudited (2026-08-26 board finding).
-const { colour, subject, title, lede } = classifyMailerAlert(failures)
+// How many DECLARED products this run actually audited, counted from the guard's own rows. The
+// classifier needs it to tell "one product could not be read" (amber) from "not one product could
+// be read" (red - nothing is watching the fleet's email at all).
+const fleetProducts = new Set((report.rows || []).map((r) => r.product)).size
+const { colour, subject, title, lede } = classifyMailerAlert(failures, { fleetProducts })
 
 await transporter.sendMail({
   from: `Production Monitor <${SMTP_USER}>`,

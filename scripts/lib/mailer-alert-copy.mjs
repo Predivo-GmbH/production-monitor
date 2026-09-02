@@ -36,11 +36,25 @@ const isBlind = (f) => GUARD_BLIND.has(f.what)
 const isUnaudited = (f) => f.what === UNAUDITED
 const isProven = (f) => !isUnaudited(f) && !isBlind(f)
 
+// AND THE SAME BUG ONE LEVEL UP AGAIN (2026-08-26 board finding, applied 2026-09-02). "Unaudited"
+// is amber because it is a MINORITY report: some products could not be read, the rest were, so the
+// guard still proved something. When EVERY declared product comes back unaudited, that reading is
+// exactly wrong - the guard proved NOTHING about the fleet's email this run, which is the same
+// blindness the guard-broken path already pages red for. Amber plus "Reserve action for a run that
+// names a proven send failure" then tells Roger to stand down from the one run that most needs a
+// look. So the classifier now needs to know how big the fleet IS: pass `fleetProducts` (the count
+// of DECLARED products the run audited, from the report's own rows) and an all-or-nearly-all
+// unaudited run goes red with guard-broken wording. An isolated minority stays amber, unchanged.
+const NEARLY_ALL = 0.8
+
 /**
  * @param {{product:string, env:string, what:string, detail:string}[]} failures
+ * @param {{fleetProducts?: number}} [options] fleetProducts = how many declared products this run
+ *   audited. Omitted (0) keeps the pre-2026-09-02 behaviour: an unaudited-only run reads amber.
  * @returns {{colour:string, subject:string, title:string, lede:string}}
  */
-export function classifyMailerAlert(failures) {
+export function classifyMailerAlert(failures, options = {}) {
+  const fleetProducts = Number(options.fleetProducts) || 0
   const provenProducts = [...new Set(failures.filter(isProven).map((f) => f.product))]
   const unauditedProducts = [...new Set(failures.filter(isUnaudited).map((f) => f.product))]
   const blindProducts = [...new Set(failures.filter(isBlind).map((f) => f.product))]
@@ -77,8 +91,23 @@ export function classifyMailerAlert(failures) {
   }
 
   // 3. Only unaudited findings: the send history could not be READ, which is not the same as a
-  // proven send failure. This is amber, not red, and must never say "cannot send email".
+  // proven send failure. This is amber, not red, and must never say "cannot send email"...
   const plural = unauditedProducts.length > 1 ? 's' : ''
+
+  // ...UNLESS it is the WHOLE FLEET. Nothing was read, so nothing was proved, and calling that
+  // amber - and then telling Roger to reserve action - is a guard reporting its own blindness as
+  // reassurance. Still never "cannot send email": no send was proven to have failed. It is red
+  // because the WATCH is down, and the wording says so.
+  if (fleetProducts > 0 && unauditedProducts.length >= fleetProducts * NEARLY_ALL) {
+    const allOfThem = unauditedProducts.length >= fleetProducts
+    return {
+      colour: '#dc2626',
+      subject: `[MAILERS] send history unreadable for ${allOfThem ? 'EVERY' : 'nearly every'} product - nothing is confirming product email`,
+      title: `${unauditedProducts.length} of ${fleetProducts} product${fleetProducts > 1 ? 's' : ''} unaudited - this run proved nothing about the fleet's email`,
+      lede: `This is NOT a "cannot send email" notice - no send was proven to have failed. It is worse than one product going quiet: the send history could not be read for ${allOfThem ? 'any product at all' : 'nearly the whole fleet'}, so right now nothing is confirming that the fleet's email is arriving. That is the guard itself being down (a rotated Postmark or Supabase token, or an upstream HTTP 500), and it needs fixing before the next real outage has nobody watching it.`,
+    }
+  }
+
   return {
     colour: '#d97706',
     subject: `[MAILERS] ${unauditedProducts.join(', ')} unaudited - could not confirm email is being sent`,

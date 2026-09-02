@@ -101,14 +101,44 @@ export const isProdDeployJob = (name) => /^(deploy|deploy-fast|prod-smoke)$/i.te
 
 /**
  * The lane a RUN belongs to, from its trigger, used only to keep the "what is currently red"
- * decision per-lane. A push runs the staging deploy job; a manual dispatch (or a scheduled gate
- * pass) belongs to the production lane. Without this a green staging push and a red production
- * dispatch of the SAME deploy.yml share one bucket, and the newer green push silently erases the
- * red production result - the latent second half of the 2026-09-01 misfiling.
+ * decision per-lane. A push runs the staging deploy job; a manual dispatch runs the production
+ * one. Without this a green staging push and a red production dispatch of the SAME deploy.yml
+ * share one bucket, and the newer green push silently erases the red production result - the
+ * latent second half of the 2026-09-01 misfiling.
+ *
+ * A SCHEDULED RUN DEPLOYS NOTHING, SO IT IS ITS OWN LANE (2026-09-01 board finding, applied
+ * 2026-09-02). Every deploy.yml in this fleet gates its production job on
+ * `if: github.event_name == 'workflow_dispatch'`, so the nightly cron runs the GATES and skips
+ * the deploy: it ships nothing, and its green conclusion is a statement about the gates, not
+ * about production. Filed under 'production' it became the NEWEST run in that lane and displaced
+ * a red dispatch - a red production-deploy alarm cleared itself at ~04:50Z every night with no
+ * human and no deploy involved. That is the same "a job that reports success for doing nothing"
+ * shape one level up. Its own lane keeps a genuinely red nightly gate visible while making it
+ * structurally unable to clear, or to be cleared by, a real production result.
  */
 export function runLane(run) {
   if (!isProductionWorkflow(run.path)) return 'staging' // a dedicated deploy-staging.yml
+  if (run.event === 'schedule') return 'scheduled'
   return run.event === 'push' ? 'staging' : 'production'
+}
+
+/**
+ * The board keys this run is entitled to have an OPINION about, per deploy file, from the lanes it
+ * actually OBSERVED. Recovery may only resolve a key some run judged; adding both lanes for every
+ * file (what this did until 2026-09-02) meant a production row could be resolved by a repo whose
+ * runs were all staging pushes - nothing looked at production, and the row cleared anyway. The
+ * 'scheduled' lane judges neither: it ships nothing, so it certifies nothing.
+ */
+export function observedLaneKeys(product, runs) {
+  const keys = new Set()
+  for (const r of runs || []) {
+    if (!isDeployWorkflow(r.path)) continue
+    if (r.status !== 'completed') continue
+    const lane = runLane(r)
+    if (lane === 'production') keys.add(deployKey(product, r.path, true))
+    else if (lane === 'staging') keys.add(deployKey(product, r.path, false))
+  }
+  return keys
 }
 
 /** The board key for one pipeline. Production keeps the historical `product:path` key so existing
@@ -402,13 +432,9 @@ async function main() {
     const body = await ghGet(token, `/repos/${p.repo}/actions/runs?branch=${encodeURIComponent(p.branch)}&per_page=${RUNS_PER_REPO}`)
     const runs = (body.workflow_runs || []).map((r) => ({ ...r, repository_full_name: p.repo }))
 
-    // Every deploy workflow this repo HAS is judged, green or red, so a recovery can resolve it.
-    // Both lane keys, because staging and production of one deploy.yml are separate board rows.
-    for (const r of runs) {
-      if (!isDeployWorkflow(r.path)) continue
-      judgedKeys.add(deployKey(p.name, r.path, true))
-      judgedKeys.add(deployKey(p.name, r.path, false))
-    }
+    // Every deploy LANE this repo actually produced a completed run in is judged, green or red,
+    // so a recovery can resolve it - and only those. A lane nobody ran is a lane nobody looked at.
+    for (const k of observedLaneKeys(p.name, runs)) judgedKeys.add(k)
 
     for (const run of currentFailures(runs)) {
       const jobs = await ghGet(token, `/repos/${p.repo}/actions/runs/${run.id}/jobs`)

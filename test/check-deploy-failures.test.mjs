@@ -11,7 +11,7 @@
 import assert from 'node:assert'
 import {
   isDeployWorkflow, isProductionWorkflow, currentFailures, classifyFailure, isAlarm, isUnreadableFile,
-  signalFor, planSignals, recoveredKeys, ROLLUP_KEY, ROLLUP_THRESHOLD,
+  signalFor, planSignals, recoveredKeys, ROLLUP_KEY, ROLLUP_THRESHOLD, observedLaneKeys, deployKey,
 } from '../scripts/check-deploy-failures.mjs'
 
 let n = 0
@@ -362,6 +362,54 @@ t('the rollup is never resolved by the per-pipeline recovery loop', () => {
     redKeys: new Set(),
   })
   assert.deepEqual(got, [])
+})
+
+t('a green NIGHTLY SCHEDULED run does not clear a red production DISPATCH', () => {
+  // 2026-09-01 board finding. Every deploy.yml here gates its production job on
+  // `if: github.event_name == 'workflow_dispatch'`, so the nightly cron runs the gates, SKIPS the
+  // deploy, ships nothing - and still concludes green. Filed in the production lane it became the
+  // newest result there and erased the red dispatch on the ~04:50Z cron, every night, silently.
+  const red = currentFailures([
+    run({ id: 11, event: 'schedule', conclusion: 'success', created_at: '2026-09-02T04:50:00Z' }),
+    run({ id: 10, event: 'workflow_dispatch', conclusion: 'failure', created_at: '2026-09-01T14:00:00Z' }),
+  ])
+  assert.equal(red.length, 1, 'a run that deployed nothing must not clear a real production failure')
+  assert.equal(red[0].id, 10)
+  assert.equal(red[0].event, 'workflow_dispatch')
+})
+
+t('a red nightly scheduled run is still visible in its own lane', () => {
+  const red = currentFailures([
+    run({ id: 13, event: 'schedule', conclusion: 'failure', created_at: '2026-09-02T04:50:00Z' }),
+    run({ id: 12, event: 'workflow_dispatch', conclusion: 'success', created_at: '2026-09-01T14:00:00Z' }),
+  ])
+  assert.equal(red.length, 1, 'its own lane means a broken nightly gate is not swallowed either')
+  assert.equal(red[0].id, 13)
+})
+
+t('only the lanes a repo actually RAN may be resolved by a recovery', () => {
+  // Adding both lane keys for every deploy file let a production row be resolved by a repo whose
+  // runs were all staging pushes: nothing looked at production, and the row cleared anyway.
+  const stagingOnly = observedLaneKeys('ScoutCopilot', [
+    run({ id: 20, event: 'push', conclusion: 'success', created_at: '2026-09-02T09:00:00Z' }),
+  ])
+  assert.ok(stagingOnly.has(deployKey('ScoutCopilot', '.github/workflows/deploy.yml', false)))
+  assert.ok(!stagingOnly.has(deployKey('ScoutCopilot', '.github/workflows/deploy.yml', true)),
+    'no production run was observed, so no production verdict may be claimed')
+
+  const both = observedLaneKeys('ScoutCopilot', [
+    run({ id: 21, event: 'push', conclusion: 'success', created_at: '2026-09-02T09:00:00Z' }),
+    run({ id: 22, event: 'workflow_dispatch', conclusion: 'success', created_at: '2026-09-02T10:00:00Z' }),
+  ])
+  assert.ok(both.has(deployKey('ScoutCopilot', '.github/workflows/deploy.yml', true)))
+  assert.ok(both.has(deployKey('ScoutCopilot', '.github/workflows/deploy.yml', false)))
+})
+
+t('a scheduled run certifies NEITHER lane - it ships nothing, so it proves nothing', () => {
+  const keys = observedLaneKeys('ReplyFlow', [
+    run({ id: 23, event: 'schedule', conclusion: 'success', created_at: '2026-09-02T04:50:00Z' }),
+  ])
+  assert.equal(keys.size, 0, 'a green nightly gate must not be able to resolve a production row')
 })
 
 console.log(`\n${n} assertions passed.`)

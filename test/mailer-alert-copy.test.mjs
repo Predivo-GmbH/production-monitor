@@ -99,5 +99,52 @@ check('a proven outage still pages red even when another project is guard-blind'
   assert.match(r.title, /guard could not read/, 'the guard-blind products should still be counted in the headline')
 })
 
+// 2026-08-26 board finding, applied 2026-09-02: "unaudited" is amber because it is a MINORITY
+// report - some products could not be read, the rest were. When EVERY declared product comes back
+// unaudited the guard proved nothing at all, and amber + "Reserve action for a run that names a
+// proven send failure" stands Roger down from the one run that most needs a look.
+const unauditedFleet = (n) => Array.from({ length: n }, (_, i) => ({
+  product: `product-${i}`, env: 'production', what: 'unaudited',
+  detail: 'its send history could not be read (outbound HTTP 500)',
+}))
+
+check('an ALL-unaudited run is red and drops the "Reserve action" stand-down', () => {
+  const r = classifyMailerAlert(unauditedFleet(8), { fleetProducts: 8 })
+  assert.equal(r.colour, '#dc2626', 'a run that read nothing at all must not be amber')
+  assert.ok(!/Reserve action/i.test(r.lede), 'a run that proved nothing must not tell Roger to reserve action')
+  assert.ok(!/cannot send email/i.test(r.subject), 'still no proven send failure, so still no outage claim')
+  assert.ok(!/cannot send email/i.test(r.title), 'still no proven send failure, so still no outage claim')
+  assert.match(r.title, /8 of 8/, 'the headline must say how much of the fleet went unread')
+  assert.match(r.lede, /nothing is confirming/i)
+})
+
+check('nearly-all unaudited is red too', () => {
+  const r = classifyMailerAlert(unauditedFleet(7), { fleetProducts: 8 })
+  assert.equal(r.colour, '#dc2626')
+  assert.ok(!/Reserve action/i.test(r.lede))
+  assert.match(r.subject, /nearly every/i)
+})
+
+check('an isolated unaudited minority stays amber and keeps the stand-down', () => {
+  const r = classifyMailerAlert(unauditedFleet(2), { fleetProducts: 8 })
+  assert.equal(r.colour, '#d97706', '2 of 8 unread is still a minority report')
+  assert.match(r.lede, /Reserve action/i)
+})
+
+check('without a fleet size the classifier keeps its old amber behaviour', () => {
+  const r = classifyMailerAlert(unauditedFleet(8))
+  assert.equal(r.colour, '#d97706')
+})
+
+check('a proven failure still outranks an all-unaudited fleet', () => {
+  const r = classifyMailerAlert([
+    { product: 'arivioo', env: 'production', what: 'the mailer is not configured at all', detail: '...' },
+    ...unauditedFleet(8),
+  ], { fleetProducts: 9 })
+  assert.equal(r.colour, '#dc2626')
+  assert.match(r.subject, /cannot send email/)
+  assert.match(r.subject, /arivioo/)
+})
+
 console.log(`\n${passed} passed, ${failed} failed.`)
 process.exit(failed ? 1 : 0)
