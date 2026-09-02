@@ -5,7 +5,7 @@
  * Run: node test/board-drainer.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
-import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, workableFinding, parkedFields, gateFor, stripCode, actionOf, plainTitle, titleObjections, workItemSlugFor, handoffPrompt, routeToWorkBoard, prose, DEPLOY_DENY_TOOLS, agentToolFlags, signalObjects, signalPhrases, matchItem, findJoinTarget, joinMarker, expectedBusinessApplies, handedOverClearsCounter, parkedHandoverQueue, mintOpenedAt } from '../scripts/board-drainer.mjs'
+import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, stuckRootCause, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, workableFinding, parkedFields, gateFor, stripCode, actionOf, plainTitle, titleObjections, workItemSlugFor, handoffPrompt, routeToWorkBoard, prose, DEPLOY_DENY_TOOLS, agentToolFlags, signalObjects, signalPhrases, matchItem, findJoinTarget, joinMarker, expectedBusinessApplies, handedOverClearsCounter, parkedHandoverQueue, mintOpenedAt } from '../scripts/board-drainer.mjs'
 
 let n = 0
 const t = (name, fn) => { fn(); n++; console.log(`  ok - ${name}`) }
@@ -378,6 +378,27 @@ t('an ALREADY-escalated stuck item is silent: parked, never re-written', () => {
   const { toEscalate, parked } = selectWorkQueue({ routed, state })
   assert.equal(toEscalate.length, 0, 'no second write')
   assert.equal(parked.length, 1)
+})
+
+t('escalating a stuck item PRESERVES the original diagnosis, appending the stuck note — never a bare stub', () => {
+  // `board-drainer-stuck-stub-erases-root-cause`: the escalation write must not throw away
+  // inc.root_cause. The real diagnosis survives; the note is added, not substituted.
+  const diag = 'v_external_tools is readable by anyone with the public anon key — bypasses RLS.'
+  const rc = stuckRootCause({ root_cause: diag }, 3)
+  assert.ok(rc.includes(diag), 'the original diagnosis survives the escalation')
+  assert.ok(rc.includes('auto-fix STUCK after 3 attempts'), 'the stuck note is appended')
+})
+t('stuckRootCause is idempotent — a re-escalation does not stack notes or bury the original', () => {
+  const diag = 'checkout throws on empty basket'
+  const once = stuckRootCause({ root_cause: diag }, 3)
+  const twice = stuckRootCause({ root_cause: once }, 5)
+  assert.ok(twice.includes(diag), 'the true original is still present after a second escalation')
+  assert.equal(twice.match(/auto-fix STUCK after/g).length, 1, 'exactly one stuck note, not stacked')
+  assert.ok(twice.includes('after 5 attempts'), 'the note reflects the latest attempt count')
+})
+t('stuckRootCause with no prior diagnosis is just the note (no leading blank lines)', () => {
+  const rc = stuckRootCause({ root_cause: '' }, 3)
+  assert.ok(rc.startsWith('[board-drainer] auto-fix STUCK'), 'bare note when there was nothing to preserve')
 })
 
 t('a `note` item is recorded outside the budget too, never charged as a dispatch', () => {

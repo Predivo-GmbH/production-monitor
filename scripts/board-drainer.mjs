@@ -2130,6 +2130,19 @@ export function stuckWhoMustAct(whoMustAct) {
   return { owner, priorAction, value: `${owner} - ${priorAction}` }
 }
 
+/** The root_cause written when an item is escalated as auto-fix-stuck. The ORIGINAL diagnosis is
+ *  PRESERVED verbatim and the stuck note is APPENDED — replacing it with a bare stub was the
+ *  `board-drainer-stuck-stub-erases-root-cause` bug (a human landed on the row and the real
+ *  diagnosis was gone). Idempotent: a previously-appended note is stripped before re-appending, so
+ *  a RESET_STUCK re-escalation cannot stack notes or lose the true original underneath them. */
+export function stuckRootCause(inc, attempts, intervalMs = PARKED_RETRY_INTERVAL_MS) {
+  const note = `[board-drainer] auto-fix STUCK after ${attempts} attempts — the action below still stands, it just could not be applied automatically. It is retried automatically within ${intervalMs / 3600_000}h, or immediately with "Hand to Claude" on /signals.`
+  const original = String(inc?.root_cause || '')
+    .replace(/\n*\[board-drainer\] auto-fix STUCK after \d+ attempts[\s\S]*$/, '')
+    .trim()
+  return (original ? `${original}\n\n${note}` : note).slice(0, 2000)
+}
+
 /** Returned by dispatchAgent when the agent never got to produce a verdict at all — a 12-minute
  *  execFileSync timeout or a spawn failure. Distinct from `null`, which means the agent RAN and
  *  chose to say nothing. */
@@ -2559,7 +2572,7 @@ async function main() {
           // not a promotion of the PROBLEM to critical — a warning item that could not be
           // auto-fixed is still a warning.
           p_source: inc.source, p_key: inc.key, p_title: inc.title, p_severity: inc.severity || 'warning', p_status: 'blocked',
-          p_root_cause: `[board-drainer] auto-fix STUCK after ${attempts} attempts — the action below still stands, it just could not be applied automatically. It is retried automatically within ${PARKED_RETRY_INTERVAL_MS / 3600_000}h, or immediately with "Hand to Claude" on /signals.`,
+          p_root_cause: stuckRootCause(inc, attempts),
           p_who_must_act: stuckWho,
           p_evidence: {
             by: 'board-drainer', stuck: true, attempts, stuckOwner, needsRogersHands,
