@@ -23,6 +23,41 @@ async function bypassPasswordGate(page: import('@playwright/test').Page, url: st
   await page.goto(url, { waitUntil: 'networkidle' })
 }
 
+/**
+ * Click the page's Search SUBMIT button — not the sidebar navigation item.
+ *
+ * ScoutCopilot renders TWO buttons whose text is exactly "Search": the sidebar
+ * nav entry (src/components/layout/Sidebar.tsx:24 — `{ path: '/search', key:
+ * 'search' }`, rendered as a <button>) and the real submit button beside
+ * #player-search (src/features/search/SearchPage.tsx:105-113, onClick=handleSearch).
+ * The sidebar sits OUTSIDE <main id="main-content"> (AppShell.tsx:116) and BEFORE
+ * it in the DOM, so the selector all three call sites used —
+ *   page.locator('button').filter({ hasText: /^search$/i }).first()
+ * — resolved to the NAVIGATION item every time. Clicking it merely re-navigated to
+ * the page already open, handleSearch() never ran, and the results panel sat on its
+ * "Start a search / Results will appear here" placeholder for the whole 60s wait.
+ *
+ * Production proves it never once fired: search_queries holds 38 rows, the newest
+ * 2026-05-05, while these tests have run hourly ever since. The backend was never
+ * the problem — POST /functions/v1/search returns 200 with Lionel Messi in ~4s.
+ *
+ * The count assertion is the real fix. `.first()` on an ambiguous locator silently
+ * clicking the wrong element is precisely the failure above, and it stayed invisible
+ * for months because the assertions that followed could not fail either. If another
+ * "Search"-labelled button ever lands inside <main>, this now fails at the click
+ * with the reason, instead of quietly exercising the wrong widget.
+ */
+async function clickSearchSubmit(page: import('@playwright/test').Page): Promise<void> {
+  const btn = page.locator('main#main-content button').filter({ hasText: /^search$/i })
+  await expect(
+    btn,
+    'expected exactly one "Search" submit button inside <main id="main-content"> — ' +
+      'the sidebar nav item is also labelled "Search", and matching that one instead ' +
+      'means no search is ever run',
+  ).toHaveCount(1)
+  await btn.click()
+}
+
 test.describe('ScoutCopilot — Production Monitor', () => {
   test.beforeAll(async () => {
     await ensureTestUser(SUPABASE_URL, SERVICE_ROLE_KEY, TEST_EMAIL)
@@ -129,6 +164,14 @@ test.describe('ScoutCopilot — Production Monitor', () => {
   // ─── Real User Interaction Tests ──────────────────────────────
 
   test('player search flow: enter query and verify results table loads', async ({ page }) => {
+    // A real ScoutCopilot search is slow on purpose: Claude parses the query, the
+    // providers are polled, then Claude ranks the result set. Measured against
+    // production on 2026-09-02: 'Messi' (name lookup) 4.2s, 'Strikers with goals'
+    // (filter query) 15.8s server-side, 22.7s to the browser, 25.1s to painted rows.
+    // The 60s wait below therefore needs a test budget bigger than 60s — the config
+    // default is exactly 60s (playwright.config.ts:21), so login and navigation would
+    // eat into the very window this test is trying to measure.
+    test.setTimeout(120_000)
     await page.addInitScript(() => { try { sessionStorage.setItem('scoutcopilot-unlocked', 'true') } catch {} })
     await loginViaMagicLink(page, AUTH_CONFIG)
     await page.goto(`${SITE_URL}/search`, { waitUntil: 'networkidle' })
@@ -140,14 +183,26 @@ test.describe('ScoutCopilot — Production Monitor', () => {
     // Type a query
     await searchInput.fill('Messi')
 
-    // Click Search button (same selector as passing "player detail" test)
-    const btn = page.locator('button').filter({ hasText: /^search$/i }).first()
-    await btn.click()
+    // Click the Search SUBMIT button. The comment that used to sit here said "same
+    // selector as passing 'player detail' test" — both were clicking the sidebar nav
+    // item, and "passing" was the lenient assertion below, not a working search.
+    await clickSearchSubmit(page)
 
     // Wait for the search to ANSWER: a result count, the empty state, or a row.
     // Strings confirmed in SearchResultsTable.tsx + src/i18n/en.json:
     //   search.playersFound = 'players found' / search.playerFound = 'player found'
     //   search.noResults    = 'No players found'  (the empty state)
+    //
+    // THE `undefined` IS LOAD-BEARING, NOT NOISE — do not "tidy" it away. The signature is
+    // waitForFunction(pageFunction, arg, options): with only two arguments the object
+    // becomes the ARG handed to the callback, and the timeout silently falls back to
+    // use.actionTimeout (playwright.config.ts:47 — 15s). All six call sites in this
+    // file were written that way. The recorded trace of the 2026-09-02 red run shows
+    // it exactly: arg={"k":"timeout","v":{"n":60000}} beside timeout:15000, and the
+    // wait ending 15.0s after the click. So this test announced "no result within 60s"
+    // having waited 15 — while the search it was watching answers in 16-23s. It was
+    // reporting the harness's own deadline as a production outage. lib/publicRoutes.ts
+    // passes the arg correctly; test/waitforfunction-timeout.test.mjs now enforces it.
     const gotResponse = await page.waitForFunction(
       () => {
         const body = document.body.textContent?.toLowerCase() ?? ''
@@ -158,6 +213,7 @@ test.describe('ScoutCopilot — Production Monitor', () => {
           document.querySelector('table tbody tr') !== null
         )
       },
+      undefined,
       { timeout: 60_000 },
     ).then(() => true).catch(() => false)
 
@@ -175,6 +231,8 @@ test.describe('ScoutCopilot — Production Monitor', () => {
   })
 
   test('player detail view: search then click first result to view profile', async ({ page }) => {
+    // Same reason as the search-flow test above, plus a profile navigation afterwards.
+    test.setTimeout(120_000)
     await page.addInitScript(() => { try { sessionStorage.setItem('scoutcopilot-unlocked', 'true') } catch {} })
     await loginViaMagicLink(page, AUTH_CONFIG)
     await page.goto(`${SITE_URL}/search`, { waitUntil: 'networkidle' })
@@ -183,9 +241,9 @@ test.describe('ScoutCopilot — Production Monitor', () => {
     await expect(searchInput).toBeVisible({ timeout: 10_000 })
     await searchInput.fill('Strikers with goals')
 
-    // Button text is "Search" (t('search.searchBtn')) — match exactly, case-insensitive
-    const btn = page.locator('button').filter({ hasText: /^search$/i }).first()
-    await btn.click()
+    // Button text is "Search" (t('search.searchBtn')) — but so is the sidebar nav
+    // item's, so the submit button is resolved inside <main> (see clickSearchSubmit).
+    await clickSearchSubmit(page)
 
     // SearchResultsTable renders <tr role="link"> rows in table view (default on desktop).
     // Grid view renders [role="button"][aria-label="<player>: <name>"].
@@ -201,6 +259,7 @@ test.describe('ScoutCopilot — Production Monitor', () => {
         const body = document.body.textContent ?? ''
         return rows.length > 0 || cards.length > 0 || body.toLowerCase().includes('no players found')
       },
+      undefined,
       { timeout: 60_000 },
     ).then(() => true).catch(() => false)
 
@@ -264,6 +323,7 @@ test.describe('ScoutCopilot — Production Monitor', () => {
         const cards = document.querySelectorAll('.bg-surface-container.border')
         return !statusGrid || cards.length >= 1
       },
+      undefined,
       { timeout: 15_000 },
     )
 
@@ -307,6 +367,7 @@ test.describe('ScoutCopilot — Production Monitor', () => {
         const nav = document.querySelector('nav')
         return nav !== null && (nav.textContent ?? '').length > 20
       },
+      undefined,
       { timeout: 15_000 },
     )
 
@@ -333,6 +394,7 @@ test.describe('ScoutCopilot — Production Monitor', () => {
         const body = document.body.textContent ?? ''
         return body.toLowerCase().includes('plan') || body.toLowerCase().includes('billing')
       },
+      undefined,
       { timeout: 10_000 },
     )
 
@@ -410,8 +472,10 @@ test.describe('ScoutCopilot — Production Monitor', () => {
     // Run a search to confirm filters are retained across the search action
     const searchInput = page.locator('#player-search')
     await searchInput.fill('Messi')
-    const searchBtn = page.locator('button').filter({ hasText: /^search$/i }).first()
-    await searchBtn.click()
+    // Same ambiguity as the two search tests: this one claims to prove the filters
+    // survive "the search action", and was clicking the sidebar nav item, so no
+    // search action ever happened and the retention assertions below were vacuous.
+    await clickSearchSubmit(page)
 
     // Wait for search to complete (results or timeout — non-fatal)
     await page.waitForFunction(
@@ -423,6 +487,7 @@ test.describe('ScoutCopilot — Production Monitor', () => {
           document.querySelector('table tbody tr') !== null
         )
       },
+      undefined,
       { timeout: 60_000 },
     ).catch(() => {})
 
