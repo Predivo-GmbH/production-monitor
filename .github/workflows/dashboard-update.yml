@@ -178,7 +178,6 @@ jobs:
         env:
           BACKOFFICE_SUPABASE_URL: ${{ secrets.BACKOFFICE_SUPABASE_URL }}
           BACKOFFICE_SERVICE_ROLE_KEY: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
-          FLEET_READ_TOKEN: ${{ secrets.FLEET_READ_TOKEN }}
 
       # Always runs after collection; the script emails only when escalations exist
       # (red >48h) and exits 0 otherwise, so this never fails the job.

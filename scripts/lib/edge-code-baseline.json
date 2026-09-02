@@ -1,0 +1,29 @@
+{
+  "_comment": [
+    "What the fleet is SUPPOSED to contain, for check-edge-code-live.mjs.",
+    "Same house rule as supabase-projects-baseline.json: a written-down expectation, so a gap",
+    "is a FACT instead of a guess. Without this file, a repo nobody can read is ABSENT, and",
+    "absent reads as fine — the exact hole that made check-supabase-build-currency print",
+    "'21 projects checked, 0 behind' while a product went unwatched (2026-08-30).",
+    "",
+    "prod: the PRODUCTION Supabase project ref. null means NOT YET ESTABLISHED — the repo is",
+    "still listed, and the check reports it as UNPROVEN coverage rather than skipping it.",
+    "Only refs verified against the live Management API on 2026-09-02 are filled in here.",
+    "",
+    "branch: the ref that is actually deployable. Deliberately the REMOTE branch, because a",
+    "commit that exists only on this machine is not something anyone can ship."
+  ],
+  "repos": [
+    { "repo": "replyflow",       "prod": "dqmhsdzldkxngwjrxois", "branch": "origin/main",   "verified": "2026-09-02" },
+    { "repo": "ChannelMover",    "prod": "qswluvqunswggfmesdcs", "branch": "origin/main",   "verified": "2026-09-02" },
+    { "repo": "signalscore",     "prod": "ogdpgufptemcgyszmjek", "branch": "origin/main",   "verified": "2026-09-02" },
+    { "repo": "BackOffice",      "prod": "xoecpzfsskalvjrtcbbl", "branch": "origin/main",   "verified": "2026-09-02" },
+    { "repo": "Distribution-OS", "prod": "jxjpbmkgmuunpayqgbsx", "branch": "origin/master", "verified": "2026-09-02" },
+    { "repo": "arivioo",         "prod": null, "branch": "origin/main", "verified": null },
+    { "repo": "Valrano",         "prod": null, "branch": "origin/main", "verified": null },
+    { "repo": "ScoutCopilot",    "prod": null, "branch": "origin/main", "verified": null },
+    { "repo": "launchready",     "prod": null, "branch": "origin/main", "verified": null },
+    { "repo": "BoatBuddy",       "prod": null, "branch": "origin/main", "verified": null },
+    { "repo": "jass-tour-ui-kit","prod": null, "branch": "origin/main", "verified": null }
+  ]
+}

@@ -20,7 +20,7 @@ import { readFileSync } from 'node:fs'
 import {
   httpDeliveryVerdict, scheduleIntervalMs, RESPONSE_RETENTION_MS, PERSISTENT_FAILURES,
   msSinceLastFire, deliveryCoverage,
-  jobVerdict, allowanceMs, attributionClause, ATTRIBUTION_WINDOW_SEC,
+  jobVerdict, allowanceMs, attributionClause, DISPATCH_BAND_SEC, NEAREST_RUN_LOOKBACK_SEC,
 } from '../scripts/check-cron-heartbeats.mjs'
 
 let n = 0
@@ -424,7 +424,7 @@ t('THE WIRING: the shipped script passes real job names and its own clock, not j
   // product calls it — exitDecision() was exported, documented and unit-tested here
   // while the CLI had stopped calling it (fixed in 6f2fd93). Same trap, same guard.
   const src = readFileSync(new URL('../scripts/check-cron-heartbeats.mjs', import.meta.url), 'utf8')
-  assert.match(src, /httpDeliveryVerdict\(\{ stats, queryError, httpPostJobs, nowMs: now, attribution, attributionError \}\)/)
+  assert.match(src, /httpDeliveryVerdict\(\{ stats, queryError, httpPostJobs, nowMs: now, attribution, attributionError, dispatchers \}\)/)
   assert.match(src, /const httpPostJobs = rows\.filter\(\(r\) => r\.uses_http_post\)/)
 })
 
@@ -463,9 +463,9 @@ t('a job that cannot be pinned down is offered as a candidate, never asserted as
 })
 
 t('a bad call with no cron run behind it says so — net._http_response is per-database, not per-job', () => {
-  const c = attributionClause([{ status: '500', candidate_count: 0, candidates: '', n: 4 }])
+  const c = attributionClause([{ status: '500', candidate_count: 0, candidates: '', n: 4, nearest_job: null, nearest_gap_s: null }])
   assert.match(c, /4 × 500/)
-  assert.match(c, /no cron run in the 90s before them/)
+  assert.match(c, new RegExp(`no cron job on this database ran in the ${NEAREST_RUN_LOOKBACK_SEC}s before them at all`))
   assert.match(c, /other than pg_cron/)
 })
 
@@ -681,6 +681,127 @@ t('THE WIRING: an unproven job is printed but never pushed as a finding', () => 
   assert.ok(at > 0, 'the call site must handle unproven before the dead branch')
   const branch = src.slice(at, src.indexOf('} else {', at))
   assert.doesNotMatch(branch, /findings\.push/)
+})
+
+
+// ── THE 90-SECOND WINDOW THAT NAMED AN INNOCENT JOB (2026-09-02, run 33657359918) ──────
+// Every test below is a measurement from BackOffice production, not an invented shape.
+
+t('DEFECT: a call dispatched 21s after a cron run is NOT that job — the band is the measured one', () => {
+  // The exact row. A 500 dispatched at 13:02:21.48; signal-sweep-5min started at
+  // 13:02:00.23. The old 90s window claimed it with candidate_count 1, so the finding
+  // named the fleet pager. 168 of 194 calls on that database dispatch within 0.5s of
+  // their job's start; 21s is not a late answer, it is a different call.
+  assert.ok(DISPATCH_BAND_SEC <= 5, `band is ${DISPATCH_BAND_SEC}s — wide enough to reclaim the 21s row`)
+  const c = attributionClause([{
+    status: '500', sb_error_code: 'EDGE_FUNCTION_ERROR', candidate_count: 0, candidates: '',
+    nearest_job: 'signal-sweep-5min', nearest_gap_s: 21.3, n: 1,
+  }])
+  assert.doesNotMatch(c, /signal-sweep-5min -> /)      // never presented as the culprit
+  assert.match(c, /nearest cron run was signal-sweep-5min, 21.3s earlier/)
+  assert.match(c, new RegExp(`outside the ${DISPATCH_BAND_SEC}s`))
+})
+
+t('the orphan verdict shows its arithmetic, so the reader can check it instead of trusting it', () => {
+  const c = attributionClause([{
+    status: '404', sb_error_code: 'NOT_FOUND', candidate_count: 0, candidates: '',
+    nearest_job: 'support-send-due', nearest_gap_s: 45.2, n: 1,
+  }])
+  assert.match(c, /45\.2s earlier/)
+  assert.match(c, /so it was not that job/)
+})
+
+t('an unattributed call names the OTHER things that dispatch HTTP, not just where to stop looking', () => {
+  // BackOffice's auth Send Email hook is pg-functions://postgres/public/handle_send_email,
+  // which pg_net-calls send-auth-email on every login mail — 26 of 194 calls in the window,
+  // and the true source of the 500 the alarm pinned on the pager.
+  const c = attributionClause(
+    [{ status: '500', candidate_count: 0, candidates: '', nearest_job: null, nearest_gap_s: null, n: 1 }],
+    null,
+    [{ fn: 'public.handle_send_email', route: '/functions/v1/send-auth-email' }],
+  )
+  assert.match(c, /public\.handle_send_email -> \/functions\/v1\/send-auth-email/)
+})
+
+t('an unreadable dispatcher list says less, and never claims there is no other caller', () => {
+  // null = the lookup failed or was not run. Reporting that as "nothing else calls
+  // http_post" would be the same trade the 90s window made: a guess dressed as a fact.
+  const row = { status: '500', candidate_count: 0, candidates: '', nearest_job: null, nearest_gap_s: null, n: 1 }
+  assert.doesNotMatch(attributionClause([row], null, null), /No SQL function/)
+  assert.match(attributionClause([row], null, []), /No SQL function on this database calls http_post/)
+})
+
+t('the gateway error code is carried when present, and never invented when absent', () => {
+  const withCode = attributionClause([{ status: '404', sb_error_code: 'NOT_FOUND', candidate_count: 1, candidates: 'j -> /functions/v1/x', n: 1 }])
+  assert.match(withCode, /404 NOT_FOUND/)
+  const without = attributionClause([{ status: 'no-response', sb_error_code: null, candidate_count: 1, candidates: 'j -> /functions/v1/x', n: 1 }])
+  assert.match(without, /1 × no-response\)/)
+  assert.doesNotMatch(without, /null|undefined/)
+})
+
+t('SAFETY: the response BODY is never selected — only the gateway status enum', () => {
+  // net._http_response.content is whatever our own edge functions returned. These findings
+  // are emailed and printed into a public run log. sb-error-code is a short fixed gateway
+  // enum; the body is not, and "it is only an error message" is how user data leaks.
+  const src = readFileSync(new URL('../scripts/check-cron-heartbeats.mjs', import.meta.url), 'utf8')
+  assert.doesNotMatch(src, /\br\.content\b/)
+  assert.doesNotMatch(src, /\bas\s+content\b/)
+  assert.match(src, /headers->>'sb-error-code'/)
+})
+
+t('SAFETY: the non-cron dispatcher lookup takes the route out of the definition, never the definition', () => {
+  // public.handle_send_email carries a bearer token as a literal in its body — read on
+  // production 2026-09-02. Same rule, same reason, as the cron command ratchet above.
+  const src = readFileSync(new URL('../scripts/check-cron-heartbeats.mjs', import.meta.url), 'utf8')
+  const at = src.indexOf('const NON_CRON_DISPATCHER_SQL')
+  const sql = src.slice(at, src.indexOf('`', src.indexOf('`', at) + 1) + 1)
+  assert.match(sql, /substring\(pg_get_functiondef\(p\.oid\) from '\/functions\/v1\//)
+  for (const m of sql.matchAll(/pg_get_functiondef\(p\.oid\)/g)) {
+    const around = sql.slice(Math.max(0, m.index - 40), m.index + 60)
+    assert.ok(/substring\(|ilike/.test(around), `function body exposed raw near: ${around}`)
+  }
+})
+
+t('DEFECT: the REFUSED headline states the refused statuses, not every status in the window', () => {
+  // Run 33657359918: "1 of 194 HTTP calls were REFUSED (status 404, 500, no-response)".
+  // One call, three statuses — because bad_codes spans every non-2xx call. The 500 and the
+  // no-response were two other calls, and one of them was the finding that mattered.
+  const v = httpDeliveryVerdict({
+    stats: { calls: 194, ok: 191, bad: 3, refused: 1, bad_codes: '404, 500, no-response', refused_codes: '404' },
+    queryError: null,
+    httpPostJobs: [{ jobname: 'signal-sweep-5min', schedule: '2-59/5 * * * *' }],
+  })
+  assert.match(v.detail, /REFUSED \(status 404\)/)
+  assert.doesNotMatch(v.detail, /REFUSED \(status 404, 500/)
+})
+
+t('DEFECT: the fleet-pager warning fires only when the pager is actually named', () => {
+  // It used to be printed on every refusal. On run 33657359918 it rode along with a 404 no
+  // cron job made, telling the reader the pager was down. It was not.
+  const notNamed = httpDeliveryVerdict({
+    stats: { calls: 194, ok: 193, bad: 1, refused: 1, refused_codes: '404' }, queryError: null,
+    httpPostJobs: [{ jobname: 'signal-sweep-5min', schedule: '2-59/5 * * * *' }],
+    attribution: [{ status: '404', sb_error_code: 'NOT_FOUND', candidate_count: 0, candidates: '', nearest_job: 'signal-sweep-5min', nearest_gap_s: 45.2, n: 1 }],
+  })
+  assert.equal(notNamed.verdict, 'dead')
+  assert.doesNotMatch(notNamed.detail, /fleet pager is not delivering/)
+
+  const named = httpDeliveryVerdict({
+    stats: { calls: 194, ok: 193, bad: 1, refused: 1, refused_codes: '401' }, queryError: null,
+    httpPostJobs: [{ jobname: 'signal-sweep-5min', schedule: '2-59/5 * * * *' }],
+    attribution: [{ status: '401', candidate_count: 1, candidates: 'signal-sweep-5min -> https://x/functions/v1/signal-intake', n: 1 }],
+  })
+  assert.match(named.detail, /signal-sweep-5min IS among them, so the fleet pager is not delivering/)
+})
+
+t('THE WIRING: the shipped script runs the dispatcher lookup, and only when there is a failure', () => {
+  const src = readFileSync(new URL('../scripts/check-cron-heartbeats.mjs', import.meta.url), 'utf8')
+  const guard = src.indexOf('if (stats && Number(stats.bad) > 0) {')
+  const close = src.indexOf('    const delivery = httpDeliveryVerdict', guard)
+  assert.ok(guard > 0 && close > guard)
+  assert.ok(src.slice(guard, close).includes('await query(ref, pat, NON_CRON_DISPATCHER_SQL)'),
+    'the dispatcher lookup must live inside the has-a-failure guard')
+  assert.match(src, /attributionClause\(attribution, attributionError, dispatchers\)/)
 })
 
 console.log(`\n${n} assertions passed.`)
