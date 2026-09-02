@@ -48,6 +48,13 @@ jobs:
       # the gate — the same shape of miss as the feed inventory that lost the "products down" tile.
       # `set -e` plus the explicit exit code means one red suite fails the job.
       - name: Run every unit suite
+        # READ-ONLY healthchecks keys, so a suite that guards the monitoring can actually read it
+        # here instead of skipping. test/a-retired-job-stays-quiet.test.mjs is the first: without
+        # this it prints "SKIPPED — ZERO checks were made" and the step still says PASS, which is
+        # the exact shape of green this repo exists to catch. The keys are `hcr_` read-only, the
+        # same ones scripts/check-healthchecks-down.mjs uses; nothing here can pause or ping a check.
+        env:
+          HEALTHCHECKS_API_KEYS: ${{ secrets.HEALTHCHECKS_API_KEYS }}
         run: |
           set -e
           failed=0
