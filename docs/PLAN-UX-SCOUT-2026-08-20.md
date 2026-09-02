@@ -542,3 +542,52 @@ Four separate times today the same shape appeared, three of them in my own work:
 4. The Gate A rollout is fixing the same two defects once per product instead of once in the template.
 
 **Fixing instances is not fixing a class.** The durable move is always the one that makes the next instance impossible.
+
+---
+
+## 2026-09-02 — the Kimi write root: the scout's narration would have died the day the engine switched
+
+The one model call this tool makes is `narrate()`, and since 2026-08-30 it no longer spawns
+`claude` itself: it goes through `Cockpit/scripts/agent-run.mjs`, the single launcher that reads
+the cockpit's engine switch (`docs/CONTRACT-agent-run-2026-08-30.md`). On the **Kimi** side that
+launcher builds `KIMI_JOB_WRITE_ROOTS` from the `--add-dir` values the caller passes, and it
+**refuses a Kimi launch that passes none** — an agent whose write boundary is unset is exactly the
+thing the switch exists to never start.
+
+So on 2026-08-31 the narration spawn was given one (commit `1949082`):
+
+```
+'--add-dir', 'C:/Business/_ux-scout/kimi-workspace'
+```
+
+A dedicated, deliberately **empty** directory, never `UX_SCOUT_HOME` itself — that holds
+`ux-scout.log`, `fatal.txt` and the dismissal digests, and handing a Kimi agent write access to
+this tool's own records would be a worse boundary than none. The narration writes nothing at all;
+the root exists only because the guard requires one.
+
+**What was wrong with that.** Nothing on the machine ever created the directory, and `agent-run`
+refuses a write root that does not exist just as firmly as a missing one. The scout runs weekly on
+a GREEN board and its narration failure degrades to "narration unavailable" rather than an alarm —
+so the first Monday after Roger put the engine on Kimi, the run would have quietly lost the one
+part of it a human reads, and nothing would have said why. Fixed the same night by `1e53d20`, an
+idempotent `mkdirSync(..., { recursive: true })` immediately before the spawn.
+
+**Why there is now a test (`test/ux-scout.test.mjs`, 2026-09-02).** The fix left the two paths as
+two string literals five lines apart, and drifting is the entire defect — a later edit that moves
+the workspace, or drops the `mkdirSync` as "dead code", reproduces it exactly and no reader would
+notice. Four assertions pin the **relationship**, not the value:
+
+- the spawn still declares an `--add-dir` at all (without one the job cannot move to Kimi);
+- the path it declares is among the paths `mkdirSync` creates;
+- the creation sits **before** the spawn that is told to write there;
+- the root is a dedicated subdirectory, never the state dir.
+
+They read the source off disk rather than calling `narrate()`, which would spawn the real CLI.
+Proven to catch the defect and not merely to pass: the same expressions run against
+`git show 1949082:scripts/ux-scout.mjs` find the `--add-dir` literal and **zero** `mkdirSync`
+literals, so the suite would have been red on the broken commit.
+
+**Still true and deliberate:** the `UX-Scout-LocalRunner` scheduled task is **Disabled** on this
+machine (last run 2026-08-24, result 0). That is the documented kill switch from
+`scripts/setup-ux-scout-task.ps1`, not a fault — but it does mean the write-root fix has not yet
+been exercised by a real weekly run, which is why the pin above is a test and not a log line.
