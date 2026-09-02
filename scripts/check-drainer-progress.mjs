@@ -68,6 +68,16 @@
  * because the write still goes to `monitoring_incidents`, whose `source` CHECK accepts only six
  * values. Everything else is logged as HELD BACK and dropped before `considered` is taken.
  *
+ * -- THAT FILTER WAS REMOVED THE SAME DAY (2026-09-02) ----------------------------------------
+ *
+ * The paragraph above is kept because it is the history of this assertion, not because it is still
+ * true. `readBoard()` now filters on `workableFinding`, a DENY list of rows that are not findings
+ * (the work board itself, the drainer's own heartbeat, drills, delivery receipts) — the write-target
+ * constraint stopped applying on 2026-09-01 when migration 142 made `upsert_incident` an adapter
+ * onto `upsert_signal`. Out-of-reach therefore drops to the non-finding sources only, which is the
+ * true statement; the assertion is UNCHANGED and still recomputes the population itself, so it goes
+ * red again the moment a filter of any shape starts hiding findings.
+ *
  * Measured live 2026-09-02 20:04Z:
  *
  *     active signals on the board (open/acknowledged)   42
@@ -84,7 +94,7 @@
  * THE RULE THIS FILE NOW ENFORCES: the denominator is the BOARD, and the numerator is everything
  * NOBODY IS WORKING — parked (tried, abandoned) plus out-of-reach-and-unowned (never tried, and
  * not attached to a work item either). Both halves are read here, from the board, not taken from
- * the drainer's summary of itself. `writableToIncidentBoard` is IMPORTED from the drainer rather
+ * the drainer's summary of itself. `workableFinding` is IMPORTED from the drainer rather
  * than copied, so the reach test cannot drift away from the filter it is testing; if that module
  * fails to load the alarm throws, and a throw here is already "could not tell", never "fine".
  *
@@ -104,7 +114,7 @@
  * Exit 0 = healthy or alarm filed successfully. Exit 1 = could not tell, which is never "fine".
  */
 import { readFileSync } from 'fs'
-import { writableToIncidentBoard } from './board-drainer.mjs'
+import { workableFinding, NOT_A_FINDING_SOURCES } from './board-drainer.mjs'
 
 const BO_REF = 'xoecpzfsskalvjrtcbbl'
 const BO_BASE = `https://${BO_REF}.supabase.co`
@@ -135,27 +145,34 @@ function readBoSecret() {
 const minsSince = (iso, now) => (iso ? Math.round((now - new Date(iso).getTime()) / 60000) : null)
 
 /** Sources whose rows are not findings to be fixed and must never be counted as abandoned:
- *  `work-board` rows ARE the work board (a person already has them by definition), and
- *  `board-drainer` rows are this machinery's own heartbeat and this very alarm. Counting either
- *  would make the alarm louder by measuring itself. */
-const NOT_A_FINDING = new Set(['work-board', 'board-drainer'])
+ *  `work-board` rows ARE the work board (a person already has them by definition), `board-drainer`
+ *  rows are this machinery's own heartbeat and this very alarm — counting either would make the
+ *  alarm louder by measuring itself — and drills and delivery receipts are not faults.
+ *
+ *  IMPORTED, not copied, since 2026-09-02, and it is the same set the drainer filters on. Two
+ *  hand-kept lists is how the numerator and the denominator came to disagree in the first place.
+ *  It does NOT make the reach assertion below vacuous: that assertion compares the drainer's
+ *  actual filter FUNCTION against this population, so it fires the moment `workableFinding` starts
+ *  refusing rows for any reason other than this list — which is exactly the defect it caught. */
+const NOT_A_FINDING = NOT_A_FINDING_SOURCES
 
 /**
  * Turn the raw active board into the two numbers the verdict needs, and nothing else.
  *
  * Pure so it can be fault-injected: every case in the test file hands it rows it never saw live.
  *
- * `outOfReach` is the population the drainer's own `readBoard()` throws away — sources
+ * `outOfReach` is the population the drainer's own `readBoard()` throws away — since 2026-09-02
+ * that is the DENY list of non-finding sources, and before it was every source
  * `monitoring_incidents` would reject — MINUS the rows that already have a person: anything whose
  * source is the work board itself, and anything carrying `detail.work_item`, which is the pointer
  * the drainer writes when it hands a finding over. What remains is findings that no machine will
  * ever classify and no human has been given. That is the quietest failure on this page.
  */
-export function summariseBoard(rows) {
+export function summariseBoard(rows, { isWorkable = workableFinding } = {}) {
   const active = Array.isArray(rows) ? rows : []
   const findings = active.filter((r) => !NOT_A_FINDING.has(r.source))
-  const inReach = findings.filter((r) => writableToIncidentBoard(r))
-  const outOfReach = findings.filter((r) => !writableToIncidentBoard(r) && !r?.detail?.work_item)
+  const inReach = findings.filter((r) => isWorkable(r))
+  const outOfReach = findings.filter((r) => !isWorkable(r) && !r?.detail?.work_item)
   const parkedPublished = active.filter((r) => r?.detail?.parked === true)
   const nameOf = (r) => `${r.source}/${r.key}`
   return {

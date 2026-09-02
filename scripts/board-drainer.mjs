@@ -7,8 +7,10 @@
  * NONE reads the aggregated Monitoring Board. This runner does: it reads `fleet_signals` (BO
  * Supabase — the single store, since Plan A step 1 on 2026-08-27; it read `monitoring_incidents`
  * before that and could not see four active problems), works the owner=Claude items an autonomous
- * dev session may safely fix, escalates the rest, and writes the result back to
- * `monitoring_incidents` — so the board drains to zero without Roger in the loop.
+ * dev session may safely fix, escalates the rest, and writes the result back through
+ * `upsert_incident` — which since migration 142 (live on production 2026-09-01) is a thin adapter
+ * onto `upsert_signal` and writes `fleet_signals`, not the retired store — so the board drains to
+ * zero without Roger in the loop.
  *
  * Reuses the existing primitives (agent-triage.mjs's headless-Claude dispatch, Tier-B policy,
  * allowedTools allowlist, dedup-state, local-first, upsert_incident writer) — nothing rebuilt.
@@ -302,9 +304,12 @@ async function writeRunHeartbeat(secret) {
  * healthchecks/kb-learning-phase0, kb-learning-backfill, knowledge-apply-loop and
  * kb-learning-loop, every one of them "Scheduled job stopped running".
  *
- * THE WRITE DOES NOT MOVE. This is deliberately a read-only cutover: results still go to
- * `monitoring_incidents` through upsert_incident, and the mirror trigger carries them back into
- * fleet_signals. Step 2 of the plan dual-writes for a week before anything is retired.
+ * THE WRITE HAS SINCE MOVED TOO. This began as a read-only cutover, with results still going to
+ * `monitoring_incidents` through upsert_incident and the mirror carrying them back. Migration 142
+ * finished the move on 2026-09-01: `upsert_incident` is now an adapter onto `upsert_signal`, the
+ * mirror is disabled and writing the retired store is refused outright (migration 156). Read and
+ * write are both `fleet_signals`. The dual-write week in the original plan was dropped — see
+ * PLAN-ONE-STORE-2026-08-27.md §3 for why it would have proved nothing.
  *
  * ORDER. `first_seen_at asc` preserves the oldest-first queue the old `opened_at asc` gave, so
  * the per-run cap keeps taking the head of the same queue.
@@ -366,18 +371,76 @@ export function signalToIncident(sig) {
 }
 
 /**
- * monitoring_incidents.source CHECK, read back from BOTH live databases 2026-08-27:
- *   healthchecks | sentry | production-monitor | cron | silent-failure | commit-review
- * `fleet_signals` has NO such constraint and has carried `__drill__` and `board-drainer` rows.
+ * WHICH SIGNALS THE AUTO-FIXER MAY WORK — and why this is a DENY list, not an allow list.
  *
- * Since the WRITE still goes to monitoring_incidents (this step moves the read only), a signal
- * whose source that table rejects cannot be worked: upsertIncident would take a 400 and throw,
- * which is the exact fail-open class documented at isScoutDerived() above. So it is held back —
- * and NAMED in the log every single run, because a work item nobody can see is how this whole
- * defect started. Plan A step 2 (write to both stores) is what removes this limit.
+ * -- WHAT WAS HERE, AND WHY IT WAS WRONG -----------------------------------------------------
+ *
+ * Until 2026-09-02 this was an ALLOW list of the six values `monitoring_incidents.source` accepts
+ * (healthchecks | sentry | production-monitor | cron | silent-failure | commit-review), because
+ * the drainer's write-back went to that table and a rejected source would 400 and throw the item
+ * out of its own run. That reason expired on 2026-09-01, when migration 142 went live on
+ * production: `upsert_incident` no longer mentions `monitoring_incidents` at ALL — it is a thin
+ * adapter onto `upsert_signal`, and `fleet_signals` has no source CHECK of any kind.
+ *
+ * Proved rather than read, on BackOffice staging 2026-09-02:
+ *   insert into monitoring_incidents (source='monitoring-hygiene')  -> ERROR 23514, still refused
+ *   select upsert_incident('monitoring-hygiene', ...)               -> HTTP 201, row lands OPEN
+ *                                                                      in fleet_signals
+ * and on production `pg_get_functiondef(upsert_incident)` contains `upsert_signal` and does not
+ * contain `monitoring_incidents`.
+ *
+ * So the guard was holding work back to avoid an error that can no longer happen. Measured on
+ * production the moment before it was removed: **12 of 25 active signals (48%) were being dropped
+ * here**, before `considered` was taken — seven `monitoring-hygiene` faults in the monitoring
+ * system itself, the drainer's own stall alarm, an `external-tools-freshness` staleness alarm and
+ * three `work-board` rows. Nothing ever tried them and no count noticed, because a population
+ * defined by what the tool can write is not the population that exists.
+ *
+ * -- WHY DENY AND NEVER ALLOW ------------------------------------------------------------------
+ *
+ * An allow list makes a NEW source invisible by default: a producer added next month is silently
+ * outside the queue until somebody remembers this constant. That is the exact defect above, and it
+ * would come back the same way. A deny list fails the other way — an unrecognised source is WORKED
+ * (or at worst classified and handed to a person), which is loud.
+ *
+ * -- WHAT IS DENIED, EACH FOR ITS OWN REASON ---------------------------------------------------
+ *
+ * These are not "sources we cannot write". They are rows that are not FINDINGS:
+ *
+ *   work-board      the rows ARE the work board. A person already has them by definition, and
+ *                   routing one would mint a second work item for the item it came from.
+ *   board-drainer   this machinery's own heartbeat and its own stall alarm. Working it would make
+ *                   the fixer measure and dispatch against itself.
+ *                   (Both of the above match `NOT_A_FINDING` in check-drainer-progress.mjs, which
+ *                   reached the same two names independently on 2026-09-02.)
+ *   test, probe,    synthetic. Migration 159 dispositioned all three as "exercise the pipe, not a
+ *   wrapper,        fault"; `__drill__` and `__migration_probe__` are the fleet's drill identities.
+ *   __drill__,      A drill that dispatches a real agent is not a drill.
+ *   __migration_probe__
+ *   report,         deliveries and delivery bookkeeping — migration 159's own words: "a report IS
+ *   closer-digest,  a delivery". There is nothing to fix in the record that something was sent.
+ *   notification-closer, notification-hc-up, notification-report
+ *
+ * Everything else is a finding, INCLUDING sources this list has never seen. `scout-ux` is deliberately
+ * absent: it is refused structurally by isScoutDerived() above, which also catches a scout-derived
+ * row filed under any other source, and one guard removed must not quietly disarm the other.
  */
-const INCIDENT_BOARD_SOURCES = new Set(['healthchecks', 'sentry', 'production-monitor', 'cron', 'silent-failure', 'commit-review'])
-export function writableToIncidentBoard(inc) { return INCIDENT_BOARD_SOURCES.has(inc?.source) }
+export const NOT_A_FINDING_SOURCES = new Set([
+  'work-board', 'board-drainer',
+  'test', 'probe', 'wrapper', '__drill__', '__migration_probe__',
+  'report', 'closer-digest', 'notification-closer', 'notification-hc-up', 'notification-report',
+])
+
+/** True when this row is a finding the auto-fixer may take on. A row with NO source is denied:
+ *  every producer sets one, so an absent source is a malformed row, not a new kind of work. */
+export function workableFinding(inc) {
+  const source = inc?.source
+  return typeof source === 'string' && source.length > 0 && !NOT_A_FINDING_SOURCES.has(source)
+}
+
+/** @deprecated Kept ONLY so an out-of-tree caller does not break silently. The name is a lie since
+ *  migration 142 — nothing is written to the incident board any more. Use workableFinding. */
+export const writableToIncidentBoard = workableFinding
 
 async function readBoard(secret) {
   const res = await fetch(boardQueryUrl(), {
@@ -385,11 +448,11 @@ async function readBoard(secret) {
   })
   if (!res.ok) throw new Error(`board read HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`)
   const rows = (await res.json()).map(signalToIncident)
-  const held = rows.filter((r) => !writableToIncidentBoard(r))
+  const held = rows.filter((r) => !workableFinding(r))
   if (held.length) {
-    log(`  ${held.length} active signal(s) HELD BACK — monitoring_incidents (still the write target) rejects their source, so working them would 400: ${held.map((r) => `${r.source}/${r.key}`).join(', ')}`)
+    log(`  ${held.length} active signal(s) are not findings (the work board itself, the drainer's own heartbeat, drills and delivery receipts) — not worked, by decision, not by a constraint: ${held.map((r) => `${r.source}/${r.key}`).join(', ')}`)
   }
-  return rows.filter(writableToIncidentBoard)
+  return rows.filter(workableFinding)
 }
 
 /** The ONLY manual control over an otherwise fully automatic queue.
@@ -438,10 +501,11 @@ async function fetchWithTransportRetry(url, init) {
   }
 }
 
-/** monitoring_incidents.source CHECK allows ONLY
- *  healthchecks | sentry | production-monitor | cron | silent-failure.
- *  A scout-derived item carries source='scout-ux', which the constraint REJECTS with a 400,
- *  and upsertIncident throws on a non-ok response. Incident
+/** HISTORICALLY this guard rode on the monitoring_incidents.source CHECK (healthchecks | sentry |
+ *  production-monitor | cron | silent-failure), which REJECTED source='scout-ux' with a 400 and
+ *  made upsertIncident throw. That CHECK is no longer in the write path (migration 142), so the
+ *  400 is gone — and this guard is KEPT anyway, because the constraint was never the reason.
+ *  What follows is what the 400 cost us when it was the only thing holding the line. Incident
  *  production-monitor:e9c8e44:scout-ux-source-violates-incident-check-constraint (2026-08-20)
  *  traced the consequence: the throw escapes the per-item loop, main() aborts BEFORE
  *  markScoutReport(), worked_at is never set, readScoutQueue() filters on worked_at is null,
@@ -961,12 +1025,12 @@ function classify(inc) {
  * right, and is why this is not a mute. The work item is minted once and only once (see
  * workItemSlugFor), so a row that flaps produces one task, not one per flap.
  *
- * WHAT DELIBERATELY DOES NOT HAPPEN: the incident row in `monitoring_incidents` is NOT rewritten.
- * Writing it fires the mirror trigger (134_mirror_carries_status_and_owner.sql), which maps
- * `blocked` back to `open` and would un-supersede the signal on the same tick. The only honest
- * statuses that mirror to resolved are fixed / self-healed / expected, and this item is none of
- * the three. A status meaning "handed to a human queue" is a schema change in BackOffice, which
- * this session does not own — it is written up as the one change needed there.
+ * WHAT DELIBERATELY DOES NOT HAPPEN: the row is NOT re-written through `upsert_incident`. That
+ * adapter maps `blocked` back to state `open` (migration 142's CASE, the mirror's mapping before
+ * it), so the write would un-supersede the signal on the same tick. The only statuses that map to
+ * resolved are fixed / self-healed / expected, and this item is none of the three. A status
+ * meaning "handed to a human queue" is a schema change in BackOffice, which this session does not
+ * own — it is written up as the one change needed there.
  */
 const HANDOFF_ENABLED = process.env.BOARD_DRAINER_HANDOFF !== '0'
 
