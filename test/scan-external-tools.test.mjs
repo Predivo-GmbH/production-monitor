@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   classify, indexFingerprints, indexHints, normalizeName, matchByHint, isReportable, isReportableHostname,
-  orphanBlockers,
+  orphanBlockers, clearedFindings, findingRepos,
 } from '../scripts/scan-external-tools.mjs'
 
 // Tests for the pure half of the external-tools discovery scan.
@@ -172,4 +172,56 @@ test('the exact 2026-08-31 false alarm cannot be filed again', () => {
   // ...and on a complete checkout the scan regains its opinion.
   const complete = new Set([...hostWithoutThem, 'arivioo', 'pull-engine'])
   for (const repos of Object.values(prior)) assert.deepEqual(orphanBlockers(repos, complete), [])
+})
+
+// ── recovery: the half the scanner did not have until 2026-09-02 ────────────────────────────
+// Three findings (BOARD_URL, BOARD_KEY, ALERT_EMAIL — our own board and our own alert address)
+// sat `confirmed` on the External Tools page with three `open` rows on /signals, and nothing in
+// this file could ever take them back. Registering or ignoring a token is the DESIGNED remedy and
+// it closed nothing. These lock the recovery in, including the case where it must REFUSE to.
+
+const openFinding = (over) => ({
+  id: 'x', kind: 'unregistered', fingerprint: 'BOARD_URL', state: 'confirmed', seen_count: 2,
+  evidence: { kind: 'gha_secret', paths: ['Cockpit/.github/workflows/morning-report.yml'] }, ...over,
+})
+
+test('a token that is no longer unrecognised clears its finding', () => {
+  const cleared = clearedFindings([openFinding()], [], new Set(), new Set(['Cockpit', 'production-monitor']))
+  assert.deepEqual(cleared.map((f) => f.fingerprint), ['BOARD_URL'])
+})
+
+test('a token still unrecognised this run is NOT cleared', () => {
+  const cleared = clearedFindings([openFinding()], [{ pattern: 'BOARD_URL' }], new Set(), new Set(['Cockpit']))
+  assert.deepEqual(cleared, [])
+})
+
+test('a finding is never cleared by a run that did not walk its repo', () => {
+  // The 2026-08-31 orphan false alarm, re-run against the recovery path: a host without the repo
+  // would otherwise "fix" every finding in it just by not looking. Absence is only evidence when
+  // you looked where the thing was.
+  const cleared = clearedFindings([openFinding()], [], new Set(), new Set(['production-monitor']))
+  assert.deepEqual(cleared, [], 'Cockpit was not scanned, so this run has no opinion about it')
+})
+
+test('a finding that remembers no repo is never cleared', () => {
+  const cleared = clearedFindings([openFinding({ evidence: {} })], [], new Set(), new Set(['Cockpit']))
+  assert.deepEqual(cleared, [], '"I cannot tell where it was" is not "it is gone"')
+})
+
+test('a resolved or ignored finding is left exactly where a human put it', () => {
+  for (const state of ['resolved', 'ignored']) {
+    assert.deepEqual(clearedFindings([openFinding({ state })], [], new Set(), new Set(['Cockpit'])), [])
+  }
+})
+
+test('an orphaned tool referenced again is cleared, and one still absent is not', () => {
+  const orphan = { id: 'o', kind: 'orphaned', fingerprint: 'Zyte', api_entry_id: 'tool-zyte', state: 'confirmed', evidence: {} }
+  assert.deepEqual(clearedFindings([orphan], [], new Set(['tool-zyte']), new Set()).map((f) => f.fingerprint), ['Zyte'])
+  assert.deepEqual(clearedFindings([orphan], [], new Set(), new Set()), [])
+})
+
+test('findingRepos reads the repo out of a "<repo>/<path>" evidence line', () => {
+  assert.deepEqual(findingRepos({ evidence: { paths: ['Cockpit/.github/workflows/a.yml', 'Cockpit/b.yml', 'replyflow/c.yml'] } }),
+    ['Cockpit', 'replyflow'])
+  assert.deepEqual(findingRepos({}), [])
 })
