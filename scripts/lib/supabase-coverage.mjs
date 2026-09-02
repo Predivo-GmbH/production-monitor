@@ -86,6 +86,11 @@ export function coverageLine(gaps, baseline, verb = 'read') {
  * JASSTOUR_SERVICE_ROLE_KEY and talks to the project directly) still demand it. A project
  * unreachable by every route would show up as a gap in all of them, which is correct.
  *
+ * CLOSED 2026-09-02, and the mechanism stays. That account's PAT is now the repo secret
+ * SUPABASE_TOKEN_JASSTOUR, the flag is off Beize Jass Tour, and NO project carries it today —
+ * so everything above is the reason this exists, not a description of the fleet's current state.
+ * The next project bought under a new account will need it again.
+ *
  * Pure, and deliberately not defaulted to `true` in the file: an entry with no flag is
  * reachable, so this stays a narrow exception someone had to write down on purpose.
  */
