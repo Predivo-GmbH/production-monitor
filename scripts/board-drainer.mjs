@@ -338,6 +338,13 @@ export function signalToIncident(sig) {
     // while its own evidence field said the fix was written and never deployed. See
     // expectedBusinessApplies().
     action_taken: detail.actionTaken ?? null,
+    // WHICH LIVE JOB THIS FINDING IS ALREADY ATTACHED TO, if any. Carried through since 2026-09-02,
+    // when a joined signal stopped being superseded and started staying visible on /signals until a
+    // person ticks it off (Roger's decision, 2026-08-28). That change means the drainer SEES the
+    // same signal again every 20 minutes, so without this field it would bolt another identical
+    // marker onto the item on every run - a marker flood in place of a mute. Attaching twice must
+    // be a no-op, and this is what makes it one.
+    joined_to: detail.work_item ?? null,
   }
 }
 
@@ -1352,6 +1359,14 @@ export async function routeToWorkBoard(inc, cls, deps) {
     const join = findJoinTarget(inc, liveItems)
     if (join && join.item && !join.ambiguous) {
       deps.log?.(`    joining live in-progress item "${join.item.slug}" (tier ${join.tier}: ${join.evidence}) — attaching as evidence, minting NO row and NOT touching its owner`)
+      // ALREADY ATTACHED TO THIS EXACT JOB: say nothing more. Since a joined signal now stays in the
+      // active band rather than being superseded, this code path runs again every 20 minutes for as
+      // long as the finding is open, and re-attaching would put an identical marker on the item on
+      // every run. The whole value of the marker is that the working session reads it once.
+      if (inc.joined_to === join.item.slug) {
+        deps.log?.('    already attached to that item on an earlier run — leaving it alone')
+        return { created: false, joined: true, slug: join.item.slug, title: join.item.title, tier: join.tier, marked: false, alreadyAttached: true, objections: [], reason: `already attached to a live in-progress item (${join.evidence})` }
+      }
       if (join.item.id) {
         await deps.addEvidence(join.item.id, {
           kind: 'note',
@@ -1360,8 +1375,22 @@ export async function routeToWorkBoard(inc, cls, deps) {
           verified: false,
         })
       }
-      const superseded = await deps.supersedeSignal(inc, join.item.slug)
-      return { created: false, joined: true, slug: join.item.slug, title: join.item.title, tier: join.tier, superseded, objections: [], reason: `joined a live in-progress item (${join.evidence})` }
+      // QUIET, BUT STILL VISIBLE — Roger's decision, 2026-08-28, taken with the cost stated.
+      //
+      // This line used to call supersedeSignal, so ATTACHING was what muted the finding: state went
+      // to 'superseded' and the signal dropped out of the `state=in.(open,acknowledged)` band every
+      // board surface reads. From then on it lived only inside the item's evidence trail, and if the
+      // owning session never read that trail and closed the job, a one-off observation was gone -
+      // only a repeating check would ever bring it back. He was told exactly that and chose the
+      // option that keeps it on /signals until a PERSON marks it handled.
+      //
+      // 'acknowledged', not 'open': it is in the active band, so it is still on the page, but it
+      // reads as known and in hand rather than new and unclaimed. The page is suppressed the same
+      // way superseding did it (pageFieldsOnSupersede), so nobody is woken - the whole point of the
+      // join is that the work is already being done. Visible and silent are different properties,
+      // and this is the line where they were being confused.
+      const marked = await deps.markSignalJoined(inc, join.item.slug)
+      return { created: false, joined: true, slug: join.item.slug, title: join.item.title, tier: join.tier, marked, objections: [], reason: `joined a live in-progress item (${join.evidence})` }
     }
     if (join && join.ambiguous) {
       deps.log?.(`    ${join.count} live in-progress items match at tier ${join.tier} — too ambiguous to join safely, opening a row instead`)
@@ -1497,6 +1526,55 @@ export function workBoardDeps(secret, base = BO_BASE) {
         }),
       })
       if (!res.ok) throw new Error(`signal supersede HTTP ${res.status}: ${(await res.text()).slice(0, 160)}`)
+      return true
+    },
+
+    /**
+     * ATTACHED TO A LIVE JOB, AND STILL ON THE PAGE. Roger's decision, 2026-08-28: "attach it to the
+     * job as it does now, but the signal stays open on /signals until a person marks it handled."
+     *
+     * The difference from supersedeSignal, and it is the only difference: `acknowledged` instead of
+     * `superseded`, and no resolved_at. Every board surface reads
+     * `state=in.(open,acknowledged)`, so an acknowledged signal is still THERE - it simply reads as
+     * known and in hand rather than new and unclaimed. Superseding removed it from that band, which
+     * is why attaching used to be what muted the finding.
+     *
+     * IT STILL DOES NOT PAGE. The page fields are computed by exactly the same helper the supersede
+     * path uses, so an undelivered page stays armed on its original schedule and a delivered one
+     * stays cancelled. Nobody is woken because the work is already being done - that was never the
+     * part in question. Visible and silent are different properties.
+     *
+     * IDEMPOTENT. Two drainer runs that both attach the same finding to the same item write the
+     * same row twice and change nothing: the state is already `acknowledged`, `work_item` is
+     * already this slug, and `joined_at` is only stamped when it is not already set, so re-running
+     * does not keep moving the clock on how long this has been sitting there.
+     */
+    async markSignalJoined(inc, slug) {
+      const filter = `source=eq.${encodeURIComponent(inc.source)}&key=eq.${encodeURIComponent(inc.key)}`
+      const cur = await fetch(`${base}/rest/v1/fleet_signals?select=id,state,detail,page_due_at,paged_at&${filter}`, { headers: H })
+      if (!cur.ok) throw new Error(`signal read HTTP ${cur.status}`)
+      const rows = await cur.json()
+      if (!rows.length) { log(`    signal ${inc.source}/${inc.key} not found — nothing to mark as joined`); return false }
+      const page = pageFieldsOnSupersede(rows[0])
+      if (page.kept) log(`    page for ${inc.source}/${inc.key} was still undelivered — LEFT ARMED, joining does not silence it`)
+      const detail = rows[0].detail || {}
+      const res = await fetchWithTransportRetry(`${base}/rest/v1/fleet_signals?${filter}`, {
+        method: 'PATCH', headers: { ...H, Prefer: 'return=minimal' },
+        body: JSON.stringify({
+          state: 'acknowledged',
+          page_due_at: page.page_due_at,
+          page_suppressed_reason: page.page_suppressed_reason,
+          detail: {
+            ...detail,
+            ...parkedFields(null),
+            work_item: slug,
+            joined_at: detail.joined_at || new Date().toISOString(),
+            routed_to_work_board_at: new Date().toISOString(),
+          },
+        }),
+      })
+      if (!res.ok) throw new Error(`signal join HTTP ${res.status}: ${(await res.text()).slice(0, 160)}`)
+      log(`    signal ${inc.source}/${inc.key} marked as attached to "${slug}" — still on /signals until a person ticks it off`)
       return true
     },
   }

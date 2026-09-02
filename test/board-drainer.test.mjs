@@ -978,10 +978,11 @@ const fakeBoard = () => {
   const items = new Map()
   const evidence = []
   const superseded = []
+  const joined = []   // signals ATTACHED to a live job — visible, not muted (Roger 2026-08-28)
   const live = []   // set live.push(anInProgressItem) to make a join target available
   let creates = 0
   return {
-    items, evidence, creates: () => creates, superseded, live,
+    items, evidence, creates: () => creates, superseded, joined, live,
     deps: {
       log() {},
       async findItem(slug) { return items.get(slug) || null },
@@ -989,6 +990,7 @@ const fakeBoard = () => {
       async addEvidence(itemId, ev) { evidence.push({ itemId, ...ev }) },
       async listLiveItems() { return live },
       async supersedeSignal(inc, slug) { superseded.push({ inc, slug }); return true },
+      async markSignalJoined(inc, slug) { joined.push({ inc, slug }); return true },
     },
   }
 }
@@ -1245,7 +1247,61 @@ ta('JOIN (real signal at a real in-progress item): the security signal ATTACHES,
   assert.ok(marker, 'the marker is attached to the LIVE item so the owning session sees it')
   assert.match(marker.title, /machines spotted something/i)
   assert.ok(marker.detail.includes('v_external_tools'), 'and it carries the verbatim finding')
-  assert.deepEqual(board.superseded, [{ inc, slug: 'list-every-external-tool-we-use-and-why' }], 'the signal is superseded onto the item, off the alarm surface')
+  // ROGER'S DECISION, 2026-08-28: attaching must not be what mutes the finding. Until then this
+  // line asserted the opposite — that joining SUPERSEDED the signal, taking it out of the
+  // `state=in.(open,acknowledged)` band every board surface reads. The finding then lived only in
+  // the item's evidence trail, so if the owning session never read that trail and closed the job, a
+  // one-off observation was gone. He was told that cost and chose to keep it visible.
+  assert.deepEqual(board.superseded, [], 'joining must NOT supersede: that is what used to mute it')
+  assert.deepEqual(board.joined, [{ inc, slug: 'list-every-external-tool-we-use-and-why' }],
+    'the signal is marked as attached to the item, and stays on /signals until a person ticks it off')
+})
+
+ta('a JOINED signal is attached ONCE, however many times the drainer sees it again', async () => {
+  // This matters ONLY because the signal now stays visible. While joining superseded the signal it
+  // left the drainer's query after one run, so a second attach was unreachable; now the same
+  // finding comes round every 20 minutes for as long as it is open, and without the guard the item
+  // would collect an identical marker on every single run. The marker is worth having exactly once.
+  const board = fakeBoard()
+  board.live.push(liveExternalTools())
+  const inc = securitySignal()
+  const first = await routeToWorkBoard(inc, classify(inc), board.deps)
+  assert.equal(first.marked, true, 'the first run attaches and marks')
+
+  // Second run, exactly as the drainer would see it: the signal now carries the item it was
+  // attached to (signalToIncident maps detail.work_item -> joined_to).
+  const seenAgain = { ...inc, joined_to: 'list-every-external-tool-we-use-and-why' }
+  const second = await routeToWorkBoard(seenAgain, classify(seenAgain), board.deps)
+  assert.equal(second.joined, true, 'it is still reported as joined, not as new work')
+  assert.equal(second.alreadyAttached, true, 'and it says why it did nothing')
+
+  const markers = board.evidence.filter((e) => /machines spotted something/i.test(e.title))
+  assert.equal(markers.length, 1, 'attaching twice must not put two identical markers on the item')
+  assert.equal(board.creates(), 0, 'and still no row is minted on either run')
+  assert.deepEqual(board.superseded, [], 'and it is never superseded on any run')
+  assert.equal(board.joined.length, 1, 'nor is the signal re-marked once it already carries the item')
+})
+
+t('signalToIncident carries the item a finding is already attached to', () => {
+  const withItem = signalToIncident({ source: 's', key: 'k', detail: { work_item: 'some-live-job' } })
+  assert.equal(withItem.joined_to, 'some-live-job')
+  const without = signalToIncident({ source: 's', key: 'k', detail: {} })
+  assert.equal(without.joined_to, null, 'a signal attached to nothing must not read as attached to something')
+})
+
+ta("a JOINED signal keeps its findings and never lands in Roger's lane", async () => {
+  // Quiet, not gone. The item carries the verbatim finding for the session that is on the job, and
+  // nobody is paged, because the work is already being done. What changed on 2026-08-28 is only
+  // that the SIGNAL is no longer taken off the page by the act of attaching.
+  const board = fakeBoard()
+  board.live.push(liveExternalTools())
+  const inc = securitySignal()
+  const r = await routeToWorkBoard(inc, classify(inc), board.deps)
+  assert.equal(r.marked, true, 'the join path reports that the signal was marked, not superseded')
+  assert.equal(r.superseded, undefined, 'and it no longer reports a supersede at all')
+  const marker = board.evidence.find((e) => e.itemId === 'live-1')
+  assert.ok(marker.detail.includes('v_external_tools'), 'the finding still reaches the working session verbatim')
+  assert.equal(board.items.size, 0, 'no row exists to carry a blocked_owner')
 })
 
 ta('JOIN via TITLE (tier 3): the currency signal folds into the same live item', async () => {
