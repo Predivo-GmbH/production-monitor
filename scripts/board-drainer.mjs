@@ -2071,9 +2071,18 @@ function dispatchAgent(inc, mode) {
     // execFileSync THROWS on a non-zero exit; the code is on err.status. 76 is not an error at
     // all: the cockpit switch is off, so nothing was spawned. Return the sentinel and let the
     // caller stop the run - do NOT fall through to the timeout bookkeeping below.
-    if ((e?.status === SWITCHED_OFF_EXIT || e?.status === NO_CAPACITY)) {
+    if (e?.status === SWITCHED_OFF_EXIT) {
       log('  automations are switched off in the cockpit - no agent dispatched (a deliberate off, not a failure)')
       return AGENT_SWITCHED_OFF
+    }
+    // 77 is NOT 76. Both mean "no agent ran", and until 2026-09-03 both returned the same
+    // sentinel, so an engine OUTAGE was reported to Roger as "you switched the automations
+    // off" - a sentence naming the wrong actor and the wrong remedy. Measured that day: the
+    // switch read runs_enabled=true / emergency_stop=false in the database AND in the local
+    // cache, while the page said the fixer was switched off.
+    if (e?.status === NO_CAPACITY) {
+      log('  both AI engines are out of capacity - no agent dispatched (an outage, not a deliberate off)')
+      return AGENT_NO_CAPACITY
     }
     log(`  agent errored/timed out: ${(e.message || '').split('\n')[0]}`)
     timedOut = true
@@ -2164,7 +2173,12 @@ export function stuckRootCause(inc, attempts, intervalMs = PARKED_RETRY_INTERVAL
  *  chose to say nothing. */
 export const AGENT_TIMED_OUT = Symbol.for('board-drainer.agent-timed-out')
 
-/** Returned by dispatchAgent when agent-run exited 76: Roger has switched the automations off in
+/** Returned by dispatchAgent when agent-run exited 77: both AI engines are usage-capped, so no
+ *  agent could be spawned. Distinct from AGENT_SWITCHED_OFF on purpose - this one is an OUTAGE
+ *  nobody chose, and saying "switched off" about it sends Roger to a switch that is already on. */
+export const AGENT_NO_CAPACITY = Symbol.for('board-drainer.agent-no-capacity')
+
+/** Returned by dispatchAgent when agent-run exited 76 (and ONLY 76): Roger has switched the automations off in
  *  the cockpit. Nothing ran, so this is neither a timeout nor a failed attempt - the run stops
  *  where it is, charges nobody an attempt, alarms nothing, and ends at exit 0. */
 export const AGENT_SWITCHED_OFF = Symbol.for('board-drainer.automations-switched-off')
@@ -2710,7 +2724,7 @@ async function main() {
       // optimistically above (a count must name what actually happened), leave the attempt
       // counters and the board untouched, and stop - the switch is fleet-wide, so the remaining
       // items would only re-learn the same thing.
-      if (verdict === AGENT_SWITCHED_OFF) {
+      if (verdict === AGENT_SWITCHED_OFF || verdict === AGENT_NO_CAPACITY) {
         runStats.dispatched -= 1
         runStats.last_dispatch_at = lastDispatchBefore
         state.lastDispatchAt = lastDispatchBefore
@@ -2718,7 +2732,9 @@ async function main() {
         // check-drainer-progress.mjs reads runStats.skipped and reports it as switched-off
         // rather than as a stalled fixer. Without it, dispatchable>0 with dispatched=0 would
         // read as a red stall - a deliberate off must never look like a failure.
-        runStats.skipped = 'automations switched off in the cockpit (agent-run exit 76)'
+        runStats.skipped = verdict === AGENT_SWITCHED_OFF
+          ? 'automations switched off in the cockpit (agent-run exit 76)'
+          : 'both AI engines are out of capacity, so no agent could run (agent-run exit 77) - an outage, not a deliberate off; the cockpit switch is untouched'
         switchedOff = true
         saveState(state)
         log(`  ${inc.key}: not dispatched - automations are switched off in the cockpit. Nothing recorded; it is picked up when they are switched back on.`)
