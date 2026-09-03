@@ -1,4 +1,8 @@
 import { test, expect } from '@playwright/test';
+// @ts-expect-error — plain-JS libs, shared with the node unit tests that own their rules.
+import { scheduleFreshness, FRESH_FLOOR_HOURS } from '../../scripts/lib/gauntlet-staleness.mjs';
+// @ts-expect-error — see above.
+import { extractCronSchedules, cronPeriodHours } from '../../scripts/lib/cron-cadence.mjs';
 
 /**
  * Nightly-gauntlet health.
@@ -31,6 +35,13 @@ import { test, expect } from '@playwright/test';
  * Defensive by design: only a definitive 'failure'/'timed_out' conclusion alerts. A GitHub
  * API error, no-run-yet (first nightly hasn't fired), an in-progress run, or a 'cancelled'
  * run all SKIP — a transient API blip must never raise a false alarm.
+ *
+ * AND A GREEN RUN IS ONLY EVIDENCE WHILE IT IS RECENT (2026-09-03). "Did the newest scheduled
+ * run fail" answers nothing once there stops being a new one, so a gauntlet that quietly stops
+ * firing used to read as healthy forever. The freshness gate in the green branch below closes
+ * that; the rule lives in scripts/lib/gauntlet-staleness.mjs and is unit-tested separately.
+ * NOTE the older sentence in the SUPERSEDED block — "a stuck cron is itself worth a page" —
+ * described only the failure path when it was written; the green path is what this gate adds.
  *
  * PERSISTENCE GATE (Roger's alerting philosophy, 2026-07-23: "alert only on persistent breakage,
  * transient = noise"). A staging gauntlet can go red for a few minutes on a self-healing blip —
@@ -74,6 +85,63 @@ for (const repo of TIERED_REPOS) {
 
     // Only a definitive failure is a candidate; a green/cancelled latest run is healthy.
     const isFail = ['failure', 'timed_out'].includes(latest.conclusion);
+
+    // IS THAT GREEN RUN STILL SAYING ANYTHING? (2026-09-03.) Until this block existed, the line
+    // below returned "healthy" the instant the newest scheduled run was green, whatever its age
+    // — so a nightly gauntlet that STOPS FIRING reported healthy forever and the whole staging
+    // regression net for this product disappeared without one red. The header above already
+    // claimed a stuck cron was covered ("once >26h elapse ... we page again"); that arithmetic
+    // lived inside the failure branch below and a green run never reached it. Measured the same
+    // morning: three fleet repos had been silent 62 days and were still counted green.
+    // The rule itself lives in scripts/lib/gauntlet-staleness.mjs and is unit-tested there
+    // (test/nightly-gauntlet-staleness.test.mjs) against injected defects; this block only
+    // gathers the facts it judges. Under FRESH_FLOOR_HOURS nothing extra is fetched, so the
+    // normal hourly path costs no additional GitHub calls.
+    if (!isFail) {
+      const startedMs = new Date(latest.run_started_at ?? latest.created_at).getTime();
+      const greenAgeHours = (Date.now() - startedMs) / 3_600_000;
+
+      let archived: boolean | null = null;
+      let yamlRead = false;
+      let cronCount = 0;
+      let periodHours: number | null = null;
+
+      if (greenAgeHours >= FRESH_FLOOR_HOURS) {
+        // An archived repo legitimately stops scheduling; that is retirement, not breakage.
+        const repoRes = await request.get(`https://api.github.com/repos/${repo}`, {
+          headers: { Authorization: `Bearer ${ghToken}`, Accept: 'application/vnd.github.v3+json' },
+        });
+        if (repoRes.ok()) archived = !!(await repoRes.json()).archived;
+
+        const wfRes = await request.get(
+          `https://api.github.com/repos/${repo}/contents/.github/workflows/deploy.yml`,
+          { headers: { Authorization: `Bearer ${ghToken}`, Accept: 'application/vnd.github.v3+json' } },
+        );
+        if (wfRes.ok()) {
+          const yaml = Buffer.from((await wfRes.json()).content ?? '', 'base64').toString('utf-8');
+          yamlRead = true;
+          const crons: string[] = extractCronSchedules(yaml);
+          cronCount = crons.length;
+          // Several crons on one workflow = it fires on the SHORTEST of them; being judged
+          // against the longest would forgive a schedule that had already stopped.
+          const periods = crons.map((c) => cronPeriodHours(c)).filter((p: number | null) => Number.isFinite(p));
+          if (periods.length) periodHours = Math.min(...(periods as number[]));
+        }
+      }
+
+      const f = scheduleFreshness({ ageHours: greenAgeHours, archived, yamlRead, cronCount, periodHours });
+      // Only a stopped schedule pages. RETIRED and UNPROVEN are named out loud and stay quiet —
+      // a GitHub API blip must never red the hourly monitor.
+      test.skip(
+        f.verdict === 'RETIRED' || f.verdict === 'UNPROVEN',
+        `${repo}: latest scheduled gauntlet is green but ${greenAgeHours.toFixed(1)}h old and its freshness is ${f.verdict} — ${f.reason}. Not treated as an alarm.`,
+      );
+      expect(
+        f.verdict,
+        `${repo} NIGHTLY GAUNTLET HAS STOPPED RUNNING — ${f.reason}. Its last scheduled run PASSED, which is why nothing has gone red: this check reports on the newest scheduled run, and there has not been a new one. Nothing has tested ${repo} against live staging since ${new Date(startedMs).toISOString()}. Check whether deploy.yml's schedule was removed, the workflow was disabled, or GitHub disabled it for repository inactivity (${latest.html_url}).`,
+      ).toBe('FRESH');
+    }
+
     test.skip(!isFail, `${repo}: latest scheduled gauntlet is '${latest.conclusion}' — healthy`);
 
     // PERSISTENCE GATE — page only once the failure has outlived the auto-retry self-heal window
