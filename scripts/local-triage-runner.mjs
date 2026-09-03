@@ -91,7 +91,12 @@ function refreshClone() {
   sh(`git fetch origin ${BRANCH}`, { cwd: WORKDIR })
   sh(`git checkout ${BRANCH}`, { cwd: WORKDIR })
   sh(`git reset --hard origin/${BRANCH}`, { cwd: WORKDIR })
-  sh(`git clean -fd`, { cwd: WORKDIR })
+  // -x too: last run's test-results/ (and the other gitignored *-results.json artefacts) are
+  // gitignored, so a plain `git clean -fd` leaves them — and a second `gh run download -n
+  // test-results` onto the surviving test-results/results.json refuses to clobber and fails. -x
+  // makes every triage start from a genuinely pristine tree. Safe: this ephemeral clone carries no
+  // node_modules or .env to lose.
+  sh(`git clean -fdx`, { cwd: WORKDIR })
 }
 
 function triageMonitor(state) {

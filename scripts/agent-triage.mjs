@@ -40,6 +40,11 @@ const OUTPUT_PATH = 'triage-results.json'     // send-alert.mjs reads this
 const MAX_TURNS = 40
 const MODEL = 'claude-opus-4-8'
 const AGENT_TIMEOUT_MS = 10 * 60 * 1000
+// agent-run's Kimi write-root (--add-dir, below) is the one repo the agent may write: this clone.
+// local-triage-runner.mjs launches us with cwd = that clone, so process.cwd() IS it. Was a bare
+// undefined `WORKDIR` — a ReferenceError that aborted before the agent ever launched, so no
+// triage-verdict.json was written and the agenttriage-localrunner dead-man pinged red every run.
+const WORKDIR = process.cwd()
 
 // Project → { spec dir, GitHub repo, deploy branch }. Mirrors auto-fix.resolveProjectDir + flaky-retry.
 const PROJECTS = {
