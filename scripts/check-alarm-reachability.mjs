@@ -54,6 +54,7 @@
  *   Exit 0 = reachable, or unreachable and the alarm was filed. Exit 1 = could not tell.
  */
 import { readFileSync } from 'fs'
+import { sayVerdict, PASS, FAIL, UNKNOWN } from './lib/check-verdict.mjs'
 
 const BO_REF = 'xoecpzfsskalvjrtcbbl'
 const BO_BASE = `https://${BO_REF}.supabase.co`
@@ -191,6 +192,13 @@ async function main() {
   const j = judgeReachability({ signals, policies })
   console.log(`alarm reachability: ${j.verdict} — ${j.summary}`)
   for (const f of j.faults) console.log(`  - ${f.detail}`)
+
+  // Three-valued, out loud (lib/check-verdict.mjs). This check already got the WORDS right -- it
+  // says "unknown" and it says "the board is never empty, so this is a failed read" -- and it
+  // still exited 0 with no machine-readable trace of that, because the house rule is that a filed
+  // alarm exits 0. Correct prose in a log a person is not reading is not a channel. `unknown` is
+  // now declared, so anything downstream can tell "the fleet is fine" from "this sensor is blind".
+  sayVerdict(j.verdict === 'ok' ? PASS : j.verdict === 'unknown' ? UNKNOWN : FAIL, j.summary)
 
   if (dry) { console.log('--dry: nothing written.'); return 0 }
 

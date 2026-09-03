@@ -27,6 +27,7 @@ import { readFileSync, existsSync, writeFileSync } from 'node:fs'
 import { execSync } from 'node:child_process'
 import { join } from 'node:path'
 import { getFleet } from '../lib/fleet.mjs'
+import { sayVerdict, PASS, FAIL, UNKNOWN } from './lib/check-verdict.mjs'
 
 // Fleet from the DB-backed registry (fleet_products) via getFleet(); each product carries `staged`
 // (=staging-gated → §4a applies). Falls back to the identical hardcoded superset on any DB failure, so
@@ -38,12 +39,32 @@ console.log(`pipeline-drift: fleet source = ${FLEET_SOURCE} (${FLEET.length} pro
 const LOCAL_ROOT = process.env.LOCAL_FLEET_ROOT
 
 // CI mode needs a token with read access to the fleet repos (secret FLEET_READ_TOKEN,
-// a classic PAT with `repo` read scope, exposed to the script as GH_TOKEN). If neither
-// local mode nor a token is available, skip cleanly rather than fail the nightly — the
-// check activates the moment the secret is added.
+// a classic PAT with `repo` read scope, exposed to the script as GH_TOKEN).
+//
+// A CHECK THAT CANNOT LOOK MUST NOT EXIT 0 (2026-09-03, found by fault injection).
+//
+// This block used to print "pipeline-drift check skipped: set the FLEET_READ_TOKEN secret ..."
+// and exit 0, leaving drift-check.yml GREEN. Run it with no token — which is exactly what a
+// revoked or expired PAT looks like from in here — and the guard that exists to stop a deploy
+// pipeline silently regressing to the shape that caused the 2026-07-15 prod-promotion failures
+// simply stops existing: no red run, no email, no trace anywhere a person looks.
+//
+// drift-check.yml records that this already happened once, for a different reason: "FLEET_READ_
+// TOKEN was never created, so this check skipped silently in CI (dormant safety net)". It was
+// dormant, that was known, and the only thing that ever said so was a human reading a log. The
+// rationalisation in the old comment — "skip cleanly rather than fail the nightly" — optimises
+// for the day the guard is being wired up and pays for it every day after, when the identical
+// silence means the opposite thing.
+//
+// drift-check.yml already runs send-drift-alert.mjs on `if: failure()`, so a non-zero exit is
+// wired to a person. The fix is simply to stop lying to the wire that already exists.
 if (!LOCAL_ROOT && !process.env.GH_TOKEN && !process.env.GITHUB_TOKEN) {
-  console.log('pipeline-drift check skipped: set the FLEET_READ_TOKEN secret (classic PAT, repo:read) to enable cross-repo CI checking. Runnable locally with LOCAL_FLEET_ROOT set.')
-  process.exit(0)
+  const reason = 'the deploy-pipeline drift guard could not read a single deploy.yml: no FLEET_READ_TOKEN / '
+    + 'DASHBOARD_PAT in the environment and no LOCAL_FLEET_ROOT. Nothing was compared against the deploy '
+    + 'standard, so nothing is known — this is a dormant guard, not a conformant fleet.'
+  sayVerdict(UNKNOWN, reason)
+  console.error(`::error::${reason}`)
+  process.exit(1)
 }
 
 const failures = []
@@ -155,8 +176,10 @@ if (failures.length) {
   // Machine-readable payload so send-drift-alert.mjs renders the real findings,
   // not the Playwright-shaped "no report produced" fallback of send-alert.mjs.
   writeFileSync('pipeline-drift-results.json', JSON.stringify(failures, null, 2))
+  sayVerdict(FAIL, `${failures.length} deploy.yml finding(s) against the hardened standard.`)
   console.error(`PIPELINE DRIFT DETECTED (${failures.length} finding(s)) — a deploy.yml has regressed from the hardened standard (standards/deploy-standard.md).`)
   process.exitCode = 1
 } else {
+  sayVerdict(PASS, `${FLEET.length} fleet deploy.yml read and conformant.`)
   console.log('No pipeline drift — all fleet deploy.yml conform to the hardened standard.')
 }

@@ -58,6 +58,7 @@ import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { sayVerdict, PASS, FAIL, UNKNOWN } from './lib/check-verdict.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const BASELINE_PATH = process.env.MAILER_BASELINE || path.join(HERE, 'lib', 'mailer-baseline.json')
@@ -506,8 +507,33 @@ try {
   }, null, 2))
 } catch { /* if we cannot write the report, send-mailer-alert.mjs still fires on the missing file */ }
 
+// AN EMPTY POPULATION IS NOT A CLEAN ONE (2026-09-03, found by fault injection).
+//
+// `rows` is one entry per product-environment this guard actually examined. Emptying `products`
+// in lib/mailer-baseline.json makes the loop at :350 iterate zero times, so `failures` stays
+// empty for the only reason that can never be good news -- nothing was looked at -- and this
+// file printed:
+//
+//     All declared mailers OK (1 warning(s)).
+//
+// under a table with no rows in it, and exited 0. Note what the single warning said: "Postmark
+// history unavailable - no product could be checked for whether it actually sent." The guard
+// had already worked out that it was blind and still called the result OK, because "no failures"
+// and "no observations" arrive at the same variable. They are opposite facts and they must not
+// share a channel.
+if (!rows.length) {
+  const reason = 'not one mailer was examined: lib/mailer-baseline.json yielded an empty product list, '
+    + 'so "no failures" here means "no observations", not a healthy fleet. Every product could be misconfigured '
+    + 'and this guard would look exactly like this.'
+  sayVerdict(UNKNOWN, reason)
+  console.error(`::error::${reason}`)
+  process.exit(1)
+}
+
 if (failures.length) {
+  sayVerdict(FAIL, `${failures.length} mailer problem(s) across ${new Set(failures.map((f) => f.product)).size} product(s).`)
   console.error(`\nFAIL: ${failures.length} mailer problem(s) across ${new Set(failures.map((f) => f.product)).size} product(s).`)
   process.exit(1)
 }
+sayVerdict(PASS, `${rows.length} mailer environment(s) examined, all OK (${warnings.length} warning(s)).`)
 console.log(`\nAll declared mailers OK (${warnings.length} warning(s)).`)
