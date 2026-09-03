@@ -56,6 +56,15 @@ const report = (...suites) => ({ config: {}, suites, errors: [], stats: {} })
 const rowFor = (rows, slug) => rows.find((r) => r.slug === slug)
 /** The verbatim message every failure in run 33781865310 carried. */
 const GOTO_TIMEOUT = 'TimeoutError: page.goto: Timeout 30000ms exceeded.'
+/**
+ * What a GENUINE mail failure actually says. Taken from the source that throws it,
+ * lib/imap.ts:114 — `throw new Error(\`No OTP email received within ${timeoutMs}ms\`)` —
+ * and NOT invented. The first draft of these tests used a plausible-sounding message that
+ * the code never emits, which is the unrepresentative-fixture trap written up in
+ * project_closer_lane_omits_awaiting_signoff_dedup_ambiguous_blocked_2026_09_03.md: a test
+ * whose fixture cannot occur passes forever while proving nothing about the real case.
+ */
+const REAL_MAIL_FAILURE = 'Error: No OTP email received within 90000ms'
 
 // ── A TEST THAT DIED AT THE FRONT DOOR NEVER TESTED ITS SUBJECT ─────────────────────────────
 
@@ -93,8 +102,7 @@ t('a REAL mail failure is still reported as failed', () => {
   // on everything would be its own defect — a monitor that can never say "mail is broken".
   const rows = buildRows(report(dirSuite('backoffice', [
     passed('auth page loads with form'),
-    failed('E2E OTP: request code → email delivery → enter code → dashboard',
-      'Error: the code never arrived: waited 120000ms for a message in the mailbox'),
+    failed('E2E OTP: request code → email delivery → enter code → dashboard', REAL_MAIL_FAILURE),
   ])))
   const r = rowFor(rows, 'backoffice')
   assert.equal(r.mail_delivery, 'failed',
@@ -108,7 +116,7 @@ t('the detector reads the reason, not the test name', () => {
   // A timeout LATER in a test is not a front-door failure: waiting for a mailbox is exactly the
   // shape of a real mail outage, and must not be swallowed.
   assert.equal(neverReachedTheProduct('TimeoutError: locator.click: Timeout 30000ms exceeded.'), false)
-  assert.equal(neverReachedTheProduct('waited 120000ms for a message in the mailbox'), false)
+  assert.equal(neverReachedTheProduct(REAL_MAIL_FAILURE), false)
   assert.equal(neverReachedTheProduct(''), false)
   assert.equal(neverReachedTheProduct(null), false)
 })
