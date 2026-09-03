@@ -28,9 +28,14 @@
  *     rate-limit cooldown). A skipped test counts in neither `checks_total` nor `checks_passed`
  *     and cannot make a field 'ok'. Counting skips as passes is how "153 checks, 153 passed"
  *     would be printed for a run that proved nothing.
+ *   * a test that RAN, FAILED, and could not OBSERVE is also 'not-tested' — added 2026-09-03,
+ *     and it is the third way to not run a check, which this file did not model. See
+ *     `observationOf` below for the run that proved it and what it published.
  *
  * Inventing a pass for an unrun check is the exact defect this table was created to end. If you
- * are about to default something to 'ok' because it "must be fine", stop.
+ * are about to default something to 'ok' because it "must be fine", stop. The mirror of it is
+ * just as wrong and cost five products a red card: inventing a FAILURE for an unrun check,
+ * because the monitor's own breakage arrived wearing a failed test's clothes.
  *
  * ── FIRE AND FORGET: THIS MUST NEVER FAIL THE MONITOR RUN ───────────────────────────────────
  *
@@ -47,6 +52,7 @@
  *   --dry prints the rows it would write and writes nothing.
  */
 import { readFileSync } from 'fs'
+import { MONITOR_FAULT_MARKER, isNonObservingFailure } from './lib/otp-failure.mjs'
 
 const BO_REF = 'xoecpzfsskalvjrtcbbl'
 const BO_BASE = `https://${BO_REF}.supabase.co`
@@ -63,6 +69,14 @@ export const MAX_MESSAGE = 300
 export const NOT_TESTED = 'not-tested'
 export const OK = 'ok'
 export const FAILED = 'failed'
+
+/**
+ * A fourth OUTCOME — never a field value, and it must never become one: 082 constrains every
+ * field to the three above, and `insertRows()` posts the whole fleet in ONE request, so a
+ * fourth value here would have the database reject all twelve products' hour, not just one.
+ * An unproven check lands on the field as NOT_TESTED, which is what it is.
+ */
+export const UNPROVEN = 'unproven'
 
 /** The three-valued fields, in the order the row is written. */
 export const FIELDS = ['login', 'mail_delivery', 'site', 'identity', 'backend']
@@ -237,6 +251,63 @@ export function outcomeOf(test) {
   return 'skipped'
 }
 
+/**
+ * Every attempt's first error line, oldest attempt first. Playwright keeps one entry in
+ * `results` per attempt, and `messageOf` deliberately reads only the LAST of them — which is
+ * right for a card and wrong for deciding what a test observed, because the last attempt is
+ * the one most likely to have been unable to run at all.
+ */
+export function attemptMessages(test) {
+  const results = (test && test.results) || []
+  return results
+    .map((r) => (r.errors && r.errors[0] && r.errors[0].message) || (r.error && r.error.message) || '')
+    .filter((m) => typeof m === 'string' && m !== '')
+    .map((m) => stripAnsi(m).split('\n')[0].trim())
+}
+
+/**
+ * 'passed' | 'failed' | UNPROVEN | 'skipped'. The judgement `outcomeOf` cannot make, because it
+ * sees only the status and this distinction lives in the message.
+ *
+ * WHY (measured, run 33741992196 on 2026-09-03). The shared OTP mailbox answered
+ * `[AUTHENTICATIONFAILED]` to the monitor's own login — the run's inbox pre-clear step recorded
+ * it at 10:10:04, five seconds before the first spec. Five OTP tests then failed WITHOUT EVER
+ * OPENING AN INBOX, each printing "MONITOR FAULT ... this is NOT evidence that the product
+ * failed to send the email". Playwright can only call that `unexpected`, `outcomeOf` maps
+ * `unexpected` to 'failed', and 'failed' is terminal for a field — so the fleet board published
+ * `mail_delivery=failed` for BackOffice, ChannelMover, ReplyFlow, SignalScore and Valrano, and
+ * `login=failed` for BackOffice whose real magic-link sign-in had PASSED in that same run.
+ *
+ * The mailbox was refused for about eleven hours (22:09 the previous evening through 08:36),
+ * green for six consecutive runs (08:49–09:54), then refused again — so this is not a one-off:
+ * every refused hour republished five products as broken.
+ *
+ * A FAILED ATTEMPT IS ONLY DISCOUNTED IF NOTHING EVER OBSERVED. If any attempt came back with a
+ * real product error, that stands: the mailbox recovering between attempts and the delivery then
+ * genuinely failing is a product failure, and this must not launder it. Only when EVERY attempt
+ * that produced an error said "I could not look" has the test proven nothing — which is exactly
+ * ChannelMover's shape in that run (attempt 1 a monitor fault, attempt 2 rate-limited by attempt
+ * 1's own OTP request, so the monitor fault is not even in the reported message).
+ */
+export function observationOf(test) {
+  const outcome = outcomeOf(test)
+  if (outcome !== 'failed') return outcome
+  const messages = attemptMessages(test)
+  if (messages.length === 0) return outcome
+  return messages.every(isNonObservingFailure) ? UNPROVEN : outcome
+}
+
+/**
+ * Why an unproven check could not look. Prefers the attempt that names the monitor fault over a
+ * later "could not be re-run", because the first says what is broken and the second only says
+ * that nothing tried again.
+ */
+export function unprovenReasonOf(test) {
+  const messages = attemptMessages(test)
+  const named = messages.find((m) => m.includes(MONITOR_FAULT_MARKER))
+  return (named || messages[0] || 'Unknown error').slice(0, MAX_MESSAGE)
+}
+
 /** The first line of the real error behind a failed test, trimmed to fit on a card. */
 export function messageOf(test) {
   const results = (test && test.results) || []
@@ -258,13 +329,16 @@ export function collectChecks(results) {
     for (const spec of suite.specs || []) {
       const file = spec.file || suite.file || ''
       for (const test of spec.tests || []) {
-        const outcome = outcomeOf(test)
+        const outcome = observationOf(test)
         checks.push({
           file,
           slug: slugForFile(file),
           title: spec.title || 'Unknown test',
           outcome,
-          message: outcome === 'failed' ? messageOf(test) : null,
+          message:
+            outcome === 'failed' ? messageOf(test)
+            : outcome === UNPROVEN ? unprovenReasonOf(test)
+            : null,
         })
       }
     }
@@ -319,6 +393,18 @@ export function buildRows(results, { runUrl = null, source = SOURCE } = {}) {
 
     // A skipped test is not an outcome: it counts nowhere and classifies nothing.
     if (check.outcome === 'skipped') continue
+
+    // Neither is a test that ran and could not observe. It classifies nothing — so it can
+    // neither fail a field nor, just as importantly, CLEAR one that a real test proved — and it
+    // counts in neither total nor passed, because a check that did not look is not a check.
+    //
+    // It IS still named in `failures`, and that is deliberate: the alternative is a card that
+    // reads all-clear while the monitor is blind, which is the silence this whole file exists to
+    // stop. The message says whose fault it is in its first six words.
+    if (check.outcome === UNPROVEN) {
+      row.failures.push({ name: check.title, message: check.message || 'Unknown error' })
+      continue
+    }
 
     row.checks_total += 1
     if (check.outcome === 'passed') row.checks_passed += 1

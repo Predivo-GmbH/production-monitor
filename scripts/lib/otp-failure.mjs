@@ -108,6 +108,52 @@ export function isCredentialRejection(cause) {
   )
 }
 
+/**
+ * THE TWO SENTENCES THAT MEAN "THE MONITOR NEVER LOOKED", named so they can be READ.
+ *
+ * 2026-09-03: everything above this line fixed the WORDS. The words were right — run
+ * 33741992196 printed, five times, "this is NOT evidence that the product failed to send the
+ * email". In the same run, `publish-check-results.mjs` wrote to the fleet board:
+ *
+ *     backoffice    login=failed  mail_delivery=failed
+ *     channelmover                mail_delivery=failed
+ *     replyflow                   mail_delivery=failed
+ *     signalscore                 mail_delivery=failed
+ *     valrano                     mail_delivery=failed
+ *
+ * The prose forbade the claim and the DATA made it anyway, on the one surface a human actually
+ * reads. BackOffice's real magic-link sign-in PASSED in that same run and the board still said
+ * `login=failed`, because a monitor-side blindness outranked a positive observation of the
+ * product. Publishing is downstream of wording, so a sentence cannot fix it: the machine has to
+ * be able to tell "the product failed" from "I could not look", and for that the marker must be
+ * a value both sides share rather than prose one side happens to print.
+ *
+ * MONITOR_FAULT_MARKER is emitted by describeOtpFailure below.
+ * UNRERUNNABLE_MARKER is emitted inline by the four OTP specs when the RETRY is rate-limited by
+ * the first attempt's own OTP request (caa60e2). It matters here because Playwright reports the
+ * LAST attempt's error, so on ChannelMover this sentence is all that survives — the monitor
+ * fault that caused the first failure is not in the message at all. A test whose every attempt
+ * says "I could not run" has observed nothing, however many attempts there were.
+ *
+ * test/publish-check-results.test.mjs pins both against the real report from that run, and
+ * against the four spec files that build the second one, so a reword breaks a test instead of
+ * quietly restoring the false claim.
+ */
+export const MONITOR_FAULT_MARKER = 'MONITOR FAULT - cannot verify'
+export const UNRERUNNABLE_MARKER = 'could not be re-run after its first attempt failed'
+
+/**
+ * Is this failure message the monitor talking about ITSELF?
+ *
+ * Substring, not prefix: Playwright renders a thrown Error as "Error: <message>", so nothing
+ * we print is ever at index 0 by the time it reaches the JSON report (measured against
+ * run 33741992196's own results.json, not against a fixture written from memory).
+ */
+export function isNonObservingFailure(message) {
+  if (typeof message !== 'string') return false
+  return message.includes(MONITOR_FAULT_MARKER) || message.includes(UNRERUNNABLE_MARKER)
+}
+
 export class MailboxUnreachableError extends Error {
   constructor(message, cause) {
     super(message)
@@ -140,7 +186,7 @@ export function describeOtpFailure(err, project) {
         `reachable and answering, and whether the mailbox is throttled, full or locked.`
 
     return (
-      `MONITOR FAULT - cannot verify ${project} OTP delivery: the monitor could not read its own ` +
+      `${MONITOR_FAULT_MARKER} ${project} OTP delivery: the monitor could not read its own ` +
       `test mailbox, so it never looked. This is NOT evidence that ${project} failed to send the ` +
       `email, and ${project}'s send chain should not be touched on the strength of this line. ` +
       `${action} Underlying IMAP error: ${err.reason}`

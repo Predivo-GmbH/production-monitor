@@ -15,7 +15,7 @@
  * Run: node test/publish-check-results.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
-import { readdirSync, writeFileSync, mkdtempSync } from 'node:fs'
+import { readdirSync, writeFileSync, mkdtempSync, readFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
@@ -24,8 +24,10 @@ import {
   TEST_DIR_TO_SLUG, NON_PRODUCT_DIRS, CLASSIFIER_RULES, FIELDS, LOGIN_METHOD_STRENGTH,
   buildRows, collectChecks, classify, slugForFile, outcomeOf, messageOf,
   loadResults, runUrlFrom, parseArgs, describeRow,
-  NOT_TESTED, OK, FAILED, SOURCE, MAX_MESSAGE,
+  observationOf, attemptMessages, unprovenReasonOf,
+  NOT_TESTED, OK, FAILED, UNPROVEN, SOURCE, MAX_MESSAGE,
 } from '../scripts/publish-check-results.mjs'
+import { MONITOR_FAULT_MARKER, UNRERUNNABLE_MARKER, isNonObservingFailure } from '../scripts/lib/otp-failure.mjs'
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..')
 const SCRIPT = join(REPO, 'scripts', 'publish-check-results.mjs')
@@ -604,6 +606,159 @@ t('Playwright statuses map to the three outcomes and nothing is assumed', () => 
 t('the error is taken from the result that actually failed, ANSI stripped', () => {
   assert.equal(messageOf({ results: [{}, { errors: [{ message: '[31mboom[0m\ndetail' }] }] }), 'boom')
   assert.equal(messageOf({ results: [{ error: { message: 'legacy shape' } }] }), 'legacy shape')
+})
+
+// ── A MONITOR THAT COULD NOT LOOK HAS NOT FOUND THE PRODUCT BROKEN ───────────────────────────
+//
+// Every message below is COPIED VERBATIM out of test-results/results.json from monitor run
+// 33741992196 (2026-09-03 10:10 UTC), not written from memory of what the code prints. That
+// distinction is not pedantry here: the guard this repo already had for the same family of bug
+// (otp-failure case 2) passed for weeks because its fixture was an Error the library never
+// builds. Note the "Error: " prefix — Playwright adds it, so nothing we print starts at index 0.
+
+const REAL_MONITOR_FAULT =
+  "Error: MONITOR FAULT - cannot verify ChannelMover OTP delivery: the monitor could not read its own test mailbox, " +
+  "so it never looked. This is NOT evidence that ChannelMover failed to send the email, and ChannelMover's send chain " +
+  "should not be touched on the strength of this line. Underlying IMAP error: 2 NO [AUTHENTICATIONFAILED] Authentication failed."
+
+const REAL_UNRERUNNABLE =
+  'Error: OTP request rate-limited on the RETRY (For security purposes, you can only request this after 15 seconds.), ' +
+  'so this test could not be re-run after its first attempt failed. That earlier failure was never disproven and stands. ' +
+  'This is a monitor-side limitation, not proof that the product failed to send.'
+
+/** A REAL product failure: the mailbox WAS readable and the email never came. */
+const REAL_PRODUCT_FAILURE =
+  'Error: ReplyFlow OTP email NOT delivered: the test mailbox was readable and stayed empty for 90s - ' +
+  'send-auth-email chain is broken.'
+
+/** A failed test with one entry in `results` per attempt, which is what Playwright emits. */
+const failedAttempts = (title, ...messages) => ({
+  title, ok: false,
+  tests: [{ status: 'unexpected', results: messages.map((message) => ({ status: 'failed', errors: [{ message }] })) }],
+})
+
+const OTP_TITLE = 'E2E OTP: trigger email → verify IMAP delivery → check OTP format'
+const OTP_LOGIN_TITLE = 'E2E OTP: request code → email delivery → enter code → dashboard'
+
+t('both "the monitor could not look" sentences are recognised from the REAL report text', () => {
+  assert.ok(isNonObservingFailure(REAL_MONITOR_FAULT), 'the MONITOR FAULT line must be recognised despite the "Error: " prefix')
+  assert.ok(isNonObservingFailure(REAL_UNRERUNNABLE), 'the rate-limited-retry line must be recognised too')
+  assert.ok(!isNonObservingFailure(REAL_PRODUCT_FAILURE), 'a readable mailbox that stayed empty IS a product failure')
+  assert.ok(!isNonObservingFailure(''), 'an empty message claims nothing')
+  assert.ok(!isNonObservingFailure(null))
+  assert.ok(!isNonObservingFailure(undefined))
+})
+
+t('a monitor fault is UNPROVEN, not failed — the field stays not-tested', () => {
+  const rows = buildRows(report(dirSuite('ytmigration', [failedAttempts(OTP_TITLE, REAL_MONITOR_FAULT)])))
+  const row = rowFor(rows, 'channelmover')
+  assert.equal(row.mail_delivery, NOT_TESTED, 'the monitor never opened an inbox, so it proved nothing about delivery')
+  assert.notEqual(row.mail_delivery, FAILED, 'THE BUG: run 33741992196 published mail_delivery=failed for five products')
+})
+
+t('a monitor fault does NOT erase a login the product actually passed', () => {
+  // Exactly BackOffice's shape in run 33741992196: its magic-link sign-in PASSED, and the board
+  // still read login=failed because 'failed' is terminal for a field and a blind OTP test set it.
+  const rows = buildRows(report(dirSuite('backoffice', [
+    passed('full login works'),
+    failedAttempts(OTP_LOGIN_TITLE, REAL_MONITOR_FAULT),
+  ])))
+  const row = rowFor(rows, 'backoffice')
+  assert.equal(row.login, OK, 'a real sign-in was observed; a check that could not look must not outrank it')
+  assert.equal(row.login_method, 'magic-link-browser')
+  assert.equal(row.mail_delivery, NOT_TESTED)
+})
+
+t('a REAL product failure still publishes failed — the fix must not launder anything', () => {
+  const rows = buildRows(report(dirSuite('replyflow', [failedAttempts(OTP_TITLE, REAL_PRODUCT_FAILURE)])))
+  assert.equal(rowFor(rows, 'replyflow').mail_delivery, FAILED)
+})
+
+t('if ANY attempt observed a real failure, the test failed — even after a monitor fault', () => {
+  // The mailbox recovering between attempts and delivery then genuinely failing is a product
+  // failure. Discounting on "any attempt was a monitor fault" would silence exactly that.
+  const rows = buildRows(report(dirSuite('replyflow', [
+    failedAttempts(OTP_TITLE, REAL_MONITOR_FAULT, REAL_PRODUCT_FAILURE),
+  ])))
+  assert.equal(rowFor(rows, 'replyflow').mail_delivery, FAILED)
+})
+
+t('a test whose every attempt could not run is unproven — ChannelMover\'s real two-attempt shape', () => {
+  // Playwright reports the LAST attempt's error, so `messageOf` sees only the rate-limit line and
+  // the monitor fault that caused the first failure is nowhere in it.
+  const test = { status: 'unexpected', results: [
+    { status: 'failed', errors: [{ message: REAL_MONITOR_FAULT }] },
+    { status: 'failed', errors: [{ message: REAL_UNRERUNNABLE }] },
+  ] }
+  assert.equal(observationOf(test), UNPROVEN)
+  assert.ok(messageOf(test).includes('rate-limited'), 'messageOf still reports the last attempt, unchanged')
+  assert.ok(unprovenReasonOf(test).includes(MONITOR_FAULT_MARKER), 'but the published reason names the CAUSE, not the retry')
+})
+
+t('an unproven check counts in neither checks_total nor checks_passed', () => {
+  const rows = buildRows(report(dirSuite('valrano', [
+    passed('landing page loads'),
+    failedAttempts(OTP_TITLE, REAL_MONITOR_FAULT),
+  ])))
+  const row = rowFor(rows, 'valrano')
+  assert.equal(row.checks_total, 1, 'a check that did not look is not a check')
+  assert.equal(row.checks_passed, 1)
+})
+
+t('an unproven check is still NAMED in failures — it must not go quiet', () => {
+  const rows = buildRows(report(dirSuite('signalscore', [failedAttempts(OTP_TITLE, REAL_MONITOR_FAULT)])))
+  const row = rowFor(rows, 'signalscore')
+  assert.equal(row.failures.length, 1, 'a blind monitor is news; an all-clear card would be the worse bug')
+  assert.ok(row.failures[0].message.includes(MONITOR_FAULT_MARKER))
+})
+
+t('UNPROVEN never reaches a field: 082 constrains all five to three values', () => {
+  const rows = buildRows(report(
+    dirSuite('signalscore', [failedAttempts(OTP_TITLE, REAL_MONITOR_FAULT)]),
+    dirSuite('replyflow', [failedAttempts(OTP_TITLE, REAL_PRODUCT_FAILURE)]),
+  ))
+  // One rejected value fails the whole fleet's insert, not just its own row.
+  for (const row of rows) for (const f of FIELDS) {
+    assert.ok([OK, FAILED, NOT_TESTED].includes(row[f]), `${row.slug}.${f} was "${row[f]}"`)
+  }
+})
+
+t('observationOf only reclassifies failures, and never on an absent message', () => {
+  assert.equal(observationOf({ status: 'expected', results: [] }), 'passed')
+  assert.equal(observationOf({ status: 'skipped', results: [] }), 'skipped')
+  assert.equal(observationOf({ status: 'flaky', results: [] }), 'passed')
+  assert.equal(observationOf({ status: 'unexpected', results: [] }), 'failed',
+    'a failure with no message at all is a failure — never assume the monitor was at fault')
+  assert.equal(observationOf({ status: 'unexpected', results: [{ status: 'failed', errors: [] }] }), 'failed')
+})
+
+t('attemptMessages reads every attempt, oldest first, ANSI stripped', () => {
+  const msgs = attemptMessages({ results: [
+    { errors: [{ message: '\x1b[31mfirst\x1b[0m\ndetail' }] },
+    { error: { message: 'second' } },
+    { status: 'passed' },
+  ] })
+  assert.deepEqual(msgs, ['first', 'second'], 'the legacy `error` shape counts too, and attempts with none are dropped')
+})
+
+t('the four OTP specs still print the sentence this file matches on', () => {
+  // A RATCHET, not decoration. UNRERUNNABLE_MARKER is built inline in four spec files rather than
+  // imported, so rewording one of them would silently restore "mail_delivery=failed" for that
+  // product with every test still green. If this fails: update the constant, do not delete this.
+  const specs = [
+    'tests/ytmigration/production-monitor.spec.ts',
+    'tests/valrano/production-monitor.spec.ts',
+    'tests/signalscore/production-monitor.spec.ts',
+    'tests/replyflow/production-monitor.spec.ts',
+  ]
+  // All four build the sentence across a `' +\n  '` concatenation, so the marker is contiguous in
+  // the STRING and not in the FILE. Joining those back up is the whole reason this reads the
+  // source rather than grepping it — a raw grep here fails against code that is perfectly correct.
+  const joinConcatenations = (src) => src.replace(/['"`]\s*\+\s*['"`]/g, '')
+  for (const rel of specs) {
+    const src = joinConcatenations(readFileSync(join(REPO, rel), 'utf-8'))
+    assert.ok(src.includes(UNRERUNNABLE_MARKER), `${rel} no longer contains UNRERUNNABLE_MARKER`)
+  }
 })
 
 console.log(`\n${n} assertions passed.`)
