@@ -692,6 +692,11 @@ jobs:
           ALERT_EMAIL: rogmueller1976@gmail.com
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           GH_TOKEN: ${{ github.token }}   # edge-triggered dedup: query the previous run + download its results.json to suppress duplicate alerts for an already-known ongoing failure
+          # SMTP is one pipe and the board is another, and on 2026-09-02 only the first was broken:
+          # this run detected 4 failures at 23:38Z and the alert died at 23:44:18Z on "Invalid login:
+          # 535 5.7.8" from the Metanet account. Without a board credential the mailer has no second
+          # channel and the notification is lost. See scripts/lib/alert-fallback.mjs.
+          BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
 
       - name: Send resolution email if previous run failed
         if: success()
