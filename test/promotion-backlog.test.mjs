@@ -8,6 +8,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { classifyBacklog, rank, DEFAULT_MAX_AGE_H } from '../scripts/lib/promotion-backlog.mjs'
+import { signalFor, exitCode, SOURCE } from '../scripts/check-promotion-backlog.mjs'
 
 const NOW = new Date('2026-09-03T12:00:00Z')
 const hoursAgo = (h) => new Date(NOW.getTime() - h * 3_600_000).toISOString()
@@ -96,4 +97,32 @@ test('junk in does not throw', () => {
     const r = classifyBacklog(p, { now: NOW })
     assert.ok(['ok', 'stale', 'diverged'].includes(r.level))
   }
+})
+
+// The regression this half of the suite exists for: on 2026-09-03 the sensor exited 1 on a FINDING,
+// so a month-old backlog rode the monitor's failure() path into send-alert.mjs and mailed Roger
+// EVERY HOUR, and could never resolve. A finding must be a filed board row that exits 0; exit 1 is
+// only for "I could not look" - exactly what every sibling sensor states in its monitor.yml comment.
+test('A FINDING EXITS 0 - it is a board row, not a job failure', () => {
+  assert.equal(exitCode({ readCount: 8, unreadableCount: 0, apiErrors: 0 }), 0)
+})
+
+test('exit 1 is reserved for "could not look": nothing read, a repo unreadable, or an API error', () => {
+  assert.equal(exitCode({ readCount: 0, unreadableCount: 0, apiErrors: 0 }), 1, 'read nothing')
+  assert.equal(exitCode({ readCount: 5, unreadableCount: 1, apiErrors: 0 }), 1, 'a repo was unreadable')
+  assert.equal(exitCode({ readCount: 5, unreadableCount: 0, apiErrors: 3 }), 1, 'a GitHub API call failed')
+})
+
+test('the filed signal never pages Roger - it lands on /signals for Claude to promote or merge', () => {
+  const diverged = signalFor({ repo: 'distribution-os', level: 'diverged', ageH: 720, reason: 'D: drifted' })
+  assert.equal(diverged.source, SOURCE)
+  assert.equal(diverged.key, 'distribution-os')
+  assert.equal(diverged.needs_human, false, 'must not ring the phone - this is what mailed hourly')
+  assert.equal(diverged.severity, 'warning')
+  assert.equal(diverged.state, 'open')
+  assert.match(diverged.title, /merging/)
+
+  const stale = signalFor({ repo: 'backoffice', level: 'stale', ageH: 30, reason: 'B: waited' })
+  assert.equal(stale.needs_human, false)
+  assert.match(stale.title, /waiting too long/)
 })

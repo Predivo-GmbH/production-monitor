@@ -593,10 +593,11 @@ jobs:
       # after 24h. Compares the DEPLOYED commits, never the branch heads: on Distribution-OS those
       # two questions give +9/+17 and +9/+8, and mixing them invents a bug that is not there.
       - name: A product that CAN ship and has not must say so
-        if: always()  # independent sensor, like the one above
+        if: always()  # independent sensor — files its finding to the board and exits 0, like every sibling; only a failed read (unreadable repo / API error / nothing read) reds the job, so a chronic backlog cannot double-red one event or re-mail hourly.
         run: node scripts/check-promotion-backlog.mjs
         env:
           GH_TOKEN: ${{ secrets.FLEET_READ_TOKEN || secrets.DASHBOARD_PAT }}
+          BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
 
       - name: A product that cannot deploy must say so
         if: always()  # independent sensor — must run even if the steps above failed. check-deploy-failures.mjs exits 0 on a filed alarm (only an unreadable repo reds the job), so this cannot double-red one event.
