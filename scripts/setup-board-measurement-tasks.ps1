@@ -58,7 +58,15 @@ function Register-BoardTask {
       -DontStopOnIdleEnd -ExecutionTimeLimit (New-TimeSpan -Minutes 15) `
       -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 
-  $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+  # S4U, NOT Interactive. A task registered with LogonType Interactive shows State=Ready in
+  # Get-ScheduledTask and then never fires while nobody is signed in — which is the normal state
+  # of an always-on headless laptop. It would look registered, look healthy, and do nothing: the
+  # exact "a job that reports success for doing nothing" class this fleet is built to catch, and
+  # the reason `Ready` alone is not proof. S4U runs without a stored password and without an
+  # interactive session; RunLevel stays Limited because neither job needs elevation. Pattern taken
+  # from C:/ClaudeShared/scripts/fix-gh-runner-anchor-at-startup.ps1, which registers the fleet's
+  # runner tasks on this same laptop.
+  $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U -RunLevel Limited
 
   Unregister-ScheduledTask -TaskName $Name -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
   Register-ScheduledTask -TaskName $Name -Action $action -Trigger $Trigger -Settings $settings `
