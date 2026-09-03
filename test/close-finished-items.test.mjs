@@ -38,7 +38,7 @@ import assert from 'node:assert'
 import { spawnSync } from 'node:child_process'
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, parse, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
@@ -446,21 +446,47 @@ ta('a finish-test carrying a writing query is UNKNOWN — a refused test has not
   assert.match(s.unknowns[0].f.reason, /refused/)
 })
 
+// EVERY PATH HERE IS BUILT FROM THE RUNNING PLATFORM'S OWN ROOT (fixed 2026-09-03).
+//
+// It used to hardcode `C:/Business/Internal Projects`. That passes on a Windows desktop and can
+// NEVER pass on the Linux runner, where `C:/Business/...` is not an absolute path at all, so the
+// containment check cannot hold. Master's Tests workflow was red on every run from 09:10Z with
+// this as the only failing suite - 65 others green either side of it - because a test encoded one
+// developer's disk layout. Third time in a week this fleet has paid for that shape: a Windows
+// `npm audit fix` pruned Linux-only lockfile entries, and a check compared two environments with
+// two different harnesses and reported a regression that did not exist.
+//
+// THE SIBLINGS ARE BUILT FROM THE SAME BASE ON PURPOSE, and this is the part worth not breaking.
+// The negative cases are load-bearing and each proves a different refusal:
+//   - `<root>Evil/...`  proves that PREFIX-MATCHING a root is not being inside it. If the root is
+//     rebuilt but this string is not, it stops being a prefix of the real root and silently
+//     degrades into the trivially-outside case - the negative that matters most would then be
+//     testing nothing while still passing. Flagged by a second session before this was written.
+//   - an absolute path under no root at all proves outside-every-root.
+//   - a relative path proves that relative is refused outright.
 t('testPathIsRunnable refuses anything that is not an allow-listed test file', () => {
-  const roots = ['C:/Business/Internal Projects']
+  // path.parse().root is 'C:\\' on Windows and '/' on POSIX; posix-style separators are used
+  // throughout so the strings read the same on both and match how callers write them.
+  const base = parse(resolve('.')).root.replace(/\\/g, '/')   // 'C:/' on Windows, '/' on POSIX
+  const roots = [`${base}Business/Internal Projects`]
+  const inside = `${base}Business/Internal Projects/production-monitor/test/x.test.mjs`
   const exists = () => true
-  assert.equal(testPathIsRunnable('C:/Business/Internal Projects/production-monitor/test/x.test.mjs', { roots, exists }).ok, true)
+  assert.equal(testPathIsRunnable(inside, { roots, exists }).ok, true)
   for (const bad of [
-    'test/x.test.mjs',                                        // relative
-    'C:/Business/Internal Projects/x.sh',                     // not a test file
-    'C:/Business/Internal Projects/scripts/deploy.mjs',       // not a test file
-    'C:/Windows/System32/calc.exe',                           // outside every root
-    'C:/Business/Internal ProjectsEvil/x.test.mjs',           // prefix-matching a root is not being inside it
+    'test/x.test.mjs',                                            // relative
+    `${base}Business/Internal Projects/x.sh`,                     // not a test file
+    `${base}Business/Internal Projects/scripts/deploy.mjs`,       // not a test file
+    `${base}somewhere/else/entirely/calc.exe`,                    // outside every root
+    `${base}Business/Internal ProjectsEvil/x.test.mjs`,           // prefix-matching a root is not being inside it
     '',
   ]) {
     assert.equal(testPathIsRunnable(bad, { roots, exists }).ok, false, `must refuse: ${bad}`)
   }
-  assert.equal(testPathIsRunnable('C:/Business/Internal Projects/production-monitor/test/gone.test.mjs', { roots, exists: () => false }).ok, false,
+  // The prefix case must remain a genuine prefix of a genuine root, or it degrades into the
+  // trivially-outside case above and stops proving anything. Asserted, not assumed.
+  assert.ok(`${base}Business/Internal ProjectsEvil/x.test.mjs`.startsWith(roots[0]),
+    'the prefix-attack fixture must still start with the real root, or it tests nothing')
+  assert.equal(testPathIsRunnable(`${base}Business/Internal Projects/production-monitor/test/gone.test.mjs`, { roots, exists: () => false }).ok, false,
     'a test file that is not there is a stale finish-test, not a passing one')
 })
 
