@@ -83,6 +83,21 @@ async function refHead(repo, ref) {
   return r.ok ? (r.body?.sha ?? null) : null
 }
 
+/**
+ * Which files the branch tip adds on top of the commit whose gates were proven - so decide() can
+ * ask whether any of them could change what is built. null means "I could not see", which is a
+ * refusal there, never an assumption that the difference is harmless.
+ *
+ * GitHub caps `files` at 300 per compare. A truncated list would let an unproven file hide behind
+ * the cap, so anything at or over the cap is reported as unreadable rather than as a short diff.
+ */
+async function tipChangedFiles(repo, fromSha, toSha) {
+  const r = await gh(`/repos/${OWNER}/${repo}/compare/${fromSha}...${toSha}`)
+  if (!r.ok || !Array.isArray(r.body?.files)) return null
+  if (r.body.files.length >= 300) return null
+  return r.body.files.map((f) => f.filename)
+}
+
 /** Is any fleet deploy in flight? Same question the PreToolUse serializer asks. */
 async function fleetBusy() {
   for (const repo of [...AUTO_PROMOTABLE, 'ChannelMover', 'ScoutCopilot', 'Valrano', 'BoatBuddy', 'ReplyFlow', 'signalscore', 'predivo']) {
@@ -119,6 +134,10 @@ for (const repo of AUTO_PROMOTABLE) {
   } else if (prod?.sha && staging?.sha) {
     compareStatus = 'identical'
   }
+  // What would ACTUALLY ship, and what it would add on top of the proven build. Read only when
+  // there is something to ship, so a hold costs no extra API call; decide() refuses on a null.
+  const worthChecking = prod?.sha && staging?.sha && prod.sha !== staging.sha
+  const tipSha = worthChecking ? await refHead(repo, pipe.ref) : null
   decisions.push({
     ...decide({
       repo,
@@ -127,9 +146,9 @@ for (const repo of AUTO_PROMOTABLE) {
       compareStatus,
       stagingJobs: staging?.jobs ?? {},
       fleetBusy: busy.busy,
-      // What would ACTUALLY ship. Read only when there is something to ship, so a hold costs no
-      // extra API call; decide() refuses on a null it needed.
-      refHeadSha: prod?.sha && staging?.sha && prod.sha !== staging.sha ? await refHead(repo, pipe.ref) : null,
+      refHeadSha: tipSha,
+      ignorePaths: pipe.ignorePaths,
+      tipChangedFiles: tipSha && tipSha !== staging.sha ? await tipChangedFiles(repo, staging.sha, tipSha) : [],
     }),
     repo,
     pipe,

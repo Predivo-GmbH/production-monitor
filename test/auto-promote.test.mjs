@@ -7,7 +7,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  decide, pickOne, isAutoPromotable, isAppDeployRun, pipelineFor,
+  decide, pickOne, isAutoPromotable, isAppDeployRun, pipelineFor, isIgnorablePath,
   AUTO_PROMOTABLE, REQUIRED_STAGING_JOBS, PIPELINES,
 } from '../scripts/lib/auto-promote.mjs'
 
@@ -16,7 +16,8 @@ const green = { 'deploy-staging': 'success', 'e2e-staging': 'success' }
 // means the promoter would ship one commit while citing another - see the tests at the bottom.
 const ok = (o = {}) => ({
   repo: 'backoffice', prodSha: 'aaaaaaa', stagingSha: 'bbbbbbb', refHeadSha: 'bbbbbbb',
-  compareStatus: 'ahead', stagingJobs: green, fleetBusy: false, ...o,
+  compareStatus: 'ahead', stagingJobs: green, fleetBusy: false,
+  ignorePaths: ['*.md', '**/*.md', 'docs/**', 'LICENSE', '.gitignore'], tipChangedFiles: [], ...o,
 })
 
 test('THE LINE THAT MUST NOT MOVE: no customer-facing product is ever auto-promoted', () => {
@@ -153,7 +154,7 @@ test('SHIP ONLY WHAT YOU PROVED: a branch tip past the gated commit refuses', ()
   // Measured: cockpit gated cc4935e while main stood at 5bf29fd; backoffice gated 9803714 while
   // main stood at 046d045. A dispatch takes a BRANCH, so both would have shipped a commit no gate
   // in this file had looked at, under a log line naming the gated one.
-  const d = decide(ok({ stagingSha: 'cc4935e', refHeadSha: '5bf29fd' }))
+  const d = decide(ok({ stagingSha: 'cc4935e', refHeadSha: '5bf29fd', tipChangedFiles: ['src/server.ts'] }))
   assert.equal(d.promote, false)
   assert.match(d.reason, /the proven commit is not the one that would ship/)
   assert.match(d.reason, /cc4935e/, 'names the commit that was proven')
@@ -230,4 +231,67 @@ test('EVERY promotable product has a pipeline - the two lists cannot drift apart
 test('pipeline matching survives the owner prefix and casing, like the allowlist', () => {
   assert.equal(pipelineFor('Predivo-GmbH/BackOffice').ref, 'main')
   assert.equal(pipelineFor('predivo-gmbh/DISTRIBUTION-OS').ref, 'master')
+})
+
+// ── AND THE GATE ABOVE HAD ITS OWN LIVENESS BUG, found by checking its own promise ──────────────
+// The first version demanded refHeadSha === stagingSha. Within the hour, backoffice's main sat one
+// commit past its gated build and that commit was a single file, docs/FIX-...md - a `paths-ignore`
+// path, so no staging run would EVER fire for it. Sha equality would have held five green commits
+// for ever while the log line promised "this promotes itself next hour". A safe refusal that never
+// stops being a refusal is just the original bug wearing the other mask.
+
+test('a tip ahead by ONLY deploy-ignored files still promotes - it builds the same thing', () => {
+  const d = decide(ok({ stagingSha: '9803714', refHeadSha: '046d045', tipChangedFiles: ['docs/FIX-four-cross-project-service-role-keys-2026-09-03.md'] }))
+  assert.equal(d.promote, true, d.reason)
+  assert.match(d.reason, /builds the same thing/)
+})
+
+test('a tip ahead by ONE real file refuses, and names the file that no gate has seen', () => {
+  const d = decide(ok({ stagingSha: '9803714', refHeadSha: '046d045', tipChangedFiles: ['docs/x.md', 'src/app.ts'] }))
+  assert.equal(d.promote, false)
+  assert.match(d.reason, /no gate has seen/)
+  assert.match(d.reason, /src\/app\.ts/, 'the offending file must be named, not just counted')
+})
+
+test('an UNREADABLE file list refuses - a difference I have not seen is not a harmless one', () => {
+  for (const v of [null, undefined, 'lots']) {
+    const d = decide(ok({ stagingSha: 'aaa', refHeadSha: 'bbb', tipChangedFiles: v }))
+    assert.equal(d.promote, false, `tipChangedFiles=${String(v)} must refuse`)
+    assert.match(d.reason, /could not read which files differ/)
+  }
+})
+
+test('no ignorePaths means nothing is ignorable - Distribution-OS ships from a dispatch-only file', () => {
+  const d = decide(ok({ repo: 'distribution-os', ignorePaths: [], stagingSha: 'aaa', refHeadSha: 'bbb', tipChangedFiles: ['README.md'] }))
+  assert.equal(d.promote, false)
+  assert.equal(pipelineFor('distribution-os').ignorePaths.length, 0)
+})
+
+test("GitHub's '*.md' is ROOT-LEVEL only, and the two products differ on purpose", () => {
+  // backoffice was bitten by this and added '**/*.md'; cockpit has not. Collapsing the two lists
+  // into one shared constant would silently start ignoring nested markdown on cockpit.
+  const bo = pipelineFor('backoffice').ignorePaths
+  const cp = pipelineFor('cockpit').ignorePaths
+  assert.equal(isIgnorablePath('README.md', bo), true)
+  assert.equal(isIgnorablePath('src/notes.md', bo), true, 'backoffice ignores markdown at any depth')
+  assert.equal(isIgnorablePath('README.md', cp), true)
+  assert.equal(isIgnorablePath('src/notes.md', cp), false, "cockpit's '*.md' is root-level only")
+})
+
+test('isIgnorablePath handles the three shapes used, and refuses everything else', () => {
+  const pats = ['*.md', 'docs/**', 'LICENSE']
+  assert.equal(isIgnorablePath('docs/a/b/c.txt', pats), true, 'docs/** is a prefix at any depth')
+  assert.equal(isIgnorablePath('LICENSE', pats), true)
+  assert.equal(isIgnorablePath('LICENSE.txt', pats), false, 'an exact pattern is not a prefix')
+  assert.equal(isIgnorablePath('docsimposter/x', pats), false, "'docs/**' must not match 'docsimposter/'")
+  assert.equal(isIgnorablePath('src/index.ts', pats), false)
+  assert.equal(isIgnorablePath('', pats), false)
+  assert.equal(isIgnorablePath('anything', ['{weird,glob}']), false, 'an unrecognised pattern never widens what is ignorable')
+  assert.equal(isIgnorablePath('anything', undefined), false)
+})
+
+test('EVERY pinned pipeline declares its ignorePaths, so the field can never be forgotten', () => {
+  for (const [repo, p] of Object.entries(PIPELINES)) {
+    assert.ok(Array.isArray(p.ignorePaths), `${repo} must declare ignorePaths, even if empty`)
+  }
 })

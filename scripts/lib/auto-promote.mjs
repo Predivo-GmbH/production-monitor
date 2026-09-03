@@ -68,15 +68,57 @@ export function isAutoPromotable(repo) {
  *   ref      the branch a production dispatch runs from. NOT always "main": Distribution-OS is
  *            on `master`, and the hardcoded "main" would have 422'd every promotion it ever
  *            tried. Verified 2026-09-03 against each repo's own default_branch.
+ *   ignorePaths  copied VERBATIM from that workflow's own `paths-ignore`. A commit touching only
+ *            these cannot change what a deploy produces, so a branch tip that is ahead of the
+ *            proven commit by nothing but such files is still deployment-equivalent to it.
+ *            Distribution-OS has none: its production workflow is dispatch-only, and its staging
+ *            lives on a different branch, so nothing there is safely ignorable.
  *
  * A product absent from this map is REFUSED, exactly like a product absent from the allowlist:
  * a new product must land on the safe side without anyone remembering to edit this file.
  */
 export const PIPELINES = Object.freeze({
-  backoffice: Object.freeze({ prod: 'deploy.yml', staging: 'deploy.yml', ref: 'main' }),
-  cockpit: Object.freeze({ prod: 'deploy.yml', staging: 'deploy.yml', ref: 'main' }),
-  'distribution-os': Object.freeze({ prod: 'deploy.yml', staging: 'deploy-staging.yml', ref: 'master' }),
+  // backoffice deliberately ignores markdown at ANY depth; cockpit's '*.md' is root-level only
+  // (GitHub Actions semantics). The lists differ on purpose - do not "tidy" them into one.
+  backoffice: Object.freeze({
+    prod: 'deploy.yml', staging: 'deploy.yml', ref: 'main',
+    ignorePaths: Object.freeze(['*.md', '**/*.md', 'docs/**', 'LICENSE', '.gitignore']),
+  }),
+  cockpit: Object.freeze({
+    prod: 'deploy.yml', staging: 'deploy.yml', ref: 'main',
+    ignorePaths: Object.freeze(['*.md', 'docs/**', 'LICENSE', '.gitignore']),
+  }),
+  'distribution-os': Object.freeze({
+    prod: 'deploy.yml', staging: 'deploy-staging.yml', ref: 'master',
+    ignorePaths: Object.freeze([]),
+  }),
 })
+
+/**
+ * Does one changed file match one `paths-ignore` pattern, with GitHub Actions' semantics?
+ *
+ * Only the three shapes these workflows actually use are implemented, and anything else returns
+ * false - an unrecognised pattern must never widen what counts as ignorable:
+ *   '*.md'      ROOT-LEVEL markdown only. This is the one people get wrong; backoffice's own
+ *               workflow carries a comment about having been bitten by it.
+ *   '**' / 'x/**'  a prefix, at any depth
+ *   'LICENSE'   an exact path
+ */
+export function isIgnorablePath(file, patterns) {
+  const f = String(file ?? '')
+  if (!f) return false
+  return (patterns ?? []).some((raw) => {
+    const p = String(raw ?? '')
+    if (p.startsWith('**/')) {
+      const suffix = p.slice(3)
+      if (suffix.startsWith('*.')) return f.endsWith(suffix.slice(1))
+      return f === suffix || f.endsWith(`/${suffix}`)
+    }
+    if (p.endsWith('/**')) return f.startsWith(`${p.slice(0, -3)}/`)
+    if (p.startsWith('*.')) return !f.includes('/') && f.endsWith(p.slice(1))
+    return f === p
+  })
+}
 
 /** The pinned pipeline for a repo, or null - and null is a refusal, never a guess. */
 export function pipelineFor(repo) {
@@ -167,8 +209,23 @@ export function decide(p) {
   if (!p?.refHeadSha) {
     return { promote: false, reason: `${repo}: could not read what the production branch currently points at - refusing to dispatch a branch whose tip is unknown` }
   }
+  // A tip that is ahead is not automatically a different DEPLOY. Every one of these pipelines
+  // carries a `paths-ignore`, and a commit touching only those paths cannot change what is built -
+  // it never even triggers a staging run, so demanding sha equality would wait for a run that is
+  // never going to happen. Found within the hour of writing this gate: backoffice's main sat one
+  // commit past its gated build, and that commit was a single file, docs/FIX-...md. Sha equality
+  // would have held five green commits for ever while the log promised they would ship next hour.
   if (p.refHeadSha !== p.stagingSha) {
-    return { promote: false, reason: `${repo}: the proven commit is not the one that would ship - staging gated ${String(p.stagingSha).slice(0, 7)} but the production branch now points at ${String(p.refHeadSha).slice(0, 7)}. Let staging catch up and this promotes itself next hour.` }
+    const short = `staging gated ${String(p.stagingSha).slice(0, 7)} but the production branch now points at ${String(p.refHeadSha).slice(0, 7)}`
+    const files = p?.tipChangedFiles
+    if (!Array.isArray(files)) {
+      return { promote: false, reason: `${repo}: ${short}, and I could not read which files differ - refusing to ship a difference I have not seen` }
+    }
+    const wouldShip = files.filter((f) => !isIgnorablePath(f, p?.ignorePaths))
+    if (wouldShip.length) {
+      return { promote: false, reason: `${repo}: the proven commit is not the one that would ship - ${short}, and ${wouldShip.length} changed file(s) no gate has seen would go out with it (e.g. ${wouldShip[0]}). Let staging catch up and this promotes itself next hour.` }
+    }
+    return { promote: true, reason: `${repo}: staging ${String(p.stagingSha).slice(0, 7)} is green on ${REQUIRED_STAGING_JOBS.join(' + ')} and production is on ${String(p.prodSha).slice(0, 7)} - the branch tip ${String(p.refHeadSha).slice(0, 7)} adds only ${files.length} deploy-ignored file(s), so it builds the same thing` }
   }
   return { promote: true, reason: `${repo}: staging ${String(p.stagingSha).slice(0, 7)} is green on ${REQUIRED_STAGING_JOBS.join(' + ')} and production is on ${String(p.prodSha).slice(0, 7)}` }
 }
