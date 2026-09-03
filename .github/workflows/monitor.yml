@@ -277,6 +277,18 @@ jobs:
       # fire-and-forget by contract — it catches everything and exits 0, so a dashboard write can
       # never red a monitoring job. Placed here, immediately after the suite, so it reads
       # test-results/results.json before any later step can touch the working tree.
+      # A failing test must not be able to erase itself on the retry. Playwright counts `skipped`
+      # as a non-failing attempt, so failed-then-skipped-retry is reported "flaky" and the runner
+      # EXITS 0 — a green run over a failure nobody disproved, with every `if: failure()` step
+      # below (auto-fix, auto-heal, triage, the alert email) silently skipped. Found live in run
+      # 33706296807 and reproduced from scratch; see scripts/check-laundered-failures.mjs.
+      #
+      # `if: always()` is the whole point: the case this exists for is one where the step above
+      # SUCCEEDED. A genuine flake (failed then PASSED) is still absorbed and does not trip this.
+      - name: A failed test must not erase itself on the retry
+        if: always()
+        run: node scripts/check-laundered-failures.mjs
+
       - name: Publish what was proven about each product
         if: always()
         run: node scripts/publish-check-results.mjs

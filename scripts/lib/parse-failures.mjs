@@ -18,6 +18,49 @@ export function stripAnsi(str) {
   return str.replace(/\x1b\[[0-9;]*m/g, '')
 }
 
+/**
+ * A test FAILED at least once and never once passed — so nothing ever disproved that failure.
+ *
+ * WHY THIS IS NOT `status === 'unexpected'` (2026-09-03). Playwright calls a test "flaky" when
+ * it has both failing and non-failing attempts — and `skipped` counts as non-failing. So a test
+ * that fails on attempt 1 and whose RETRY calls `test.skip()` is reported as flaky, which reads
+ * as "it recovered", and `npx playwright test` EXITS 0. Reproduced: a one-test suite of exactly
+ * that shape prints "1 flaky" and exit code 0 — a green run over a failure nobody disproved.
+ *
+ * This is reachable from 40+ runtime `test.skip(cond, ...)` sites in tests/, because a condition
+ * evaluated on the retry can differ from the same condition on the first attempt. It bit us live
+ * in monitor run 33706296807: ChannelMover's OTP test failed on the mailbox, then its retry hit
+ * the spec's own Supabase rate-limit branch — rate-limited BY the first attempt's own OTP
+ * request — and skipped. It was masked only because four other projects failed outright in the
+ * same run; alone, it would have gone out as green.
+ *
+ * The invariant: a test that never passed has not been shown to be healthy, whatever Playwright
+ * labelled it. `interrupted` is treated like `skipped` for the same reason — it is an absence of
+ * a result, not a passing one.
+ */
+export function isUnrecoveredFailure(test) {
+  if (test?.status === 'unexpected') return true
+  const results = test?.results ?? []
+  if (results.some((r) => r?.status === 'passed')) return false
+  return results.some((r) => r?.status === 'failed' || r?.status === 'timedOut')
+}
+
+/** True for the subset of isUnrecoveredFailure() that Playwright did NOT count as a failure —
+ *  i.e. the ones that would otherwise vanish from both the exit code and the alert. */
+export function isLaunderedFailure(test) {
+  return test?.status !== 'unexpected' && isUnrecoveredFailure(test)
+}
+
+/** The reason the final attempt gave for not re-testing, e.g. the `test.skip()` description.
+ *  Playwright records it as an annotation on that result (type 'skip'). */
+export function launderedReason(test) {
+  const last = (test?.results ?? [])[(test?.results ?? []).length - 1]
+  const ann = (last?.annotations ?? []).find((a) => a?.type === 'skip')
+    || (test?.annotations ?? []).find((a) => a?.type === 'skip')
+  const why = ann?.description ? `: ${stripAnsi(String(ann.description)).split('\n')[0].slice(0, 160)}` : ''
+  return `${last?.status || 'no result'}${why}`
+}
+
 /** Recursively extract failed specs from nested suite structure.
  *  Playwright nests: file-suite (title=filename) > describe-suite (title=describe name) > specs.
  *  We prefer the deepest suite title that isn't a filename (contains " — "). */
@@ -29,7 +72,7 @@ export function extractFailures(suite, parentName) {
 
   for (const spec of suite.specs ?? []) {
     for (const test of spec.tests ?? []) {
-      if (test.status === 'unexpected') {
+      if (isUnrecoveredFailure(test)) {
         // Pull the error from the last result that actually failed (an
         // 'unexpected' test's final result holds the real error).
         const failedResult = [...(test.results ?? [])].reverse()
@@ -43,11 +86,19 @@ export function extractFailures(suite, parentName) {
           ? `${location.file?.split('/').pop()}:${location.line}`
           : ''
 
+        // A laundered failure needs the label said out loud, because its FINAL attempt did not
+        // fail — without this line the row reads as a plain failure and the next reader
+        // re-derives the whole 2026-09-03 diagnosis from scratch.
+        const error = isLaunderedFailure(test)
+          ? `NOT RETESTED (Playwright called this "${test.status}", which does not fail a run): the first attempt failed and the retry never re-tested it — ${launderedReason(test)}. The failure was never disproven: ${cleanError.slice(0, 200)}`
+          : cleanError
+
         failures.push({
           project: name,
           test: spec.title || 'Unknown test',
-          error: cleanError,
+          error,
           file: fileRef,
+          laundered: isLaunderedFailure(test),
         })
       }
     }
@@ -58,6 +109,15 @@ export function extractFailures(suite, parentName) {
   }
 
   return failures
+}
+
+/** The laundered subset of a whole results.json — the rows that failed, never passed, and that
+ *  Playwright's exit code will NOT report. Reuses extractFailures so the guard step and the
+ *  alert email can never disagree about what counts as a failure. */
+export function findLaunderedFailures(results) {
+  const rows = []
+  for (const suite of results?.suites ?? []) rows.push(...extractFailures(suite, null))
+  return rows.filter((r) => r.laundered)
 }
 
 /** The project label of the last-resort row deriveFailures() emits when a run failed

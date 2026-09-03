@@ -407,6 +407,18 @@ test.describe('ChannelMover — Production Monitor', () => {
         options: { shouldCreateUser: false },
       })
       if (retry.error) {
+        // Skipping on a RETRY erases the attempt that already failed. Playwright counts a skip as
+        // a non-failing attempt, so failed-then-skipped is reported "flaky" and the runner EXITS 0
+        // — this is exactly how ChannelMover's OTP failure went unreported in run 33706296807. It
+        // is also near-certain to happen: the rate limit is caused BY the first attempt's own OTP
+        // request, so a retry that got this far will almost always land here.
+        if (test.info().retry > 0) {
+          throw new Error(
+            `OTP request rate-limited on the RETRY (${retry.error.message}), so this test could not be ` +
+            're-run after its first attempt failed. That earlier failure was never disproven and stands. ' +
+            'This is a monitor-side limitation, not proof that the product failed to send.',
+          )
+        }
         test.skip(true, `OTP request rate-limited: ${retry.error.message}`)
         return
       }
