@@ -108,6 +108,18 @@ test('a machine nobody wrote down is reported rather than quietly accepted', () 
 test('the baseline file on disk is the one the watchdog will actually use', () => {
   const expected = loadExpectedMachines()
   assert.ok(Array.isArray(expected), 'baseline must be a list of machine names')
-  assert.ok(expected.length >= 2, 'we run more than one machine; a one-machine baseline cannot detect a lost machine')
+  assert.ok(expected.length >= 1, 'the baseline cannot be empty - with no machine listed, a lost machine is invisible')
   for (const m of expected) assert.match(m, /^[A-Z0-9]+-[A-Z0-9]+$/, `baseline entry "${m}" is not a machine name our runners can produce`)
 })
+
+// Roger, 2026-09-03: "Everything should be running on the laptop. The work PC is for work only
+// and not for anything else." The work PC was retired on 2026-08-25, silently re-registered on
+// 2026-09-01 by a session that read its absence as lost capacity, and removed again the same day
+// he found out. This test is here so the next session has to argue with him, not with a file.
+test('the work PC is not a CI machine and must not reappear in the baseline', () => {
+  assert.ok(
+    !loadExpectedMachines().includes('DESKTOP-124K6MV'),
+    "DESKTOP-124K6MV is Roger's work PC. It must not host runners and must not be in the baseline.",
+  )
+})
+
