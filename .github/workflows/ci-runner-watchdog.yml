@@ -46,6 +46,7 @@ jobs:
       # A red run in the GitHub UI is NOT an alert - nobody is watching the GitHub UI. Without
       # this the fleet could sit on paid runners for days and the first sign would be the bill.
       - name: Email when the fleet falls back to paid runners
+        id: alert
         if: failure()
         run: node scripts/send-ci-runner-alert.mjs
         env:
@@ -71,10 +72,13 @@ jobs:
       # minutes earlier and 780 times in total. The more useful this watchdog was, the deader it
       # looked. The finding still travels - the step above mails it and the run is still red; only
       # the dead-man, whose entire job is to notice SILENCE, stops calling noise silence.
-      # A run that could NOT certify the fleet still pings /fail: see scripts/lib/watchdog-heartbeat.mjs.
+      # A run that could NOT certify the fleet still pings /fail, and so does a run whose alert step
+      # could not deliver the finding - see scripts/lib/guard-heartbeat.mjs.
       - name: Heartbeat
         if: always()
         env:
+          HEARTBEAT_GUARD: ci-runner-watchdog
           HC_PING_URL: ${{ secrets.HC_PING_CI_WATCHDOG }}
           GITHUB_JOB_STATUS: ${{ job.status }}
-        run: node scripts/ci-watchdog-heartbeat.mjs
+          ALERT_STEP_OUTCOME: ${{ steps.alert.outcome }}
+        run: node scripts/guard-heartbeat.mjs

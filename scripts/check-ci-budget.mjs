@@ -378,6 +378,30 @@ if (ranked.length) {
 }
 console.log('')
 
+// THE HEARTBEAT NEEDS TO KNOW THIS RUN HAPPENED, AND THAT IS NOT THE EXIT CODE (2026-09-03).
+// This guard exits 1 for two opposite reasons, and the `HARNESS:` prefix is already the line
+// between them: a HARNESS entry means the sweep read too little to certify anything, while
+// CEILING / UNDECLARED / BUDGET are the findings it exists to produce. The dead-man switch in
+// ci-budget-check.yml used to ping /fail on both, so a guard correctly reporting that the bill
+// had gone over budget would have looked like a guard that had stopped running - which is
+// exactly what happened to ci-runner-watchdog and mailer-config-guard on 2026-09-03.
+//
+// Written last, and in a try/catch, so failing to write the report can never change what this
+// run decides. A missing file is itself a verdict: the heartbeat reads it as "never completed".
+const harnessFailures = failures.filter((f) => f.startsWith('HARNESS:'))
+try {
+  fs.writeFileSync(new URL('../ci-budget-findings.json', import.meta.url), JSON.stringify({
+    checked_at: new Date().toISOString(),
+    window_days: WINDOW_DAYS,
+    runs_examined: totalRuns,
+    private_runs_examined: privateRuns,
+    billed_minutes: billedMinutes,
+    api_calls: stats.calls,
+    harness_failures: harnessFailures,
+    findings: failures.filter((f) => !f.startsWith('HARNESS:')),
+  }, null, 2) + String.fromCharCode(10))
+} catch { /* if we cannot write the report, the heartbeat's missing-file path pings /fail */ }
+
 if (!failures.length) {
   console.log('CI budget guard: PASS')
   process.exit(0)
