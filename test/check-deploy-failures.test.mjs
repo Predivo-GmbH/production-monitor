@@ -12,6 +12,7 @@ import assert from 'node:assert'
 import {
   isDeployWorkflow, isProductionWorkflow, currentFailures, classifyFailure, isAlarm, isUnreadableFile,
   signalFor, planSignals, recoveredKeys, ROLLUP_KEY, ROLLUP_THRESHOLD, observedLaneKeys, deployKey,
+  redForHours, STAGING_STUCK_HOURS,
 } from '../scripts/check-deploy-failures.mjs'
 
 let n = 0
@@ -215,7 +216,12 @@ t('a red deploy-staging JOB inside deploy.yml is filed as STAGING, not productio
   // deploy.yml holds both lanes; a push failing the staging deploy job must not page as production.
   const r = run({ event: 'push', path: '.github/workflows/deploy.yml' })
   const c = classifyFailure(r, { total_count: 1, jobs: [{ name: 'deploy-staging', conclusion: 'failure', steps: [] }] })
-  const s = signalFor({ product: 'ReplyFlow', run: r, classification: c })
+  // Pinned to a clock just after the run, because since 2026-09-03 a staging pipeline that stays
+  // red past STAGING_STUCK_HOURS DOES escalate - a product that cannot ship is a human's problem
+  // even while production is untouched. This case is about which LANE the failure is filed under,
+  // which is unchanged; the stuck case has its own tests at the bottom of this file.
+  const now = new Date('2026-08-31T13:00:00Z')
+  const s = signalFor({ product: 'ReplyFlow', run: r, classification: c, now })
   assert.equal(s.severity, 'warning')
   assert.equal(s.needs_human, false)
   assert.match(s.title, /staging deploy is failing/)
@@ -293,13 +299,27 @@ t('every other failure IS an alarm', () => {
   assert.equal(isAlarm({ kind: 'unknown' }), true)
 })
 
-// ── staging red is filed, not rung ────────────────────────────────────────────
-t('a red STAGING deploy is visible but does not page', () => {
-  const r = run({ path: '.github/workflows/deploy-staging.yml' })
-  const s = signalFor({ product: 'ReplyFlow', run: r, classification: classifyFailure(r, { total_count: 1, jobs: [{ name: 'deploy-staging', conclusion: 'failure', steps: [] }] }) })
+// ── staging red is filed quietly AT FIRST, and rung once it is clearly stuck ──
+// CHANGED 2026-09-03. This used to read "staging red is filed, not rung", full stop, and that is
+// why ChannelMover sat red from 13:43 until Roger found it himself and asked "will you see it and
+// try to fix it yourself." Production being untouched is not the same as the product being able
+// to ship. Fresh stays quiet so nobody mid-repair is paged at; stuck rings.
+t('a FRESH red staging deploy is visible but does not page', () => {
+  const r = run({ path: '.github/workflows/deploy-staging.yml', created_at: '2026-08-31T12:33:30Z' })
+  const now = new Date('2026-08-31T13:20:00Z') // 0.8h
+  const s = signalFor({ product: 'ReplyFlow', run: r, classification: classifyFailure(r, { total_count: 1, jobs: [{ name: 'deploy-staging', conclusion: 'failure', steps: [] }] }), now })
   assert.equal(s.severity, 'warning')
   assert.equal(s.needs_human, false)
   assert.match(s.title, /staging deploy is failing/)
+})
+
+t('the SAME red staging deploy pages once it has been red too long', () => {
+  const r = run({ path: '.github/workflows/deploy-staging.yml', created_at: '2026-08-31T12:33:30Z' })
+  const now = new Date('2026-08-31T18:00:00Z') // 5.4h
+  const s = signalFor({ product: 'ReplyFlow', run: r, classification: classifyFailure(r, { total_count: 1, jobs: [{ name: 'deploy-staging', conclusion: 'failure', steps: [] }] }), now })
+  assert.equal(s.severity, 'critical')
+  assert.equal(s.needs_human, true)
+  assert.match(s.title, /cannot ship at all/)
 })
 
 t('a red PRODUCTION deploy pages', () => {
@@ -347,17 +367,31 @@ t('the threshold is what the constant says, not a number written twice', () => {
   assert.equal(planSignals(many.slice(0, ROLLUP_THRESHOLD - 1)).rollup, null)
 })
 
-t('staging failures never count toward the rollup', () => {
+const stagingFailure = (p, id, createdAt = '2026-08-31T12:33:30Z') => ({
+  product: p,
+  run: run({ id, path: '.github/workflows/deploy-staging.yml', created_at: createdAt }),
+  classification: { kind: 'failed-step', job: 'deploy-staging', step: 'e2e', why: 'x' },
+})
+
+t('FRESH staging failures never count toward the rollup', () => {
   // They cannot page on their own, so counting them would roll up a set that was never going to
   // ring and silence the one production row that was.
-  const staging = (p, id) => ({
-    product: p,
-    run: run({ id, path: '.github/workflows/deploy-staging.yml' }),
-    classification: { kind: 'failed-step', job: 'deploy-staging', step: 'e2e', why: 'x' },
-  })
-  const { rollup, members } = planSignals([staging('A', 1), staging('B', 2), staging('C', 3), prodFailure('D', 4)])
-  assert.equal(rollup, null, 'three staging failures plus one production failure is not a fleet outage')
+  const now = new Date('2026-08-31T13:20:00Z') // 0.8h - everyone still inside the threshold
+  const { rollup, members } = planSignals(
+    [stagingFailure('A', 1), stagingFailure('B', 2), stagingFailure('C', 3), prodFailure('D', 4)], now)
+  assert.equal(rollup, null, 'three FRESH staging failures plus one production failure is not a fleet outage')
   assert.equal(members.filter((m) => m.needs_human).length, 1)
+})
+
+t('but three products STUCK unable to ship IS a fleet condition, and rolls up as one alert', () => {
+  // Added 2026-09-03 with the stuck-staging escalation. Once a staging pipeline can page, it must
+  // also be able to join the rollup - otherwise the whole fleet could be unable to ship and file
+  // three separate rows that each look like somebody else's small problem.
+  const now = new Date('2026-08-31T18:00:00Z') // 5.4h - all three clearly abandoned
+  const { rollup, members } = planSignals(
+    [stagingFailure('A', 1), stagingFailure('B', 2), stagingFailure('C', 3)], now)
+  assert.ok(rollup, 'three products that cannot ship is one fleet alert')
+  assert.equal(members.filter((m) => m.needs_human).length, 0, 'members are demoted under the rollup')
 })
 
 // ── recovery ──────────────────────────────────────────────────────────────────
@@ -472,3 +506,64 @@ t('a broken deploy FILE found by the nightly run still cannot claim the producti
 })
 
 console.log(`\n${n} assertions passed.`)
+
+// ── A STAGING PIPELINE STUCK RED MUST REACH A HUMAN ─────────────────────────────────────────────
+// The regression these exist for: on 2026-09-03 ChannelMover's staging went red at 13:43 and this
+// watcher SAW it, filed the row, and printed "not paging (not-eligible)" - because needs_human was
+// `production`, full stop. It could have stayed red for a week without telling anyone. Roger found
+// it himself and asked the only question that matters: "will you see it and try to fix it
+// yourself." Production being untouched is not the same as the product being able to ship.
+t('THE ONE ROGER FOUND HIMSELF: staging red past the threshold pages, and says it cannot ship', () => {
+  const now = new Date('2026-09-03T17:00:00Z')
+  const r = { ...run(), created_at: '2026-09-03T11:43:00Z' } // 5.3h red
+  const c = classifyFailure(r, { total_count: 1, jobs: [{ name: 'deploy-staging', conclusion: 'failure', steps: [] }] })
+  const s = signalFor({ product: 'ChannelMover', run: r, classification: c, now })
+  assert.equal(s.needs_human, true, 'must page')
+  assert.equal(s.severity, 'critical')
+  assert.match(s.title, /cannot ship at all/)
+  assert.match(s.title, /5\.3h/)
+})
+
+t('a staging failure INSIDE the threshold still does not page - no crying wolf mid-repair', () => {
+  const now = new Date('2026-09-03T12:30:00Z')
+  const r = { ...run(), created_at: '2026-09-03T11:43:00Z' } // 0.8h
+  const c = classifyFailure(r, { total_count: 1, jobs: [{ name: 'deploy-staging', conclusion: 'failure', steps: [] }] })
+  const s = signalFor({ product: 'ChannelMover', run: r, classification: c, now })
+  assert.equal(s.needs_human, false, 'an agent mid-fix must not be paged at')
+  assert.equal(s.severity, 'warning')
+})
+
+t('AN UNREADABLE AGE PAGES rather than qualifying as fresh', () => {
+  // The quiet path is how a thing sits forever.
+  for (const bad of [null, undefined, '', 'not a date']) {
+    const r = { ...run(), created_at: bad }
+    const c = classifyFailure(r, { total_count: 1, jobs: [{ name: 'deploy-staging', conclusion: 'failure', steps: [] }] })
+    const s = signalFor({ product: 'X', run: r, classification: c, now: new Date('2026-09-03T17:00:00Z') })
+    assert.equal(s.needs_human, true, `created_at=${String(bad)} must escalate`)
+    assert.match(s.title, /unknown length of time/)
+  }
+})
+
+t('a PRODUCTION failure still pages immediately, at any age', () => {
+  const now = new Date('2026-09-03T11:44:00Z')
+  const r = { ...run(), created_at: '2026-09-03T11:43:00Z' } // 1 minute old
+  const c = classifyFailure(r, { total_count: 1, jobs: [{ name: 'deploy', conclusion: 'failure', steps: [] }] })
+  const s = signalFor({ product: 'X', run: r, classification: c, now })
+  assert.equal(s.needs_human, true)
+  assert.equal(s.severity, 'critical')
+})
+
+t('the escalation is time-based, so the SAME red run flips once it has sat long enough', () => {
+  const r = { ...run(), created_at: '2026-09-03T11:43:00Z' }
+  const c = classifyFailure(r, { total_count: 1, jobs: [{ name: 'deploy-staging', conclusion: 'failure', steps: [] }] })
+  const early = signalFor({ product: 'X', run: r, classification: c, now: new Date('2026-09-03T13:00:00Z') })
+  const late = signalFor({ product: 'X', run: r, classification: c, now: new Date('2026-09-03T15:00:00Z') })
+  assert.equal(early.needs_human, false, '1.3h — still somebody\'s live work')
+  assert.equal(late.needs_human, true, '3.3h — nobody is on it')
+})
+
+t('redForHours measures from the run, and refuses to guess', () => {
+  assert.equal(redForHours({ created_at: '2026-09-03T09:00:00Z' }, new Date('2026-09-03T12:00:00Z')), 3)
+  assert.equal(redForHours({ created_at: 'rubbish' }, new Date()), null)
+  assert.equal(redForHours({}, new Date()), null)
+})
