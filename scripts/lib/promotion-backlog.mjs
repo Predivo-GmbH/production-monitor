@@ -27,8 +27,26 @@
 // comparing a branch-head number against a deployed number is how you invent a bug that is not
 // there. I nearly reported exactly that.
 
+import { isAutoPromotable } from './auto-promote.mjs'
+
 /** Hours a product may sit promotable before it counts as neglected. */
 export const DEFAULT_MAX_AGE_H = 24
+
+/**
+ * WHO performs the production promotion, in the SAME words the deploy page uses. The owner is a
+ * property of the PRODUCT, not of how late it is, and naming the wrong one is the exact defect
+ * Roger complained about five times (see BackOffice supabase/functions/deploy-status/
+ * promotion-owner.ts): a row that names an owner forbidden to act is a row nobody ever performs -
+ * he read "it's mine, not yours", waited, and nothing moved. Internal tools (backoffice, cockpit,
+ * distribution-os) are Claude's to ship; every other product - the customer-facing ones - still
+ * waits for Roger's word (his standing decision of 2026-09-01). The allowlist is the single
+ * canonical one in auto-promote.mjs, reused here rather than restated so the two cannot drift.
+ */
+export function whoPromotes(name) {
+  return isAutoPromotable(name)
+    ? `Promoting is Claude's job - it has not been done.`
+    : `Promoting a customer-facing product is Roger's call, not Claude's - it is waiting on him.`
+}
 
 /**
  * @param {object} p
@@ -80,7 +98,7 @@ export function classifyBacklog(p, opts = {}) {
     reason:
       `${p.name}: ${p.aheadBy} commit(s) have been waiting to go live for ` +
       `${days >= 2 ? `${days.toFixed(1)} DAYS` : `${ageH.toFixed(1)}h`} ` +
-      `(threshold ${maxAgeH}h). Promoting is Claude's job, not Roger's - it has not been done.`,
+      `(threshold ${maxAgeH}h). ${whoPromotes(p.name)}`,
   }
 }
 

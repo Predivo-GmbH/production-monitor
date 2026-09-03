@@ -31,13 +31,27 @@ test('diverged is reported at ANY age - there is no grace period for a split tha
   assert.equal(r.level, 'diverged')
 })
 
-test('a product waiting longer than the threshold is STALE and says whose job it is', () => {
+test('an INTERNAL product waiting too long says it is Claude to promote', () => {
+  // BackOffice is on the canonical auto-promote allowlist, so this half is mine to ship.
   const r = classifyBacklog(
     { name: 'BackOffice', status: 'ahead', aheadBy: 2, oldestUnshippedAt: hoursAgo(30) },
     { now: NOW },
   )
   assert.equal(r.level, 'stale')
-  assert.match(r.reason, /Promoting is Claude's job, not Roger's/)
+  assert.match(r.reason, /Promoting is Claude's job/)
+})
+
+test('a CUSTOMER-FACING product names ROGER, not Claude - the wrong-owner defect he hit five times', () => {
+  // ChannelMover is NOT on the allowlist; its prod promotion is Roger's word, never Claude's. A row
+  // that told him "it's Claude's job" is a row nobody performed - the whole engine of the complaint
+  // recorded in BackOffice supabase/functions/deploy-status/promotion-owner.ts.
+  const r = classifyBacklog(
+    { name: 'ChannelMover', status: 'ahead', aheadBy: 3, oldestUnshippedAt: hoursAgo(33.5) },
+    { now: NOW },
+  )
+  assert.equal(r.level, 'stale')
+  assert.match(r.reason, /Roger's call/)
+  assert.doesNotMatch(r.reason, /Claude's job/, 'must not tell Roger a customer-facing deploy is mine')
 })
 
 test('a long wait is reported in DAYS, because 400h means nothing to a reader', () => {
