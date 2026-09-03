@@ -30,7 +30,7 @@ import { writeFileSync } from 'node:fs'
 import { auditRunnerMachines, loadExpectedMachines, loadRetiredMachines } from './lib/runner-machines.mjs'
 import { auditRunnerSaturation } from './lib/runner-saturation.mjs'
 import { looksLikeRunnerLoss, confirmRunnerLoss, describeRunnerLoss, recentFailedRuns } from './lib/runner-loss.mjs'
-import { cancelledRequiredGates, describeCancelledGate, recentCancelledRuns } from './lib/cancelled-gate.mjs'
+import { cancelledRequiredGates, describeCancelledGate, recentCancelledRuns, supersededByLaterSuccess } from './lib/cancelled-gate.mjs'
 
 const OWNER = process.env.CI_RUNNER_OWNER || 'Predivo-GmbH'
 const TOKEN = process.env.GH_TOKEN || process.env.GITHUB_TOKEN
@@ -284,7 +284,22 @@ for (const repo of repos) {
   // Same bounded, cheap shape as the runner-loss block above; the run conclusion is `cancelled` when
   // a gate is singled out, so status=cancelled is the correct cheap prefilter.
   const cancelledRuns = await gh(`repos/${OWNER}/${repo}/actions/runs?status=cancelled&per_page=10`)
-  for (const run of recentCancelledRuns(cancelledRuns?.workflow_runs, { lookbackMinutes: RUNNER_LOSS_LOOKBACK_MIN })) {
+  const stillCancelled = recentCancelledRuns(cancelledRuns?.workflow_runs, { lookbackMinutes: RUNNER_LOSS_LOOKBACK_MIN })
+  // HAS THE RELEASE SINCE SHIPPED? (added 2026-09-03) One extra call, and only when there is
+  // actually a cancellation to judge - so the common case, no cancellations, costs nothing.
+  // Without it the finding is true about the past and false about the present, and the watchdog's
+  // */10 cron against a 90-minute lookback re-derives and re-mails it up to nine times. It did:
+  // seven identical emails about BoatBuddy between 07:44:30Z and 08:48:05Z on 2026-09-03, every
+  // copy after 07:47:52Z false, because run 33729608920 had already passed the same gate and
+  // deployed. Five were still unread, and each new copy pulled the thread back into the inbox
+  // faster than the archiver could file it.
+  const recentAll = stillCancelled.length
+    ? await gh(`repos/${OWNER}/${repo}/actions/runs?per_page=30`, {}, { soft: true })
+    : null
+  for (const run of stillCancelled) {
+    // A cancellation that a later successful run of the same workflow and branch has overtaken is
+    // history, not an incident. Reporting it anyway is how a true sentence becomes a false alarm.
+    if (supersededByLaterSuccess(run, recentAll?.workflow_runs)) continue
     const jobs = await gh(`repos/${OWNER}/${repo}/actions/runs/${run.id}/jobs?per_page=50`, {}, { soft: true })
     for (const job of cancelledRequiredGates(jobs?.jobs)) {
       alerts.push(describeCancelledGate({ repo, run, job }))

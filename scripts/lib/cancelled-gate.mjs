@@ -99,3 +99,35 @@ export function recentCancelledRuns(runs, { now = Date.now(), lookbackMinutes = 
     })
     .slice(0, max)
 }
+
+// IS THIS CANCELLATION ALREADY OVERTAKEN? (added 2026-09-03)
+//
+// WHY. The module above answers "was a required gate cancelled while its siblings passed" — and it
+// answers it correctly. What it never asked is whether the release it claims is blocked has since
+// SHIPPED. On 2026-09-03 BoatBuddy run 33726492534 had gate-e2e cancelled at 07:07Z; run 33729608920
+// re-ran the same workflow at 07:43:57Z with gate-e2e success at 07:45:34Z and deploy success at
+// 07:47:52Z. The finding stayed true about the past and false about the present, and because the
+// watchdog runs every ten minutes against a ninety-minute lookback, 90 / 10 = up to 9 copies of one
+// dead finding — seven were actually sent, five still unread, and each new copy pulled the thread
+// back into the inbox faster than the archiver could file it.
+//
+// The comment at the call site already promised this behaviour ("why it cannot fire on a superseded
+// run"), which referred to someJobSucceeded above — a different question. A comment asserting a
+// property the code does not have is the defect this fleet spent three days removing, so the
+// promise is now implemented rather than reworded.
+//
+// Deliberately compares by WORKFLOW + BRANCH and by start time, not by run number: a re-run of the
+// same run keeps its number, and what matters is that a later attempt of the same pipeline on the
+// same branch reached success.
+export function supersededByLaterSuccess(run, laterRuns) {
+  if (!run) return false
+  const startedAt = Date.parse(run.created_at || run.updated_at || '')
+  if (!Number.isFinite(startedAt)) return false
+  return (laterRuns || []).some((r) => {
+    if (!r || r.conclusion !== 'success') return false
+    if (String(r.workflow_id) !== String(run.workflow_id)) return false
+    if ((r.head_branch || null) !== (run.head_branch || null)) return false
+    const t = Date.parse(r.created_at || '')
+    return Number.isFinite(t) && t > startedAt
+  })
+}
