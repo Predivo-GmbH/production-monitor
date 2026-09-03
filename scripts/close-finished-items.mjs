@@ -129,6 +129,25 @@ export const ACTIONABLE_STATUSES = ['next', 'in_progress', 'blocked']
 /** A row this script must never touch, whatever its finish-test says. */
 export const UNTOUCHABLE_STATUSES = ['done', 'abandoned', 'awaiting_signoff']
 
+/**
+ * A QUESTION OWED TO ROGER IS THE OTHER HALF OF HIS LANE, AND IT WAS NOT PROTECTED.
+ *
+ * The comment above ACTIONABLE_STATUSES already says it: a row parked in his lane with a question
+ * addressed to him must not be closed by a machine, because that is "answering on his behalf".
+ * UNTOUCHABLE_STATUSES enforced that for `awaiting_signoff` and NOT for `blocked` — and this file
+ * did not mention `blocked_question` or `blocked_owner` even once. sql/092 builds his list as
+ * `awaiting_signoff` OR a question recorded against him, so a blocked row is in his lane by exactly
+ * the same right, and sql/096 exists because such a question was once deleted by a side effect.
+ *
+ * A row blocked on a VENDOR or a CLIENT is a different thing and stays closeable: the finish-test
+ * passing is real news about it, and nobody is being answered for.
+ */
+export function isOwedToRoger(item) {
+  if (!item) return false
+  if (String(item.blocked_owner || '').toLowerCase() === 'roger') return true
+  return item.status === 'blocked' && Boolean(String(item.blocked_question || '').trim())
+}
+
 export const SKIP = 'skip'
 
 // ── the pure core ────────────────────────────────────────────────────────────────────────────
@@ -521,6 +540,9 @@ export function selectItems(rows) {
   for (const r of rows || []) {
     if (UNTOUCHABLE_STATUSES.includes(r.status)) { untouchable.push(r); continue }
     if (!ACTIONABLE_STATUSES.includes(r.status)) { untouchable.push(r); continue }
+    // A question addressed to Roger is his to answer, whatever the finish-test says. Held here
+    // rather than at the close, so it never reaches workClose and never shows up as a near-miss.
+    if (isOwedToRoger(r)) { untouchable.push(r); continue }
     actionable.push(r)
   }
   return { actionable, untouchable }
@@ -568,7 +590,7 @@ export async function readBoard({ env = process.env, fetchImpl = fetch } = {}) {
   const base = env.SUPABASE_URL
   const key = env.SUPABASE_SERVICE_KEY
   const statuses = ACTIONABLE_STATUSES.concat(UNTOUCHABLE_STATUSES.filter((s) => s === 'awaiting_signoff'))
-  const q = `work_items?select=id,slug,title,status,done_when,documentation_ref,opened_at,started_at,claim_paths` +
+  const q = `work_items?select=id,slug,title,status,done_when,documentation_ref,opened_at,started_at,claim_paths,blocked_question,blocked_owner` +
     `&status=in.(${statuses.join(',')})&order=opened_at.asc&limit=2000`
   const res = await fetchImpl(`${base}/rest/v1/${q}`, {
     headers: { apikey: key, Authorization: `Bearer ${key}`, Accept: 'application/json' },

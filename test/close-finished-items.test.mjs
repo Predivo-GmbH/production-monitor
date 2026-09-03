@@ -56,7 +56,7 @@ import {
   ACTIONABLE_STATUSES, UNTOUCHABLE_STATUSES, KINDS, SKIP,
   parseDoneWhen, evaluateDoneWhen, sweep, selectItems, verdict, receiptFor, offerToBoard,
   sqlIsReadOnly, testPathIsRunnable, sentryStatusIsSettled, isDryRun, closureCap,
-  loadBoardCredentials, boardProjectRef, SENTRY_ISSUE_PATHS,
+  loadBoardCredentials, boardProjectRef, SENTRY_ISSUE_PATHS, isOwedToRoger,
 } from '../scripts/close-finished-items.mjs'
 import { PASS, FAIL, UNKNOWN, reportedPass, VERDICT_MARKER } from '../scripts/lib/check-verdict.mjs'
 
@@ -743,6 +743,44 @@ ta('a REAL test file that exits non-zero is "not finished yet", and one that exi
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+// ── A QUESTION OWED TO ROGER IS THE OTHER HALF OF HIS LANE (added 2026-09-03) ────────────────
+// This file protected `awaiting_signoff` from the first commit and left `blocked` actionable, while
+// the script did not mention `blocked_question` or `blocked_owner` once. sql/092 builds his list as
+// `awaiting_signoff` OR a question recorded against him, so a blocked row is in his lane by exactly
+// the same right — and sql/096 exists because such a question was once deleted by a side effect.
+// Caught on the live board: two rows whose finish-test PASSED were sitting blocked on a question
+// to him, and nothing in this script would have stopped it closing them.
+
+t('a blocked row carrying a question owed to Roger is untouchable', () => {
+  assert.equal(isOwedToRoger({ status: 'blocked', blocked_question: 'May I rotate the key?' }), true)
+})
+
+t('blocked_owner=roger is enough on its own, with no question text recorded', () => {
+  assert.equal(isOwedToRoger({ status: 'blocked', blocked_owner: 'roger' }), true)
+  assert.equal(isOwedToRoger({ status: 'blocked', blocked_owner: 'ROGER' }), true, 'case must not matter')
+})
+
+t('a row blocked on a VENDOR or client stays closeable — nobody is being answered for', () => {
+  assert.equal(isOwedToRoger({ status: 'blocked', blocked_owner: 'vendor', blocked_question: '' }), false)
+})
+
+t('an ordinary next or in_progress row is unaffected', () => {
+  assert.equal(isOwedToRoger({ status: 'next' }), false)
+  assert.equal(isOwedToRoger({ status: 'in_progress', blocked_question: null }), false)
+  assert.equal(isOwedToRoger(null), false, 'a missing row is not owed to anyone')
+})
+
+t('DEFECT: selectItems must HOLD the owed row, not merely refuse it at the close', () => {
+  const { actionable, untouchable } = selectItems([
+    { slug: 'owed', status: 'blocked', blocked_question: 'yes or no?' },
+    { slug: 'plain', status: 'next' },
+    { slug: 'parked', status: 'awaiting_signoff' },
+    { slug: 'vendor', status: 'blocked', blocked_owner: 'vendor' },
+  ])
+  assert.deepEqual(actionable.map((r) => r.slug), ['plain', 'vendor'])
+  assert.deepEqual(untouchable.map((r) => r.slug).sort(), ['owed', 'parked'])
 })
 
 await Promise.all(pending)
