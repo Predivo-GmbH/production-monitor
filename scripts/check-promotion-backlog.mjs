@@ -33,6 +33,7 @@
  */
 import { readFileSync } from 'fs'
 import { classifyBacklog, rank, DEFAULT_MAX_AGE_H } from './lib/promotion-backlog.mjs'
+import { isAppDeployRun } from './lib/auto-promote.mjs'
 
 // The board this files into is BackOffice's, the same one every sibling sensor writes to.
 export const SOURCE = 'promotion-backlog'
@@ -78,11 +79,11 @@ async function main() {
   }
 
   /** The head sha of the most recent run whose named job actually SUCCEEDED. Never the run colour. */
-  async function lastDeployedSha(repo, workflowMatch, jobName) {
+  async function lastDeployedSha(repo, isWanted, jobName) {
     const runs = await gh(`/repos/${OWNER}/${repo}/actions/runs?per_page=30`)
     if (!runs?.workflow_runs) return null
     for (const run of runs.workflow_runs) {
-      if (!workflowMatch.test(String(run.name || ''))) continue
+      if (!isWanted(String(run.name || ''))) continue
       const jobs = await gh(`/repos/${OWNER}/${repo}/actions/runs/${run.id}/jobs?per_page=50`)
       const job = (jobs?.jobs || []).find((j) => j.name === jobName)
       if (job?.conclusion === 'success') return run.head_sha
@@ -96,8 +97,13 @@ async function main() {
   for (const repo of FLEET) {
     // Only an error raised while reading THIS product may be offered as this product's cause.
     const errorsBefore = apiErrors
-    const prod = await lastDeployedSha(repo, /deploy/i, 'deploy')
-    const staging = await lastDeployedSha(repo, /deploy/i, 'deploy-staging')
+    // isAppDeployRun, not /deploy/i: `deploy-edge-functions.yml` is named "Deploy edge functions"
+    // AND its job is called `deploy`, so it satisfied both halves of the old match and, being far
+    // more frequent, won the scan. This board then reported backoffice and Distribution-OS against
+    // an edge-functions sha - Distribution-OS's "behind 8" on Roger's deploy page was really
+    // behind 1. Measured across all eight products; only those two change.
+    const prod = await lastDeployedSha(repo, isAppDeployRun, 'deploy')
+    const staging = await lastDeployedSha(repo, isAppDeployRun, 'deploy-staging')
     if (!prod || !staging) {
       unreadable.push(describeUnreadable({
         repo, prod: !!prod, staging: !!staging, cause: apiErrors > errorsBefore ? lastApiError : null,

@@ -20,7 +20,7 @@
  *   PROMOTE_INTERNAL_DRY_RUN=1   decide and print, dispatch nothing
  *   PROMOTE_INTERNAL_OFF=1       kill switch: do nothing at all, loudly
  */
-import { decide, pickOne, AUTO_PROMOTABLE, REQUIRED_STAGING_JOBS } from './lib/auto-promote.mjs'
+import { decide, pickOne, pipelineFor, AUTO_PROMOTABLE, REQUIRED_STAGING_JOBS } from './lib/auto-promote.mjs'
 
 const OWNER = process.env.PROMO_OWNER || 'Predivo-GmbH'
 const TOKEN = process.env.GH_TOKEN || process.env.GITHUB_TOKEN
@@ -50,12 +50,20 @@ async function gh(path, init) {
   } catch { return { ok: false, status: 0, body: null } }
 }
 
-/** The newest run whose named job actually SUCCEEDED, with that run's job conclusions. */
-async function lastDeployed(repo, jobName) {
-  const runs = await gh(`/repos/${OWNER}/${repo}/actions/runs?per_page=30`)
+/**
+ * The newest run OF ONE NAMED WORKFLOW FILE whose named job actually SUCCEEDED, with that run's
+ * job conclusions.
+ *
+ * It takes a workflow FILE, not a name pattern, and that is the whole fix of 2026-09-03: the old
+ * version scanned every recent run for a name containing "deploy" holding a job called `deploy`,
+ * and `deploy-edge-functions.yml` matches both. On backoffice and Distribution-OS the edge
+ * pipeline won that scan, so "what production is running" was the sha of an edge-functions
+ * deploy. See PIPELINES in lib/auto-promote.mjs for the measurements.
+ */
+async function lastDeployed(repo, workflowFile, jobName) {
+  const runs = await gh(`/repos/${OWNER}/${repo}/actions/workflows/${workflowFile}/runs?per_page=30`)
   if (!runs.ok || !runs.body?.workflow_runs) return null
   for (const run of runs.body.workflow_runs) {
-    if (!/deploy/i.test(String(run.name || ''))) continue
     const jobs = await gh(`/repos/${OWNER}/${repo}/actions/runs/${run.id}/jobs?per_page=50`)
     if (!jobs.ok) return null
     const list = jobs.body?.jobs || []
@@ -67,6 +75,12 @@ async function lastDeployed(repo, jobName) {
     }
   }
   return null
+}
+
+/** The commit a production dispatch would actually ship: the tip of that pipeline's branch. */
+async function refHead(repo, ref) {
+  const r = await gh(`/repos/${OWNER}/${repo}/commits/${ref}`)
+  return r.ok ? (r.body?.sha ?? null) : null
 }
 
 /** Is any fleet deploy in flight? Same question the PreToolUse serializer asks. */
@@ -84,23 +98,20 @@ async function fleetBusy() {
   return { busy: false, why: '' }
 }
 
-/** The production deploy workflow file for a repo, found rather than assumed. */
-async function prodWorkflow(repo) {
-  const r = await gh(`/repos/${OWNER}/${repo}/actions/workflows?per_page=100`)
-  if (!r.ok) return null
-  const candidates = (r.body?.workflows || []).filter(
-    (w) => /deploy/i.test(w.name || '') && !/staging|edge|nightly/i.test(w.name || '') && w.state === 'active',
-  )
-  return candidates.length === 1 ? candidates[0] : null
-}
-
 const busy = await fleetBusy()
 if (busy.busy) console.log(`promote-internal: fleet busy - ${busy.why}`)
 
 const decisions = []
 for (const repo of AUTO_PROMOTABLE) {
-  const prod = await lastDeployed(repo, 'deploy')
-  const staging = await lastDeployed(repo, 'deploy-staging')
+  // The pipeline is PINNED, never pattern-matched. A repo the map does not name is refused here
+  // rather than guessed at, the same way the allowlist refuses a product it does not name.
+  const pipe = pipelineFor(repo)
+  if (!pipe) {
+    decisions.push({ promote: false, reason: `${repo}: no production pipeline is pinned for it in lib/auto-promote.mjs - refusing to go looking for one`, repo, stagingSha: null, pipe: null })
+    continue
+  }
+  const prod = await lastDeployed(repo, pipe.prod, 'deploy')
+  const staging = await lastDeployed(repo, pipe.staging, 'deploy-staging')
   let compareStatus = null
   if (prod?.sha && staging?.sha && prod.sha !== staging.sha) {
     const cmp = await gh(`/repos/${OWNER}/${repo}/compare/${prod.sha}...${staging.sha}`)
@@ -116,8 +127,12 @@ for (const repo of AUTO_PROMOTABLE) {
       compareStatus,
       stagingJobs: staging?.jobs ?? {},
       fleetBusy: busy.busy,
+      // What would ACTUALLY ship. Read only when there is something to ship, so a hold costs no
+      // extra API call; decide() refuses on a null it needed.
+      refHeadSha: prod?.sha && staging?.sha && prod.sha !== staging.sha ? await refHead(repo, pipe.ref) : null,
     }),
     repo,
+    pipe,
     stagingSha: staging?.sha ?? null,
   })
 }
@@ -131,24 +146,21 @@ if (!chosen) {
 }
 
 if (DRY) {
-  console.log(`promote-internal: DRY RUN - would promote ${chosen.repo} ${String(chosen.stagingSha).slice(0, 7)}. Nothing dispatched.`)
+  console.log(`promote-internal: DRY RUN - would promote ${chosen.repo} ${String(chosen.stagingSha).slice(0, 7)} via ${chosen.pipe.prod} on ${chosen.pipe.ref}. Nothing dispatched.`)
   process.exit(0)
 }
 
-const wf = await prodWorkflow(chosen.repo)
-if (!wf) {
-  console.error(`::error::${chosen.repo}: could not identify exactly ONE active production deploy workflow. Refusing to guess which one to run.`)
-  process.exit(1)
-}
-
-const res = await gh(`/repos/${OWNER}/${chosen.repo}/actions/workflows/${wf.id}/dispatches`, {
+// The workflow dispatched is the SAME FILE the production sha was read from, and the ref is that
+// pipeline's own branch - "main" used to be hardcoded here, which for Distribution-OS (default
+// branch `master`) would have failed every promotion it ever attempted with an HTTP 422.
+const res = await gh(`/repos/${OWNER}/${chosen.repo}/actions/workflows/${chosen.pipe.prod}/dispatches`, {
   method: 'POST',
-  body: JSON.stringify({ ref: 'main', inputs: { confirm: 'deploy' } }),
+  body: JSON.stringify({ ref: chosen.pipe.ref, inputs: { confirm: 'deploy' } }),
 })
 if (!res.ok) {
-  console.error(`::error::${chosen.repo}: dispatching "${wf.name}" failed (HTTP ${res.status}). Nothing was promoted.`)
+  console.error(`::error::${chosen.repo}: dispatching ${chosen.pipe.prod} on ${chosen.pipe.ref} failed (HTTP ${res.status}). Nothing was promoted.`)
   process.exit(1)
 }
-console.log(`promote-internal: dispatched "${wf.name}" for ${chosen.repo} on ${String(chosen.stagingSha).slice(0, 7)}.`)
+console.log(`promote-internal: dispatched ${chosen.pipe.prod} (${chosen.pipe.ref}) for ${chosen.repo} on ${String(chosen.stagingSha).slice(0, 7)}.`)
 console.log(`  gates required and proven green on that commit: ${REQUIRED_STAGING_JOBS.join(', ')}`)
 console.log('  The deploy JOB conclusion is the proof it shipped - never the run colour.')
