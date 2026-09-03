@@ -36,9 +36,17 @@
  *   node scripts/the-monthly-no.mjs --write   file the one question
  */
 import { readFileSync } from 'fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { sayVerdict, PASS, UNKNOWN } from './lib/check-verdict.mjs'
 
-const CLAUDE_CONFIG = 'C:/Users/roger_rwjnmnz/.claude.json'
+// RESOLVED, NEVER HARDCODED. This was 'C:/Users/roger_rwjnmnz/.claude.json' and the job failed
+// on its very first real run: it is scheduled on LAPTOP-88N97BGG, where the user is
+// `roger_spfi4lz` and that path does not exist. The task reported LastTaskResult 1 and the
+// script said honestly that it could not read the board registration -- which is the only reason
+// this was caught rather than becoming a weekly job that quietly never measured anything.
+// close-finished-items.mjs had it right all along: join(homedir(), '.claude.json').
+const CLAUDE_CONFIG = join(homedir(), '.claude.json')
 const DAY = 86_400_000
 export const UNTOUCHED_DAYS = Number(process.env.NO_BUNDLE_DAYS || 30)
 export const BUNDLE_SLUG = 'the-monthly-no-shall-we-drop-these'
