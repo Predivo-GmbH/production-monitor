@@ -658,8 +658,28 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
 
+      # A STEP CAP, BECAUSE THE JOB CAP IS THE ONE THAT SILENCES US (2026-09-03).
+      #
+      # The rule is already written at :140 for the Playwright step: a STEP timeout fails the job,
+      # so the alert fires; the JOB timeout-minutes yields conclusion=cancelled, and every alert
+      # path in this file is gated on failure(). It was applied to exactly one step, and on
+      # 2026-09-03 run 33719854715 the gap was found the expensive way. check-products-down.mjs
+      # then probed twelve products one at a time, 50s each when they fail, so an hour in which
+      # everything looked unreachable cost ten minutes. The job was killed at 30 minutes while the
+      # check was still on product five. Its conclusion was "cancelled", so "Send alert on
+      # failure", the heartbeat ping and the artifact upload were ALL SKIPPED - a run that had
+      # found five failed tests, a laundered failure, two unreachable criticals and two dark
+      # scheduled jobs told nobody anything.
+      #
+      # Two things fix that and both are here. The script now probes six at a time, so its worst
+      # case is under two minutes rather than ten. This cap is the backstop for the case that
+      # reasoning misses: if this step ever runs long again it dies as a FAILURE, which is loud,
+      # instead of eating the budget of every step after it and taking the alarm down with it.
+      # Everything between the Playwright step and here shares roughly seven minutes of job
+      # budget and nothing else caps it - this is the one proven to grow with the size of the fleet.
       - name: A product a customer cannot use must say so
         if: always()  # THE FIX: a product being down is exactly what fails the monitor step above, and default if:success() then SKIPS this sensor — the alarm was armed to never fire. Matches the canary at :154. check-products-down.mjs exits 0 on a filed alarm (only a failed read reds the job), so this cannot double-red one event.
+        timeout-minutes: 4
         run: node scripts/check-products-down.mjs
         env:
           BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}

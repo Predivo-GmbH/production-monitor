@@ -245,6 +245,134 @@ export function reasonsUnreachable({ site, auth, brand }) {
   return reasons
 }
 
+/**
+ * -- AN OUTAGE CLAIM MUST FIRST PROVE THE OBSERVER COULD SEE (2026-09-03) ---------------------
+ *
+ * Everything above this line guards one direction: a thing we could not check must never read as
+ * healthy. The mirror was unguarded, and it fired. On 2026-09-03 run 33719854715 this script
+ * reported BackOffice, ReplyFlow, SignalScore, ChannelMover and ScoutCopilot each "DOWN after 3
+ * attempt(s): the site itself does not load (Timeout)". Twenty-six minutes earlier the previous
+ * run had all twelve OK in ten seconds, and they answered in under 0.2s from a laptop while the
+ * run was still going. The same run's IMAP step had already failed with `[Errno 101] Network is
+ * unreachable` -- a routing error, where every other run that day got AUTHENTICATIONFAILED.
+ *
+ * The two safeguards this file already had are both PER PRODUCT and neither one can see this:
+ * three attempts 10s apart all land inside the same network fault, and the second-sighting rule
+ * would have escalated all five to `critical` / `needs_human` an hour later. Five phone calls
+ * about five healthy products.
+ *
+ * TWO DISTINCTIONS DO THE WORK, and both are about what we actually observed:
+ *
+ *   1. AN ANSWER IS EVIDENCE; SILENCE IS NOT. `HTTP 503` means we reached the machine and it
+ *      told us it is broken -- that is a real outage of that product and is never correlated
+ *      away. A `Timeout` or a dead socket means we got nothing back, which is a statement about
+ *      the path, not about the product. Only no-answer failures are eligible below.
+ *
+ *   2. WHERE THE SILENCE LANDS. Resolved addresses are what separate the two innocent readings.
+ *      `backoffice.predivo.ch`, `signalscore.ch` and `channelmover.com` are all 80.74.145.155,
+ *      and so is the mail host `tertia.sui-inter.net` -- so one machine going dark looks like
+ *      three product outages. That is ONE incident and deserves ONE row that names the machine.
+ *      Silence spanning SEVERAL unrelated addresses in one four-minute window is not several
+ *      coincidences; the one thing all those paths share is us.
+ *
+ * Reaching GitHub or Supabase is NOT a usable control and was rejected on the evidence: in the
+ * run above the Supabase, GitHub and healthchecks steps all succeeded minutes before and after
+ * the products timed out. A "can I reach the internet" probe would have passed and the five
+ * false outages would have been filed anyway. Egress degrades per-path, so the only honest
+ * control is the shape of our own failures.
+ *
+ * THIS CANNOT SWALLOW A REAL FLEET OUTAGE. The blind verdict obeys the same two-run rule as
+ * everything else here: the first one warns on the board, and if the NEXT hourly run is blind
+ * in the same way it escalates to critical and rings. One bad network minute is quiet; a fleet
+ * that is genuinely dark for two consecutive hours still reaches Roger.
+ */
+
+/** Did we get an answer at all? `HTTP 503` did; `Timeout` and a dead socket did not. */
+export function isNoAnswer(detail) {
+  return !/^HTTP \d+/.test(String(detail || ''))
+}
+
+/** The product failed, and every reason it failed for is silence rather than a reply. */
+export function failedWithoutAnswer(last) {
+  if (!last) return false
+  const answered = [last.site, last.auth].some((r) => r && r.ok === false && !isNoAnswer(r.detail))
+  if (answered) return false
+  if (last.brand === false) return false // it served us a page, so we reached it
+  return [last.site, last.auth].some((r) => r && r.ok === false && isNoAnswer(r.detail))
+}
+
+/**
+ * One event, or many? Pure so the tests can drive every branch without a network.
+ *
+ * `entries` are the products that failed, each `{ name, addr, noAnswer }` where `addr` is the
+ * resolved IP of its hostname (null = we could not even resolve it, which is itself silence).
+ */
+export function correlateOutage(entries, total = 0) {
+  const silent = (entries || []).filter((e) => e.noAnswer)
+  const named = silent.map((e) => e.name)
+  if (silent.length < 2) return { kind: 'independent', names: [] }
+  const addrs = [...new Set(silent.map((e) => e.addr).filter(Boolean))]
+  const wholeFleet = total > 0 && named.length >= total
+  if (addrs.length === 1 && silent.every((e) => e.addr)) {
+    return { kind: 'shared-host', addr: addrs[0], names: named, wholeFleet }
+  }
+  return { kind: 'observer', addrs, names: named, wholeFleet }
+}
+
+/** The single row a correlated event files, in place of one row per product. */
+export function correlatedSignal(verdict, { confirmed }) {
+  const list = verdict.names.join(', ')
+  if (verdict.kind === 'shared-host') {
+    return {
+      source: SOURCE, key: `${KEY_PREFIX}:host:${verdict.addr}`, kind: 'incident',
+      severity: confirmed ? 'critical' : 'warning', needs_human: confirmed, state: 'open',
+      title: confirmed
+        ? `Nothing has reached ${verdict.addr} for two hours - ${verdict.names.length} product(s) sit on it`
+        : `${verdict.names.length} product(s) on one machine all went silent - confirming on the next run`,
+      summary: `${list} all stopped answering in the same window and all resolve to ${verdict.addr}. `
+        + `That is ONE machine, not ${verdict.names.length} separate outages. `
+        // NOT "the machine is down". From here those are indistinguishable, and this file does not
+        // get to pick the scarier one: the box may be dead, or this monitor's route to it may be.
+        + 'Nothing answered, so this says the machine could not be REACHED - either it is down, or the path to it from wherever this ran is. '
+        + (verdict.wholeFleet
+          ? 'This is every product in the registry, and the alert mailbox is on the same address, so an outage here is also an outage of the way you would be told about it. '
+          : '')
+        + (confirmed
+          ? 'Two consecutive hourly runs have now failed to reach it. Whichever reading is right, nobody can currently prove a single product is serving customers.'
+          : 'Filed but NOT alerted: one run is not an outage. If the next hourly run finds the same thing, this escalates and rings.'),
+      detail: { address: verdict.addr, products: verdict.names, confirmed, wholeFleet: Boolean(verdict.wholeFleet) },
+      link: 'https://cockpit.predivo.ch/signals',
+    }
+  }
+  return {
+    source: SOURCE, key: `${KEY_PREFIX}:monitor-blind`, kind: 'incident',
+    severity: confirmed ? 'critical' : 'warning', needs_human: confirmed, state: 'open',
+    title: confirmed
+      ? `Two hours running, the monitor could not reach ${verdict.names.length} products - believe it now`
+      : `The monitor could not reach ${verdict.names.length} products at once, and probably cannot see`,
+    summary: `${list} all went silent in the same run, across ${verdict.addrs.length || 'no'} different `
+      + `address(es). Nothing answered, so nothing here proves any product is down - unrelated machines `
+      + 'do not fail together, and the one thing every one of those paths has in common is this monitor. '
+      + (confirmed
+        ? 'This is the SECOND consecutive run to see it, which is no longer plausibly a network blip on one runner. Treat it as a real fleet-wide outage until proven otherwise.'
+        : 'Filed WITHOUT alerting. If the next hourly run is blind the same way, this escalates and rings.'),
+    detail: { products: verdict.names, addresses: verdict.addrs, confirmed },
+    link: 'https://cockpit.predivo.ch/signals',
+  }
+}
+
+/** Resolve a URL host to one address. Only ever called for products that already failed. */
+export async function addressOf(url, lookup = null) {
+  try {
+    const host = new URL(url).hostname
+    const resolve = lookup || (await import('node:dns')).promises.resolve4
+    const addrs = await resolve(host)
+    return (addrs && addrs[0]) || null
+  } catch {
+    return null
+  }
+}
+
 /** Probe once. Split out so the retry loop and the tests can both drive it. */
 async function probeOnce(p) {
   const [site, auth] = await Promise.all([probeSite(p.prod_url), probeAuth(p.supabase_ref, authKeyFor(p.name))])
@@ -343,6 +471,42 @@ export function coverageLine(checked, active) {
       : ' — every active product is watched')
 }
 
+/**
+ * HOW MANY PRODUCTS ARE PROBED AT ONCE, and why this is not "as many as possible".
+ *
+ * It used to be one at a time. That is what turned this check into a run-killer: a product that
+ * fails costs CONFIRM_ATTEMPTS * PROBE_TIMEOUT_MS plus the gaps -- 50 seconds each -- so twelve
+ * silent products cost ten minutes, in a job whose whole budget is 25 and whose Playwright step
+ * already takes fifteen. On 2026-09-03 run 33719854715 that is exactly what happened: the check
+ * was still on product five when the job was killed at 30 minutes, and because a killed job ends
+ * as `cancelled` rather than `failure`, "Send alert on failure" was SKIPPED. The run had found
+ * five test failures, a laundered failure, two unreachable criticals and two dark scheduled jobs,
+ * and told nobody. The slowest path through this file was the one that fires when the most is
+ * wrong -- so the worst hour was the one guaranteed to be silent.
+ *
+ * Six, not twelve, because this file's own header records the opposite failure: on 2026-08-24
+ * "Valrano: all deployed edge functions 503" was a boot storm caused by a probe's own parallel
+ * fan-out. These are GETs on a site and on /auth/v1/health rather than the rate-limited POST that
+ * caused that, but a bounded pool costs nothing and keeps the lesson honoured. Worst case falls
+ * from ten minutes to under two.
+ */
+const PROBE_CONCURRENCY = 6
+
+/** Run `fn` over `items` at most `limit` at a time, returning results IN INPUT ORDER. */
+export async function mapPool(items, limit, fn) {
+  const out = new Array(items.length)
+  let next = 0
+  const worker = async () => {
+    while (true) {
+      const i = next++
+      if (i >= items.length) return
+      out[i] = await fn(items[i], i)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+  return out
+}
+
 async function main() {
   const dry = process.argv.includes('--dry')
   const secret = readBoSecret()
@@ -357,26 +521,47 @@ async function main() {
   const open = await boGet(secret, `fleet_signals?source=eq.${SOURCE}&state=eq.open&key=like.${KEY_PREFIX}:*&select=key,severity`)
   const openKeys = new Map(open.map((r) => [r.key, r]))
 
+  const probed = await mapPool(fleet, PROBE_CONCURRENCY, (p) => confirmUnreachable(p))
+
   const down = []
   const authExpected = fleet.filter((p) => p.supabase_ref).map((p) => p.name)
   const authUnproven = []
-  for (const p of fleet) {
-    const { reasons, attempts, last } = await confirmUnreachable(p)
+  for (let i = 0; i < fleet.length; i++) {
+    const p = fleet[i]
+    const { reasons, attempts, last } = probed[i]
     if (p.supabase_ref && last && last.auth && last.auth.ok === null) authUnproven.push(p.name)
     if (reasons.length === 0) {
       const caveat = p.supabase_ref && last && last.auth && last.auth.ok === null ? `  (auth UNPROVEN: ${last.auth.detail})` : ''
       console.log(`  OK    ${p.name}${caveat}`)
       continue
     }
-    console.log(`  DOWN  ${p.name} after ${attempts} attempt(s): ${reasons.join('; ')}`)
-    down.push({ p, reasons })
+    down.push({ p, reasons, attempts, noAnswer: failedWithoutAnswer(last) })
+  }
+
+  // Resolve an address ONLY for the products that failed with silence. It is what tells one dead
+  // machine apart from a blind monitor, and it is printed so a human sees the same thing we did.
+  for (const d of down) d.addr = d.noAnswer ? await addressOf(d.p.prod_url) : null
+  for (const d of down) {
+    const where = d.noAnswer ? `  [no answer from ${d.addr || 'an address we could not even resolve'}]` : ''
+    console.log(`  DOWN  ${d.p.name} after ${d.attempts} attempt(s): ${d.reasons.join('; ')}${where}`)
   }
   console.log(authCoverageLine(authExpected.length - authUnproven.length, authExpected.length, authUnproven, fleet.length - authExpected.length))
+
+  const verdict = correlateOutage(down.map((d) => ({ name: d.p.name, addr: d.addr, noAnswer: d.noAnswer })), fleet.length)
+  const correlated = new Set(verdict.names)
+  if (verdict.kind === 'shared-host') {
+    console.log(`  -> these ${verdict.names.length} all resolve to ${verdict.addr}: ONE machine we could not reach, filed as one incident${verdict.wholeFleet ? ' (and that is the whole fleet, plus the alert mailbox)' : ''}.`)
+  } else if (verdict.kind === 'observer') {
+    console.log(`  -> ${verdict.names.length} products went silent across ${verdict.addrs.length} address(es) at once. Unrelated machines do not fail together; nothing here proves a product is down.`)
+  }
 
   if (dry) { console.log('--dry: nothing written.'); return 0 }
 
   let ringing = 0
   for (const { p, reasons } of down) {
+    // A product folded into a correlated event does not get its own row. Its key is still held
+    // back from the recovery loop below: we did not prove it healthy, we proved we could not see.
+    if (correlated.has(p.name)) continue
     // Already open from a previous run = this is the second consecutive sighting. That, and only
     // that, is what turns a board row into a phone call.
     const confirmed = openKeys.has(`${KEY_PREFIX}:${p.name}`)
@@ -384,20 +569,43 @@ async function main() {
     await fileSignal(secret, signalFor(p, reasons, { confirmed }))
   }
 
+  let correlatedKey = null
+  if (verdict.kind !== 'independent') {
+    correlatedKey = correlatedSignal(verdict, { confirmed: false }).key
+    const confirmed = openKeys.has(correlatedKey)
+    await fileSignal(secret, correlatedSignal(verdict, { confirmed }))
+    if (confirmed && verdict.kind === 'shared-host') ringing++
+  }
+
   // Recovered: resolve only rows that are actually open, so "self-resolved" on the cockpit stays
   // a fact about the fleet rather than an artefact of this script running every hour.
   const downKeys = new Set(down.map(({ p }) => `${KEY_PREFIX}:${p.name}`))
+  if (correlatedKey) downKeys.add(correlatedKey)
   for (const key of openKeys.keys()) {
     if (downKeys.has(key)) continue
+    const suffix = key.slice(KEY_PREFIX.length + 1)
+    const isCorrelated = suffix === 'monitor-blind' || suffix.startsWith('host:')
     await fileSignal(secret, {
       source: SOURCE, key, kind: 'incident', severity: 'info', state: 'resolved',
-      title: `${key.slice(KEY_PREFIX.length + 1)} is reachable again`,
-      summary: 'It answers, its backend is up and it is serving itself. This cleared without anyone doing anything.',
+      title: suffix === 'monitor-blind'
+        ? 'The monitor can see the fleet again'
+        : suffix.startsWith('host:')
+          ? `The machine at ${suffix.slice(5)} is answering again`
+          : `${suffix} is reachable again`,
+      summary: isCorrelated
+        ? 'Every product it covered answered on this run, so whatever was in the way is gone. This cleared without anyone doing anything.'
+        : 'It answers, its backend is up and it is serving itself. This cleared without anyone doing anything.',
       link: 'https://cockpit.predivo.ch/signals',
     })
-    console.log(`  recovered: ${key} — signal resolved.`)
+    console.log(`  recovered: ${key} - signal resolved.`)
   }
 
+  if (verdict.kind === 'observer') {
+    const line = `${verdict.names.length} product(s) went silent at once across ${verdict.addrs.length} address(es) - this monitor probably cannot see, so nothing was filed against any product. On /signals.`
+    if (openKeys.has(`${KEY_PREFIX}:monitor-blind`)) console.error(`::error::SECOND consecutive blind run. ${line}`)
+    else console.warn(`::warning::${line}`)
+    return 0
+  }
   if (ringing) console.error(`::error::${ringing} product(s) have now been unreachable for two consecutive runs. Filed as critical on /signals.`)
   else if (down.length) console.warn(`::warning::${down.length} product(s) look unreachable. Filed on /signals WITHOUT alerting; the next run decides.`)
   return 0

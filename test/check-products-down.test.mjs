@@ -13,6 +13,7 @@ import {
   reasonsUnreachable, brandMatches, signalFor, confirmUnreachable, CONFIRM_ATTEMPTS,
   probeAuth, assertFleetReadable, coverageLine,
   classifyAuth, authKeyEnvName, authKeyFor, authCoverageLine,
+  isNoAnswer, failedWithoutAnswer, correlateOutage, correlatedSignal, mapPool, addressOf,
 } from '../scripts/check-products-down.mjs'
 
 let n = 0
@@ -290,6 +291,231 @@ t('a full score over a partial fleet says how many products it never looked at',
   assert.match(line, /7 of 7 products with a registered backend/)
   assert.match(line, /5 more carry no backend in the registry/)
   assert.match(line, /no login is checked for them at all/)
+})
+
+// ── AN OUTAGE CLAIM MUST FIRST PROVE THE OBSERVER COULD SEE ──────────────────────────────────
+//
+// Every test below was watched to fail first against the shipped behaviour of 2026-09-03, which
+// filed one independent outage per product no matter how many failed at once or how they failed.
+// The run that prompted them, 33719854715, reported BackOffice, ReplyFlow, SignalScore,
+// ChannelMover and ScoutCopilot all "DOWN ... (Timeout)" while every one of them was serving
+// traffic; the previous run had them all OK ten seconds apart.
+
+t('an HTTP status is an answer; a timeout is silence', () => {
+  assert.equal(isNoAnswer('HTTP 503'), false)
+  assert.equal(isNoAnswer('HTTP 200'), false)
+  assert.equal(isNoAnswer('Timeout'), true)
+  assert.equal(isNoAnswer('fetch failed'), true)
+  assert.equal(isNoAnswer(undefined), true)
+})
+
+t('a product that ANSWERED 503 is a real outage and is never explained away as silence', () => {
+  // The whole correlation only applies to products that told us nothing. A machine that replies
+  // "503" has been reached, so its brokenness is a fact about it, not about our network.
+  assert.equal(failedWithoutAnswer({ site: { ok: false, detail: 'HTTP 503' }, auth: { ok: true }, brand: true }), false)
+})
+
+t('a product that timed out is silence, not evidence about the product', () => {
+  assert.equal(failedWithoutAnswer({ site: { ok: false, detail: 'Timeout' }, auth: { ok: null }, brand: null }), true)
+})
+
+t('a domain serving the wrong page is not silence — we reached it and read it', () => {
+  assert.equal(failedWithoutAnswer({ site: { ok: true, detail: 'HTTP 200' }, auth: { ok: true }, brand: false }), false)
+})
+
+t('a healthy product is not silence either', () => {
+  assert.equal(failedWithoutAnswer({ site: { ok: true, detail: 'HTTP 200' }, auth: { ok: true }, brand: true }), false)
+})
+
+t('ONE product timing out is still that product: nothing is correlated away', () => {
+  const v = correlateOutage([{ name: 'ReplyFlow', addr: '149.126.4.148', noAnswer: true }])
+  assert.equal(v.kind, 'independent')
+  assert.deepEqual(v.names, [])
+})
+
+t('products that go silent together on ONE address are ONE machine, not N outages', () => {
+  // Measured 2026-09-03: backoffice.predivo.ch, signalscore.ch and channelmover.com all resolve
+  // to 80.74.145.155, and so does the mail host tertia.sui-inter.net.
+  const v = correlateOutage([
+    { name: 'BackOffice', addr: '80.74.145.155', noAnswer: true },
+    { name: 'SignalScore', addr: '80.74.145.155', noAnswer: true },
+    { name: 'ChannelMover', addr: '80.74.145.155', noAnswer: true },
+  ])
+  assert.equal(v.kind, 'shared-host')
+  assert.equal(v.addr, '80.74.145.155')
+  assert.equal(v.names.length, 3)
+})
+
+t('THE REGRESSION: run 33719854715 filed five outages for ONE unreachable machine', () => {
+  // MEASURED 2026-09-03, not assumed. Every prod_url in fleet_projects resolves to 80.74.145.155
+  // -- all twelve products and the mail host tertia.sui-inter.net are one Swiss box. The five the
+  // run got through before it was killed were therefore five names for one event, and the shipped
+  // code was one hour away from ringing Roger's phone five times about five healthy products.
+  const v = correlateOutage([
+    { name: 'BackOffice', addr: '80.74.145.155', noAnswer: true },
+    { name: 'ReplyFlow', addr: '80.74.145.155', noAnswer: true },
+    { name: 'SignalScore', addr: '80.74.145.155', noAnswer: true },
+    { name: 'ChannelMover', addr: '80.74.145.155', noAnswer: true },
+    { name: 'ScoutCopilot', addr: '80.74.145.155', noAnswer: true },
+  ], 12)
+  assert.equal(v.kind, 'shared-host')
+  assert.equal(v.addr, '80.74.145.155')
+  assert.equal(v.names.length, 5)
+  assert.equal(v.wholeFleet, false, 'five of twelve is not the whole fleet')
+})
+
+t('the row for an unreachable machine never asserts that the machine is DOWN', () => {
+  // We cannot tell a dead box from a dead route to it, and the scarier reading is not ours to pick.
+  const row = correlatedSignal(
+    { kind: 'shared-host', addr: '80.74.145.155', names: ['A', 'B'], wholeFleet: false },
+    { confirmed: true },
+  )
+  assert.match(row.summary, /could not be REACHED - either it is down, or the path to it/)
+  assert.equal(/\bis down\b/.test(row.title), false, 'the title states as fact what was never observed')
+})
+
+t('when the silent machine carries the WHOLE fleet, the row says the pager is on it too', () => {
+  const v = correlateOutage(
+    Array.from({ length: 12 }, (_, i) => ({ name: `P${i}`, addr: '80.74.145.155', noAnswer: true })),
+    12,
+  )
+  assert.equal(v.wholeFleet, true)
+  const row = correlatedSignal(v, { confirmed: true })
+  assert.match(row.summary, /alert mailbox is on the same address/)
+})
+
+t('a fleet spread over several addresses can still produce the blind verdict', () => {
+  // Synthetic today -- every product is single-homed on 80.74.145.155 -- and kept precisely
+  // because that is a fact about 2026-09-03, not a property of the code. The day one product
+  // moves hosts, simultaneous silence across two machines stops being a shared-host story.
+  const v = correlateOutage([
+    { name: 'A', addr: '80.74.145.155', noAnswer: true },
+    { name: 'B', addr: '149.126.4.148', noAnswer: true },
+  ], 12)
+  assert.equal(v.kind, 'observer')
+  assert.equal(v.addrs.length, 2)
+})
+
+t('silence we could not even resolve is never mistaken for one shared machine', () => {
+  // Two on one address plus one that would not resolve is NOT "one host": the unresolved one is
+  // unaccounted for, and calling it a host outage would name a machine we never reached.
+  const v = correlateOutage([
+    { name: 'A', addr: '80.74.145.155', noAnswer: true },
+    { name: 'B', addr: '80.74.145.155', noAnswer: true },
+    { name: 'C', addr: null, noAnswer: true },
+  ])
+  assert.equal(v.kind, 'observer')
+})
+
+t('a genuine 503 outage is not hidden by a simultaneous timeout elsewhere', () => {
+  // Only the silent ones are eligible. One silent product does not reach the threshold, so the
+  // product that ANSWERED 503 still gets its own row through the normal path.
+  const v = correlateOutage([
+    { name: 'Valrano', addr: '1.1.1.1', noAnswer: false },
+    { name: 'ReplyFlow', addr: '2.2.2.2', noAnswer: true },
+  ])
+  assert.equal(v.kind, 'independent')
+  assert.equal(v.names.includes('Valrano'), false)
+})
+
+t('an empty or missing down-list is never an event', () => {
+  assert.equal(correlateOutage([]).kind, 'independent')
+  assert.equal(correlateOutage(undefined).kind, 'independent')
+})
+
+// ── what the single correlated row is allowed to say and do ─────────────────────────────────
+
+t('the FIRST blind run cannot ring, exactly like every other first sighting here', () => {
+  const v = { kind: 'observer', addrs: ['a', 'b'], names: ['X', 'Y'] }
+  const row = correlatedSignal(v, { confirmed: false })
+  assert.equal(row.severity, 'warning')
+  assert.equal(row.needs_human, false)
+})
+
+t('a SECOND consecutive blind run rings — this can never bury a real fleet outage', () => {
+  const v = { kind: 'observer', addrs: ['a', 'b'], names: ['X', 'Y'] }
+  const row = correlatedSignal(v, { confirmed: true })
+  assert.equal(row.severity, 'critical')
+  assert.equal(row.needs_human, true)
+})
+
+t('the blind row never claims a product is down — that is the whole point of it', () => {
+  const row = correlatedSignal({ kind: 'observer', addrs: ['a'], names: ['BackOffice'] }, { confirmed: false })
+  assert.match(row.summary, /nothing here proves any product is down/i)
+  assert.equal(/is down for customers/i.test(row.title), false)
+})
+
+t('a shared-host row names the machine and counts the products, and rings on the second run', () => {
+  const v = { kind: 'shared-host', addr: '80.74.145.155', names: ['BackOffice', 'SignalScore', 'ChannelMover'] }
+  const first = correlatedSignal(v, { confirmed: false })
+  assert.equal(first.severity, 'warning')
+  assert.equal(first.needs_human, false)
+  const second = correlatedSignal(v, { confirmed: true })
+  assert.equal(second.severity, 'critical')
+  assert.equal(second.needs_human, true)
+  assert.match(second.title, /80\.74\.145\.155/)
+  assert.match(second.summary, /BackOffice, SignalScore, ChannelMover/)
+})
+
+t('the correlated keys are stable across runs, or the two-run rule cannot work at all', () => {
+  const a = correlatedSignal({ kind: 'observer', addrs: ['x'], names: ['A'] }, { confirmed: false })
+  const b = correlatedSignal({ kind: 'observer', addrs: ['y'], names: ['A', 'B'] }, { confirmed: true })
+  assert.equal(a.key, b.key)
+  assert.equal(a.key, 'products-down:monitor-blind')
+  const h = correlatedSignal({ kind: 'shared-host', addr: '80.74.145.155', names: ['A'] }, { confirmed: false })
+  assert.equal(h.key, 'products-down:host:80.74.145.155')
+})
+
+// ── resolving the address, which is the evidence the verdict above rests on ─────────────────
+//
+// Nothing exercised this at first, and that gap cost real time: the addresses in the original
+// version of the test above were resolved from domains GUESSED off product names (replyflow.ch,
+// scoutcopilot.ch) rather than read from fleet_projects (replyflow.help, scoutcopilot.com). The
+// guessed ones pointed at different machines and the registry's all point at one, which inverted
+// the verdict. A hostname is not a thing to be inferred from a product name.
+
+await at('the address comes from the URL host, not the URL', async () => {
+  const seen = []
+  const addr = await addressOf('https://backoffice.predivo.ch/some/path?x=1', async (h) => {
+    seen.push(h)
+    return ['80.74.145.155']
+  })
+  assert.deepEqual(seen, ['backoffice.predivo.ch'])
+  assert.equal(addr, '80.74.145.155')
+})
+
+await at('a host that will not resolve is null, never a guess and never a throw', async () => {
+  assert.equal(await addressOf('https://nope.invalid', async () => { throw new Error('ENOTFOUND') }), null)
+  assert.equal(await addressOf('not a url at all', async () => ['1.2.3.4']), null)
+  assert.equal(await addressOf('https://empty.example', async () => []), null)
+})
+
+// ── the probe pool: the thing that stopped the check from killing its own run ────────────────
+
+await at('the pool returns results in INPUT order, whatever order they finish in', async () => {
+  const delays = [50, 5, 30, 1, 20]
+  const out = await mapPool(delays, 2, async (ms, i) => {
+    await new Promise((r) => setTimeout(r, ms))
+    return i
+  })
+  assert.deepEqual(out, [0, 1, 2, 3, 4])
+})
+
+await at('the pool never exceeds its limit — the 2026-08-24 boot-storm lesson stays honoured', async () => {
+  let live = 0
+  let peak = 0
+  await mapPool(Array.from({ length: 12 }, (_, i) => i), 6, async () => {
+    live++
+    peak = Math.max(peak, live)
+    await new Promise((r) => setTimeout(r, 5))
+    live--
+  })
+  assert.equal(peak <= 6, true, `peak concurrency was ${peak}`)
+  assert.equal(peak > 1, true, 'a pool that never runs two at once has not fixed the timeout')
+})
+
+await at('an empty fleet does not hang the pool', async () => {
+  assert.deepEqual(await mapPool([], 6, async () => 1), [])
 })
 
 console.log(`\n${n} assertions passed.`)
