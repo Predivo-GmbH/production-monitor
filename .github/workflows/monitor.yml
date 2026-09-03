@@ -532,6 +532,20 @@ jobs:
       # nothing, and a watcher walking jobs for a failed step would have found nothing wrong.
       # Rolls up at three so one bad fleet-wide commit is one alert, not five; staging red is
       # filed but never pages; a promotion the staging gate refused is not a failure at all.
+      # A PRODUCT THAT CANNOT DEPLOY IS CAUGHT ABOVE. THIS CATCHES THE OPPOSITE: one that CAN ship
+      # and has not. Roger, 2026-09-03, on the Deploy Status page for the fourth time in two days:
+      # "I do not want to have this fucking deploy board stale and not working properly."
+      # The page was telling the truth - Distribution-OS said "this needs merging, not approving"
+      # from 2026-08-04, a MONTH, with security fixes stranded on one side - and nothing ever went
+      # red about it, because a dashboard is PULL. Diverged reds at any age; merely waiting reds
+      # after 24h. Compares the DEPLOYED commits, never the branch heads: on Distribution-OS those
+      # two questions give +9/+17 and +9/+8, and mixing them invents a bug that is not there.
+      - name: A product that CAN ship and has not must say so
+        if: always()  # independent sensor, like the one above
+        run: node scripts/check-promotion-backlog.mjs
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_READ_TOKEN || secrets.DASHBOARD_PAT }}
+
       - name: A product that cannot deploy must say so
         if: always()  # independent sensor — must run even if the steps above failed. check-deploy-failures.mjs exits 0 on a filed alarm (only an unreadable repo reds the job), so this cannot double-red one event.
         run: node scripts/check-deploy-failures.mjs
