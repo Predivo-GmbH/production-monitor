@@ -56,7 +56,7 @@ import {
   ACTIONABLE_STATUSES, UNTOUCHABLE_STATUSES, KINDS, SKIP,
   parseDoneWhen, evaluateDoneWhen, sweep, selectItems, verdict, receiptFor, offerToBoard,
   sqlIsReadOnly, testPathIsRunnable, sentryStatusIsSettled, isDryRun, closureCap,
-  loadBoardCredentials, boardProjectRef, SENTRY_ISSUE_PATHS, isOwedToRoger,
+  loadBoardCredentials, boardProjectRef, SENTRY_ISSUE_PATHS, isOwedToRoger, silentRowsInHisLane,
 } from '../scripts/close-finished-items.mjs'
 import { PASS, FAIL, UNKNOWN, reportedPass, VERDICT_MARKER } from '../scripts/lib/check-verdict.mjs'
 
@@ -760,6 +760,43 @@ t('a blocked row carrying a question owed to Roger is untouchable', () => {
 t('blocked_owner=roger is enough on its own, with no question text recorded', () => {
   assert.equal(isOwedToRoger({ status: 'blocked', blocked_owner: 'roger' }), true)
   assert.equal(isOwedToRoger({ status: 'blocked', blocked_owner: 'ROGER' }), true, 'case must not matter')
+})
+
+// ── A ROW IN HIS LANE THAT ASKS NOTHING ─────────────────────────────────────────────────────
+// Measured on the live board 2026-09-03: 50 rows owed to Roger, 21 of them carrying no question,
+// because upsert_signal replaced decision_question with null on every producer call (BackOffice
+// migration 139; cause fixed by 167 the same day). The lane still said NEEDS ROGER on all 50.
+t('a row owed to Roger with no question is counted — it asks him for nothing', () => {
+  const rows = [
+    { slug: 'a', status: 'awaiting_signoff', blocked_owner: 'roger', blocked_question: null },
+    { slug: 'b', status: 'blocked', blocked_owner: 'roger', blocked_question: '   ' },
+  ]
+  assert.deepEqual(silentRowsInHisLane(rows).map((r) => r.slug), ['a', 'b'])
+})
+
+t('a row that DOES state its ask is not counted — that one is a real decision', () => {
+  assert.deepEqual(silentRowsInHisLane([
+    { slug: 'a', status: 'blocked', blocked_owner: 'roger', blocked_question: 'Approve the migration?' },
+  ]), [])
+})
+
+t('a row waiting on a VENDOR is never counted — his lane is the only lane measured', () => {
+  assert.deepEqual(silentRowsInHisLane([
+    { slug: 'v', status: 'blocked', blocked_owner: 'vendor', blocked_question: null },
+  ]), [], 'a vendor wait is not attention taken from Roger')
+})
+
+t('ordinary working rows are never counted, however empty their question field is', () => {
+  assert.deepEqual(silentRowsInHisLane([
+    { slug: 'n', status: 'next', blocked_question: null },
+    { slug: 'p', status: 'in_progress', blocked_question: null },
+  ]), [], 'a next row asks nobody anything; that is not a defect')
+})
+
+t('missing, empty and malformed input never throws — the count is a report, not a gate', () => {
+  assert.deepEqual(silentRowsInHisLane(), [])
+  assert.deepEqual(silentRowsInHisLane([]), [])
+  assert.deepEqual(silentRowsInHisLane([null, undefined]), [])
 })
 
 t('a row blocked on a VENDOR or client stays closeable — nobody is being answered for', () => {

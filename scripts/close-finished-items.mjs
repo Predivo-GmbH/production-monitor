@@ -148,6 +148,31 @@ export function isOwedToRoger(item) {
   return item.status === 'blocked' && Boolean(String(item.blocked_question || '').trim())
 }
 
+/**
+ * A ROW IN HIS LANE THAT ASKS HIM NOTHING IS NOT A DECISION.
+ *
+ * WHY (measured on the live board 2026-09-03): his lane held 50 rows, and 21 of them carried no
+ * question at all. They were not silent by choice. `public.upsert_signal` (BackOffice migration
+ * 139) had its two text fields backwards -- `detail` MERGED while `decision_question` REPLACED --
+ * and every producer calls it without `p_decision_question`, whose default is null. So each
+ * producer pass overwrote the ask with nothing. BackOffice migration 167 fixed the cause on
+ * 2026-09-03 (null now means "I am not talking about the question"); 16 of the erased asks were
+ * restored from the rows' own evidence trails the same day.
+ *
+ * THE CAUSE IS FIXED, SO THIS IS NOT A CLEANUP -- IT IS THE ALARM THAT WAS MISSING. The defect
+ * ran for an unknown length of time and nothing noticed, because an empty question is invisible:
+ * the row still appears in his lane, still says NEEDS ROGER, and the board cannot tell a row that
+ * wants nothing from a row whose want was deleted. Roger's own words on the board's purpose are
+ * that it should reach him "only really if there is a real decision to be made by my side" -- a
+ * row that states no decision is the exact opposite of that, and it costs him the same attention.
+ *
+ * This never closes, moves or edits anything. It counts, and it says what it counted, so that the
+ * next time a producer erases an ask the number moves instead of the lane quietly emptying.
+ */
+export function silentRowsInHisLane(items = []) {
+  return (items || []).filter((it) => isOwedToRoger(it) && !String(it?.blocked_question || '').trim())
+}
+
 export const SKIP = 'skip'
 
 // ── the pure core ────────────────────────────────────────────────────────────────────────────
@@ -825,6 +850,20 @@ async function main() {
   const { actionable, untouchable } = selectItems(rows)
   console.log(`  board: ${rows.length} open item(s); ${actionable.length} this job may act on, ` +
     `${untouchable.length} left alone (${UNTOUCHABLE_STATUSES.join('/')})`)
+
+  // A row in his lane that asks him nothing costs him exactly as much attention as a real
+  // decision and gives him nothing to decide. Counted every run so an erased ask moves a number
+  // instead of the lane quietly emptying. Never acted on here: this job does not write to his
+  // lane, and a missing question is a producer's defect, not this item's.
+  const silent = silentRowsInHisLane(rows)
+  if (silent.length) {
+    console.log(`  HIS LANE: ${silent.length} row(s) are owed to Roger but state no question — ` +
+      `they ask him for nothing. A producer erased the ask, or none was ever written.`)
+    for (const r of silent.slice(0, 10)) console.log(`     no ask   ${r.slug}: ${String(r.title || '').slice(0, 72)}`)
+    if (silent.length > 10) console.log(`     ...and ${silent.length - 10} more`)
+  } else {
+    console.log('  HIS LANE: every row owed to Roger states what it wants from him.')
+  }
 
   let offer = null
   if (!dry) {
