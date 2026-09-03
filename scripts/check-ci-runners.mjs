@@ -28,6 +28,7 @@
  */
 import { writeFileSync } from 'node:fs'
 import { auditRunnerMachines, loadExpectedMachines, loadRetiredMachines } from './lib/runner-machines.mjs'
+import { auditRunnerSaturation } from './lib/runner-saturation.mjs'
 import { looksLikeRunnerLoss, confirmRunnerLoss, describeRunnerLoss, recentFailedRuns } from './lib/runner-loss.mjs'
 import { cancelledRequiredGates, describeCancelledGate, recentCancelledRuns } from './lib/cancelled-gate.mjs'
 
@@ -147,6 +148,10 @@ let migrated = 0
 // Kept so the per-MACHINE audit below can ask a question this loop structurally cannot: the loop
 // asks "does this repository have an online runner", and two machines share that one number.
 const perRepo = []
+// How many jobs are WAITING for a runner, per repository. Every other question in this file is
+// about presence; this one is about whether the work is moving. A fleet can be fully online and
+// still too small, and until 2026-09-03 nothing here would have said so.
+const queuedByRepo = {}
 
 for (const repo of repos) {
   const runners = await gh(`repos/${OWNER}/${repo}/actions/runners`)
@@ -165,6 +170,12 @@ for (const repo of repos) {
   }
   const list = runners.runners
   perRepo.push({ repo, runners: list })
+
+  // Soft: a repository whose queue we cannot read must not fail the fleet check. It is already
+  // counted by the runner-list read above, and a missing queue number is reported as unknown
+  // rather than silently as zero - zero is the answer that means "everything is fine".
+  const queuedRuns = await gh(`repos/${OWNER}/${repo}/actions/runs?status=queued&per_page=1`, {}, { soft: true })
+  if (typeof queuedRuns?.total_count === 'number') queuedByRepo[repo] = queuedRuns.total_count
 
   // The label is read for EVERY repository, BEFORE the "nothing registered" skip, because the two
   // cases that skip look identical from the runner list alone and are opposites:
@@ -288,6 +299,14 @@ for (const [machine, coveredRepos] of Object.entries(machineAudit.machines)) {
   console.log(`machine ${machine.padEnd(16)}: online in ${coveredRepos.length} repo(s)`)
 }
 
+// IS THE WORK MOVING? Presence is not throughput. Roger asked on 2026-09-03 whether the one
+// remaining CI machine can keep up, and no check could answer him - so this one watches the harm
+// directly: a job that has been handed to us and cannot start.
+const saturation = auditRunnerSaturation({ perRepo, queued: queuedByRepo })
+alerts.push(...saturation.alerts)
+console.log(`runners busy       : ${saturation.busy} of ${saturation.online} online`)
+console.log(`jobs waiting       : ${saturation.queuedTotal}`)
+
 console.log(`repos with runners : ${migrated}`)
 console.log(`variable flips     : ${flipped.length ? flipped.join(', ') : 'none'}`)
 console.log(`apply mode         : ${APPLY ? 'on (variables are changed)' : 'off (report only)'}`)
@@ -297,6 +316,9 @@ console.log(`apply mode         : ${APPLY ? 'on (variables are changed)' : 'off 
 writeFileSync('ci-runner-findings.json', JSON.stringify({
   generated_at: new Date().toISOString(),
   repos_with_runners: migrated,
+  runners_busy: saturation.busy,
+  runners_online: saturation.online,
+  jobs_waiting: saturation.queuedTotal,
   machines: machineAudit.machines,
   flips: flipped,
   findings: alerts,
