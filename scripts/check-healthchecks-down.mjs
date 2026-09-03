@@ -48,6 +48,7 @@
 import { readFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
+import { beaconFor, partitionDownChecks, reprievedResolution } from './lib/alarm-state.mjs'
 
 const BO_REF = 'xoecpzfsskalvjrtcbbl'
 const BO_BASE = `https://${BO_REF}.supabase.co`
@@ -93,6 +94,12 @@ function readBoSecret() {
   const m = txt.match(/sb_secret_[A-Za-z0-9_]+/)
   if (!m) throw new Error(`no sb_secret_ key found in ${BO_CREDS}`)
   return m[0]
+}
+
+/** `--dry` writes nothing, so it must still work on a machine with no board secret. Without one it
+ *  simply cannot read a liveness beacon, and says so by reporting every DOWN check as dead. */
+function tryReadBoSecret() {
+  try { return readBoSecret() } catch { return null }
 }
 
 /**
@@ -297,6 +304,92 @@ async function fileSignal(secret, body) {
   return res.json()
 }
 
+/**
+ * Read the independent "did this job actually run?" record for every DOWN check that has one.
+ *
+ * A DOWN check with no beacon is not read and cannot be reprieved — see scripts/lib/alarm-state.mjs
+ * for why that direction is the safe one. A read that fails leaves the reading undefined, which
+ * `livenessVerdict` treats as 'unreadable', which leaves the alarm exactly as it is: this function
+ * can only ever KEEP an alarm red, never raise one and never clear one on its own.
+ *
+ * @returns {Promise<Record<string, string|null>>} check key -> ISO timestamp
+ */
+export async function readBeaconReadings(secret, down, get = boGet) {
+  const wanted = []
+  for (const c of down || []) {
+    const key = c?.slug || c?.name
+    const spec = beaconFor(key)
+    if (!spec) continue
+    if (spec.beacon?.table !== 'machine_state') {
+      console.log(`  ::warning::beacon for ${key} lives in ${spec.beacon?.table}, which this reader does not know — no reprieve, alarm stands`)
+      continue
+    }
+    wanted.push({ key, kind: spec.beacon.kind, column: spec.beacon.column })
+  }
+  if (!wanted.length) return {}
+
+  const kinds = [...new Set(wanted.map((w) => w.kind))]
+  const out = {}
+  try {
+    const rows = await get(secret, `machine_state?select=kind,updated_at,last_run_at&kind=in.(${kinds.map(encodeURIComponent).join(',')})`)
+    const byKind = new Map((rows || []).map((r) => [r.kind, r]))
+    for (const w of wanted) out[w.key] = byKind.get(w.kind)?.[w.column] ?? null
+  } catch (e) {
+    // Deliberately not a throw. An unreadable beacon must not fail the run NOR clear anything; it
+    // just means nothing contradicts the alarm this hour.
+    console.log(`  ::warning::could not read the liveness beacon(s) (${e.message}) — every DOWN check is left exactly as it is`)
+  }
+  return out
+}
+
+/**
+ * THE WHOLE RUN AS ONE PURE DECISION: what this hour's healthchecks state and board state mean,
+ * expressed as the exact bodies main() posts, in the order it posts them.
+ *
+ * This exists so the full red -> green -> red cycle can be driven in a test against the SAME code
+ * that runs in CI, rather than against a re-implementation of it in the test file. A reconstruction
+ * of this logic in a test proves the reconstruction, not the monitor.
+ *
+ * @param checks           every check from every account
+ * @param openKeys         Set of keys already open/superseded on the board under this source
+ * @param beaconReadings   { checkKey: isoString|null } independent proof-of-run, where one exists
+ */
+export function planRun({ checks, openKeys = new Set(), beaconReadings = {}, now = Date.now() }) {
+  const { down, neverPinged, quiet } = classifyChecks(checks, now)
+  const { dead, reprieved } = partitionDownChecks({ down, beaconReadings, now })
+
+  // Every slug this account actually knows about — down, quiet or never-pinged. A recovery may only
+  // resolve a row whose key is one of these; anything else filed under this source is not ours to touch.
+  const allCheckKeys = new Set(checks.map((c) => c.slug || c.name))
+  // `dead`, not `down`: a check whose job is provably running must not be treated as an outage
+  // here either, or the recovery sweep below would refuse to clear the very row it should clear.
+  const downKeys = new Set(dead.map((c) => c.slug || c.name))
+
+  const { rollup, members } = planSignals(dead, now)
+  const reprievedByKey = new Map(reprieved.map((r) => [r.key, r]))
+
+  // Two different recoveries, and they must not be described with the same sentence. A check that
+  // pinged again really did check in. A reprieved one did NOT check in — its ping was withheld by a
+  // red run — and writing "it checked in again" over that would hide the very mechanism that caused
+  // ten hours of false red in the first place.
+  const resolves = recoveredCheckKeys({ openKeys, allCheckKeys, downKeys }).map((key) => {
+    const r = reprievedByKey.get(key) || null
+    return {
+      key,
+      reprieved: r,
+      body: r ? reprievedResolution(r) : {
+        source: SOURCE, key, kind: 'incident', severity: 'info', state: 'resolved',
+        title: `Scheduled job is running again: ${key}`,
+        summary: 'It checked in again, so this cleared itself.',
+        link: 'https://cockpit.predivo.ch/signals',
+      },
+    }
+  })
+
+  const clearRollup = !rollup && openKeys.has(ROLLUP_KEY)
+  return { down, dead, reprieved, neverPinged, quiet, rollup, members, resolves, clearRollup }
+}
+
 async function main() {
   const dry = process.argv.includes('--dry')
   const accounts = readHcKeys()
@@ -308,33 +401,39 @@ async function main() {
   for (const c of down) console.log(`  DOWN  ${c.name} (${c.account}) last ping ${c.last_ping ?? 'never'}`)
   for (const c of neverPinged) console.log(`  ::warning::configured but never pinged: ${c.name} (${c.account}) — wired, not proven`)
 
+  // "STOPPED RUNNING" IS A CLAIM, AND IT IS CHECKED BEFORE IT IS FILED (2026-09-03).
+  // The heartbeat ping in monitor.yml is `if: success()`, so any finding by any sensor withholds
+  // it and this check goes DOWN about a job that is running fine — and stays down, because the
+  // withheld ping is also the only thing that could clear it. Where a job leaves an independent,
+  // unconditional record of having run, that record is consulted first. See scripts/lib/alarm-state.mjs.
+  const secret = dry ? tryReadBoSecret() : readBoSecret()
+  const beaconReadings = secret ? await readBeaconReadings(secret, down) : {}
+
   if (dry) {
-    const plan = planSignals(down)
+    const plan = planRun({ checks, beaconReadings })
+    for (const r of plan.reprieved) console.log(`  NOT DEAD  ${r.check.name} — ${r.verdict.why}`)
     console.log(plan.rollup
       ? `--dry: would file ONE rollup ("${plan.rollup.title}") plus ${plan.members.length} board-only entries. Nothing written.`
       : `--dry: would file ${plan.members.length} individual signal(s), each able to page. Nothing written.`)
+    if (plan.reprieved.length) console.log(`--dry: would RESOLVE ${plan.reprieved.length} alarm(s) whose job is provably running: ${plan.reprieved.map((r) => r.key).join(', ')}. Nothing written.`)
     return 0
   }
 
-  const secret = readBoSecret()
   // 'superseded' is read alongside 'open' on purpose. board-drainer moves a signal that needs a
   // person onto the work board and stamps it superseded, and a check that recovers while it sits
   // there must still be resolved. Reading only 'open' left those rows behind, so the next outage
   // re-opened a row that had never been closed and the history read as one unbroken incident.
   const open = await boGet(secret, `fleet_signals?source=eq.${SOURCE}&state=in.(open,superseded)&select=key`)
   const openKeys = new Set(open.map((r) => r.key))
-  const downKeys = new Set(down.map((c) => c.slug || c.name))
-  // Every slug this account actually knows about — down, quiet or never-pinged. A recovery may only
-  // resolve a row whose key is one of these; anything else filed under this source is not ours to touch.
-  const allCheckKeys = new Set(checks.map((c) => c.slug || c.name))
 
-  const { rollup, members } = planSignals(down)
+  const { dead, reprieved, rollup, members, resolves, clearRollup } = planRun({ checks, openKeys, beaconReadings })
+  for (const r of reprieved) console.log(`  NOT DEAD  ${r.check.name} — ${r.verdict.why}`)
 
   // The rollup goes FIRST. It is the one that may ring, and if this process dies half way through,
   // the alert Roger actually needs is the one already sent.
   if (rollup) {
     const res = await fileSignal(secret, rollup)
-    console.log(`  ROLLUP: ${down.length} jobs dark, filed as one alert - ${res.will_page ? `page due ${res.page_due_at}` : `not paging (${res.suppressed})`}`)
+    console.log(`  ROLLUP: ${dead.length} jobs dark, filed as one alert - ${res.will_page ? `page due ${res.page_due_at}` : `not paging (${res.suppressed})`}`)
   }
   for (const m of members) await fileSignal(secret, m)
 
@@ -343,32 +442,29 @@ async function main() {
   // script running every hour — and, critically, so a non-check row filed under this source (a
   // diagnosis the closer routed here, say) is NEVER erased by a recovery it can never be part of.
   // The rollup is settled below on its own threshold, not here.
-  for (const key of recoveredCheckKeys({ openKeys, allCheckKeys, downKeys })) {
-    await fileSignal(secret, {
-      source: SOURCE, key, kind: 'incident', severity: 'info', state: 'resolved',
-      title: `Scheduled job is running again: ${key}`,
-      summary: 'It checked in again, so this cleared itself.',
-      link: 'https://cockpit.predivo.ch/signals',
-    })
-    console.log(`  recovered: ${key} — signal resolved.`)
+  for (const r of resolves) {
+    await fileSignal(secret, r.body)
+    console.log(r.reprieved
+      ? `  not dead after all: ${r.key} — signal resolved (${r.reprieved.verdict.verdict}).`
+      : `  recovered: ${r.key} — signal resolved.`)
   }
 
   // The fleet came back below the threshold: clear the rollup. Resolving cancels any page still
   // inside its self-heal window, so a blockage that clears itself in fifteen minutes never rings.
   // That is the delay doing its job, applied to the rollup exactly as it is to anything else.
-  if (!rollup && openKeys.has(ROLLUP_KEY)) {
+  if (clearRollup) {
     await fileSignal(secret, {
       source: SOURCE, key: ROLLUP_KEY, kind: 'incident', severity: 'info', state: 'resolved',
       title: 'The scheduled jobs are running again',
-      summary: down.length
-        ? `Down to ${down.length} dark job(s), each now reported on its own.`
+      summary: dead.length
+        ? `Down to ${dead.length} dark job(s), each now reported on its own.`
         : 'Everything that was dark is checking in again.',
       link: 'https://cockpit.predivo.ch/signals',
     })
     console.log('  rollup cleared: back below the threshold.')
   }
 
-  if (down.length) console.error(`::error::${down.length} scheduled job(s) have stopped running. Filed on /signals.`)
+  if (dead.length) console.error(`::error::${dead.length} scheduled job(s) have stopped running. Filed on /signals.`)
   return 0
 }
 
