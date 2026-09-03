@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url'
 import {
   redactSecrets,
   classifySendFailure,
+  isStaleCredentialRace,
   buildUndeliverableSignal,
   deliverToBoard,
   sendOrEscalate,
@@ -73,6 +74,65 @@ await t('a timeout is reported as UNREACHABLE and proves nothing about the crede
 
 await t('an unrecognised error is not silently classed as a refusal', () => {
   assert.strictEqual(classifySendFailure('something else entirely').kind, 'unknown')
+})
+
+// ── the stale-credential race: a mid-run rotation is not a locked mailbox ─────────────────
+await t('a 535 whose secret was rotated AFTER the job started is a stale-credential race', () => {
+  assert.strictEqual(
+    isStaleCredentialRace({ kind: 'refused', jobStartedAt: '2026-09-03T10:00:48Z', secretUpdatedAt: '2026-09-03T10:08:20Z' }),
+    true,
+  )
+})
+
+await t('a 535 whose secret was rotated BEFORE the job started is a REAL lockout, not a race', () => {
+  // The run resolved the current secret at start and it was still refused → the mailbox is the problem.
+  assert.strictEqual(
+    isStaleCredentialRace({ kind: 'refused', jobStartedAt: '2026-09-03T11:00:00Z', secretUpdatedAt: '2026-09-03T10:08:20Z' }),
+    false,
+  )
+})
+
+await t('missing or unparseable timestamps are NOT a race → the alarm still pages (fail-safe)', () => {
+  assert.strictEqual(isStaleCredentialRace({ kind: 'refused' }), false)
+  assert.strictEqual(isStaleCredentialRace({ kind: 'refused', jobStartedAt: 'x', secretUpdatedAt: 'y' }), false)
+  assert.strictEqual(isStaleCredentialRace({ kind: 'refused', jobStartedAt: '2026-09-03T10:00:00Z', secretUpdatedAt: undefined }), false)
+})
+
+await t('only a REFUSED send can be a race; a timeout with a newer secret is not', () => {
+  assert.strictEqual(
+    isStaleCredentialRace({ kind: 'unreachable', jobStartedAt: '2026-09-03T10:00:00Z', secretUpdatedAt: '2026-09-03T10:08:00Z' }),
+    false,
+  )
+})
+
+await t('a mid-run rotation downgrades the signal off Roger\'s lane and never says "locked"', () => {
+  const s = buildUndeliverableSignal({
+    subject: '[ALERT] 4 failure(s)',
+    failures: [{ project: 'BackOffice', test: 'OTP', error: 'refused' }],
+    error: 'Invalid login: 535 5.7.8',
+    jobStartedAt: '2026-09-03T10:00:48Z',
+    secretUpdatedAt: '2026-09-03T10:08:20Z',
+  })
+  assert.strictEqual(s.severity, 'warning', 'a rotation race must not be critical')
+  assert.strictEqual(s.needs_human, false, 'a rotation race must never route to Roger')
+  assert.notStrictEqual(s.key, 'alert-email-undeliverable', 'must use a distinct key so it cannot mask a real lockout critical')
+  assert.strictEqual(s.detail.credential_rotated_mid_run, true)
+  assert.doesNotMatch(s.summary, /lock|suspend/i, 'must not claim the mailbox is locked/suspended')
+  assert.match(s.summary, /replaced|rotat/i)
+  assert.match(s.summary, /BackOffice/, 'the carried failure content must survive the downgrade')
+})
+
+await t('a REAL lockout (secret older than job start) still pages critical + needs_human', () => {
+  const s = buildUndeliverableSignal({
+    subject: '[ALERT] 4 failure(s)',
+    failures: [],
+    error: 'Invalid login: 535 5.7.8',
+    jobStartedAt: '2026-09-03T11:00:00Z',
+    secretUpdatedAt: '2026-09-03T10:08:20Z',
+  })
+  assert.strictEqual(s.severity, 'critical')
+  assert.strictEqual(s.needs_human, true)
+  assert.strictEqual(s.key, 'alert-email-undeliverable')
 })
 
 // ── the signal itself ────────────────────────────────────────────────────────────────────

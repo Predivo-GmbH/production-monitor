@@ -127,6 +127,51 @@ function failedStepFailures() {
   }
 }
 
+// Tell "the mailbox is locked" apart from "this run merely held a login replaced while it ran".
+// GitHub resolves secrets at job start, so a rotation landing mid-run leaves this process carrying
+// the OLD value for its whole life — a 535 that says nothing about the mailbox. Two timestamps tell
+// them apart: the job's start and the SMTP secret's last rotation. buildUndeliverableSignal only
+// downgrades when the secret is PROVABLY newer than the job start. FAIL-SAFE everywhere: any error
+// or missing token → undefined → it pages exactly as before. A page is never suppressed on absent
+// data (2026-09-03: the check missing here cost three false "sign in to Metanet" pages).
+function jobStartedAtISO() {
+  try {
+    const runId = String(process.env.GITHUB_RUN_ID || '')
+    if (!runId) return undefined
+    if (!process.env.GH_TOKEN && !process.env.GITHUB_TOKEN) return undefined
+    const out = execSync(`gh run view ${runId} --json jobs`, { encoding: 'utf-8', timeout: 30_000 })
+    const starts = (JSON.parse(out).jobs ?? []).map((j) => Date.parse(j.startedAt)).filter(Number.isFinite)
+    return starts.length ? new Date(Math.min(...starts)).toISOString() : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function smtpSecretUpdatedAtISO() {
+  try {
+    // `gh secret list` needs a token that can READ secret metadata (a repo-admin PAT). The default
+    // GITHUB_TOKEN used for dedup above CANNOT, so this prefers SECRET_METADATA_TOKEN (DASHBOARD_PAT)
+    // when the workflow supplies it. It never returns a value — only name + updatedAt.
+    const token = process.env.SECRET_METADATA_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_TOKEN
+    if (!token) return undefined
+    const out = execSync('gh secret list --json name,updatedAt', {
+      encoding: 'utf-8',
+      timeout: 30_000,
+      env: { ...process.env, GH_TOKEN: token },
+    })
+    // send-alert authenticates with SMTP_PASS; ALERT_SMTP_PASS is the sibling box on the same
+    // server. Both were rotated together on 2026-09-03, so take the newest of whichever exist.
+    const names = new Set(['SMTP_PASS', 'ALERT_SMTP_PASS'])
+    const times = JSON.parse(out)
+      .filter((r) => names.has(r.name))
+      .map((r) => Date.parse(r.updatedAt))
+      .filter(Number.isFinite)
+    return times.length ? new Date(Math.max(...times)).toISOString() : undefined
+  } catch {
+    return undefined
+  }
+}
+
 // Build the previous run's dedup view (signatures + root-cause reasons) from its
 // test-results artifact. Returns null on ANY uncertainty → the caller fails open (sends).
 function previousDedup() {
@@ -309,6 +354,10 @@ await sendOrEscalate(
     // The password is never wanted in a log or on the board, and an SMTP server can echo what it
     // was handed straight back in the rejection string.
     secrets: [SMTP_PASS],
+    // If the send is refused, these decide whether it was a locked mailbox or a login replaced
+    // mid-run. Best-effort; either being undefined just keeps the old paging behaviour.
+    jobStartedAt: jobStartedAtISO(),
+    secretUpdatedAt: smtpSecretUpdatedAtISO(),
   },
   { secret: process.env.BOARD_SUPABASE_SECRET || process.env.BACKOFFICE_SERVICE_ROLE_KEY },
 )

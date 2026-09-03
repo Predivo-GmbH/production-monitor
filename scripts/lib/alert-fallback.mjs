@@ -103,6 +103,29 @@ export function classifySendFailure(message) {
 }
 
 /**
+ * Was this REFUSED send the result of a credential ROTATED AFTER the job started, rather than a
+ * genuinely locked/suspended mailbox?
+ *
+ * GitHub Actions resolves secrets at job start, so a run that spans a rotation carries the OLD
+ * value for its entire life and gets a 535 that says nothing about the mailbox — the next run,
+ * which resolves the new secret, sends fine. The ONE thing that separates this from a real lockout
+ * is timing: the SMTP secret's `updated_at` strictly AFTER the job's `startedAt`. This is the check
+ * that was missing on 2026-09-03, when a rotation at 10:08:20Z made a run started at 10:00:48Z page
+ * Roger three times to "sign in and unlock the Metanet mailbox" for a box that was never locked.
+ *
+ * WE DOWNGRADE ONLY ON PROOF, NEVER ON ITS ABSENCE. A missing or unparseable timestamp, or any kind
+ * other than 'refused', returns false → the caller pages exactly as before. A page must never be
+ * silenced because we could not read the rotation time; the fail-safe direction is to alarm.
+ */
+export function isStaleCredentialRace({ kind, jobStartedAt, secretUpdatedAt } = {}) {
+  if (kind !== 'refused') return false
+  const started = Date.parse(jobStartedAt)
+  const rotated = Date.parse(secretUpdatedAt)
+  if (!Number.isFinite(started) || !Number.isFinite(rotated)) return false
+  return rotated > started
+}
+
+/**
  * Build the signal that replaces the email that could not leave.
  *
  * The failures are embedded rather than linked, because a link is something you have to go and
@@ -118,10 +141,16 @@ export function buildUndeliverableSignal({
   smtpUser,
   error,
   secrets = [],
+  // The two timestamps that tell a locked mailbox apart from a login replaced mid-run. Both
+  // optional and best-effort: when either is absent the race check returns false and this pages
+  // exactly as it always did.
+  jobStartedAt,
+  secretUpdatedAt,
   now = new Date().toISOString(),
 }) {
   const safeError = redactSecrets(error, secrets)
   const c = classifySendFailure(safeError)
+  const staleRace = isStaleCredentialRace({ kind: c.kind, jobStartedAt, secretUpdatedAt })
 
   // Redact the CARRIED failures too, not just the prose built from them. The first version of
   // this file scrubbed the summary and then attached the raw array to `detail`, which put the
@@ -139,6 +168,49 @@ export function buildUndeliverableSignal({
     return `${where || 'unnamed'}: ${f.error}`
   })
   const more = failures.length > lines.length ? ` (+${failures.length - lines.length} more)` : ''
+
+  const detail = {
+    undelivered_subject: subject,
+    failure_count: failures.length,
+    failures: carried,
+    smtp_host: smtpHost ?? null,
+    smtp_user: smtpUser ?? null,
+    send_error: safeError,
+    send_error_kind: c.kind,
+    run_url: runUrl ?? null,
+    filed_at: now,
+    credential_rotated_mid_run: staleRace,
+    job_started_at: jobStartedAt ?? null,
+    secret_updated_at: secretUpdatedAt ?? null,
+  }
+  const carriedContent = lines.length
+    ? `It was reporting ${failures.length} failure(s)${more}: ${lines.join(' | ')}`
+    : 'It carried no per-failure detail.'
+
+  // A 535 whose secret was rotated AFTER this run began is a timing artefact, not a locked mailbox:
+  // GitHub pinned this run to the old login at job start, the rotation replaced it mid-run, and the
+  // NEXT run sends with the new value. It must NOT page Roger to go and unlock a mailbox that was
+  // never locked — warning + needs_human:false, a distinct key so it can never dedup over or mask a
+  // real lockout critical, and wording that names the rotation instead of a lockout. (2026-09-03:
+  // the missing check that cost three "sign in to Metanet" pages for a box working 34 minutes later.)
+  if (staleRace) {
+    return {
+      source: 'production-monitor',
+      key: 'alert-held-replaced-credential',
+      kind: 'incident',
+      severity: 'warning',
+      needs_human: false,
+      state: 'open',
+      title: 'An alert could not be sent because this run was holding a login that had just been replaced',
+      summary:
+        `The hourly monitor tried to send "${subject}" and the mail provider refused the login — but ` +
+        `the SMTP secret was rotated at ${secretUpdatedAt} and this run started at ${jobStartedAt}, before it. ` +
+        `GitHub resolves secrets at job start, so this run carried the OLD login for its whole life; the ` +
+        `mailbox is fine and the next run sends with the new secret. No action is needed. ${carriedContent}`,
+      detail,
+      link: runUrl || 'https://cockpit.predivo.ch/signals',
+    }
+  }
 
   return {
     source: 'production-monitor',
@@ -160,17 +232,7 @@ export function buildUndeliverableSignal({
       (lines.length
         ? `It was reporting ${failures.length} failure(s)${more}: ${lines.join(' | ')}`
         : 'It carried no per-failure detail.'),
-    detail: {
-      undelivered_subject: subject,
-      failure_count: failures.length,
-      failures: carried,
-      smtp_host: smtpHost ?? null,
-      smtp_user: smtpUser ?? null,
-      send_error: safeError,
-      send_error_kind: c.kind,
-      run_url: runUrl ?? null,
-      filed_at: now,
-    },
+    detail,
     link: runUrl || 'https://cockpit.predivo.ch/signals',
   }
 }

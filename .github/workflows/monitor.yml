@@ -758,6 +758,12 @@ jobs:
           ALERT_EMAIL: rogmueller1976@gmail.com
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           GH_TOKEN: ${{ github.token }}   # edge-triggered dedup: query the previous run + download its results.json to suppress duplicate alerts for an already-known ongoing failure
+          # Reads secret METADATA ONLY (updated_at, never a value) to tell a locked mailbox apart from
+          # a login rotated mid-run: the default github.token above CANNOT list secrets, so without a
+          # repo-admin PAT here a rotation that overlaps a run reads as a lockout and pages Roger to
+          # "sign in to Metanet" for a mailbox that is fine (2026-09-03, three false pages). Fail-safe:
+          # if this token cannot read metadata, send-alert falls back to paging exactly as before.
+          SECRET_METADATA_TOKEN: ${{ secrets.DASHBOARD_PAT }}
           # SMTP is one pipe and the board is another, and on 2026-09-02 only the first was broken:
           # this run detected 4 failures at 23:38Z and the alert died at 23:44:18Z on "Invalid login:
           # 535 5.7.8" from the Metanet account. Without a board credential the mailer has no second
