@@ -53,8 +53,20 @@ jobs:
         # this it prints "SKIPPED — ZERO checks were made" and the step still says PASS, which is
         # the exact shape of green this repo exists to catch. The keys are `hcr_` read-only, the
         # same ones scripts/check-healthchecks-down.mjs uses; nothing here can pause or ping a check.
+        # The monitor mailbox, for the same reason (added 2026-09-03). It has TWO doors — IMAP to
+        # read the OTP mail the product checks need, SMTP to send the alert saying what they found
+        # — stored under different names, with the workflows mapping ALERT_SMTP_PASS onto SMTP_PASS.
+        # On 2026-09-03 a rotation fixed the reading half only; the monitor then ran, checked 204
+        # things, found problems and could not tell anyone, and the fleet was quiet for ~12 hours.
+        # test/the-monitor-mailbox-has-two-doors.test.mjs tries BOTH doors for real and needs these
+        # to do it. Without them it reports that it could not run and fails, which is deliberate:
+        # a suite that passes without reaching its dependency is the shape this repo exists to catch.
         env:
           HEALTHCHECKS_API_KEYS: ${{ secrets.HEALTHCHECKS_API_KEYS }}
+          IMAP_HOST: ${{ secrets.IMAP_HOST }}
+          IMAP_USER: ${{ secrets.IMAP_USER }}
+          IMAP_PASS: ${{ secrets.IMAP_PASS }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
         run: |
           set -e
           failed=0
