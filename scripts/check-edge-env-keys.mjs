@@ -53,7 +53,9 @@
  *   node scripts/check-edge-env-keys.mjs
  */
 import { createHash } from 'node:crypto'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath } from 'node:url'
+import { realpathSync } from 'node:fs'
+import { sayVerdict, PASS, FAIL, UNKNOWN } from './lib/check-verdict.mjs'
 import { discoverLocalTokens, projectsFor } from './lib/local-management-tokens.mjs'
 
 /** Variables whose value is PRESENTED TO SUPABASE as a credential. A dead one here is an outage. */
@@ -154,9 +156,10 @@ export async function loadProject(ref, token, { fetchImpl = fetch } = {}) {
 }
 
 /** The live sweep over every project a token on this disk opens. */
-export async function sweep({ fetchImpl = fetch, tokens } = {}) {
+export async function sweep({ fetchImpl = fetch, tokens, withMeta = false } = {}) {
   const seen = new Map()
-  for (const t of tokens ?? discoverLocalTokens()) {
+  const list = tokens ?? discoverLocalTokens()
+  for (const t of list) {
     const { projects } = await projectsFor(t.token, { fetchImpl })
     for (const p of projects) if (!seen.has(p.ref)) seen.set(p.ref, { name: p.name, token: t.token })
   }
@@ -166,32 +169,59 @@ export async function sweep({ fetchImpl = fetch, tokens } = {}) {
     if (!loaded) continue
     audits.push(auditProject({ name: p.name, ref, ...loaded }))
   }
-  return audits
+  // The caller needs to tell "no token to look with" apart from "looked and every project
+  // refused", and an array of audits cannot say which happened. Opt-in so every existing
+  // caller and test keeps the plain array.
+  return withMeta ? { audits, tokens: list.length } : audits
 }
 
-// pathToFileURL, NOT a hand-built `file:///` + backslash swap (2026-09-03, caught by
-// test/a-check-cannot-pass-without-reaching-its-dependency.test.mjs on the day this file landed).
+// WHY THIS IS NOT `import.meta.url === pathToFileURL(process.argv[1]).href` (2026-09-03).
 //
-// `import.meta.url` PERCENT-ENCODES the path. This repository lives under "Internal Projects",
-// and that space becomes %20 on one side of the comparison and stays a space on the other, so
-// the two strings never matched and THIS BLOCK NEVER RAN. Measured:
+// That is the idiom the rest of this repo uses, and it is the idiom this file shipped with. It
+// worked on the development machine and did NOT fire on the CI runner: the job printed a single
+// line of injector noise, exited 0, and the ratchet in
+// test/a-check-cannot-pass-without-reaching-its-dependency.test.mjs failed all four faults with
+// "reported a PASS ... verdict NONE DECLARED" over an EMPTY stdout. Empty stdout is the proof —
+// the judgement below, which already returns `inconclusive` for a sweep that judged nothing, was
+// never reached at all. Comparing two URL STRINGS compares two spellings of a path; percent
+// encoding, a symlinked checkout and a relative argv[1] each make the same file spell itself two
+// ways. Comparing the two REALPATHS asks the filesystem instead, which has one answer.
 //
-//     their comparison : file:///C:/Business/Internal Projects/.../check-edge-env-keys.mjs
-//     import.meta.url  : file:///C:/Business/Internal%20Projects/.../check-edge-env-keys.mjs
-//     $ node scripts/check-edge-env-keys.mjs   ->  exit 0, zero lines of output
-//
-// The judgement in this file is right — `summarise()` already returns 'inconclusive' for a sweep
-// that judged nothing, which is exactly the third state this whole tree is about — and none of it
-// was ever reached. A check that cannot run at all is the purest form of a job reporting success
-// for doing nothing, and it is invisible precisely because there is no output to be suspicious of.
-if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
-  const audits = await sweep()
+// A check that cannot run is the purest form of a job reporting success for doing nothing, and it
+// is invisible precisely because there is no output to be suspicious of.
+function invokedDirectly() {
+  const arg = process.argv[1]
+  if (!arg) return false
+  const real = (p) => { try { return realpathSync(p) } catch { return p } }
+  return real(fileURLToPath(import.meta.url)) === real(arg)
+}
+
+if (invokedDirectly()) {
+  const { audits, tokens } = await sweep({ withMeta: true })
   for (const a of audits) {
     const mark = a.failures.length ? 'FAIL' : a.warnings.length ? 'warn' : ' ok '
     console.log(`[${mark}] ${a.name} (${a.ref}) — ${a.checked} credentials judged, legacy keys ${a.legacyDisabled ? 'disabled' : 'enabled'}`)
     for (const r of [...a.failures, ...a.warnings]) console.log(`         ${r.level.toUpperCase()} ${r.name}: ${r.reason}`)
   }
   const s = summarise(audits)
-  console.log(`\n${s.projects} projects, ${s.checked} credentials judged, ${s.failing} failing, ${s.warnings} warnings — ${s.verdict.toUpperCase()}`)
-  process.exit(s.verdict === 'pass' ? 0 : 1)
+  console.log(`
+${s.projects} projects, ${s.checked} credentials judged, ${s.failing} failing, ${s.warnings} warnings — ${s.verdict.toUpperCase()}`)
+
+  // Three states, never two. "It judged nothing" is not "nothing is wrong": say WHICH kind of
+  // blindness it was, because "no management token on this host" is a deployment mistake and
+  // "every project refused to load" is an outage, and they need different people.
+  if (s.verdict === 'inconclusive') {
+    const why = tokens === 0
+      ? 'no Supabase management token is readable on this host, so not one project was looked at'
+      : `${tokens} management token(s) found, but every project failed to load — nothing was judged`
+    sayVerdict(UNKNOWN, why)
+    console.log(`INCONCLUSIVE: ${why}`)
+    process.exit(1)
+  }
+  if (s.verdict === 'fail') {
+    sayVerdict(FAIL, `${s.failing} project(s) present a key their own project no longer recognises`)
+    process.exit(1)
+  }
+  sayVerdict(PASS, `${s.checked} credentials across ${s.projects} projects all recognised by their own project`)
+  process.exit(0)
 }

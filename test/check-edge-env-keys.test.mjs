@@ -11,6 +11,9 @@
  * Run: node test/check-edge-env-keys.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
+import { spawnSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+import { verdictOf, VERDICT_MARKER, VERDICT_STATES, PASS } from '../scripts/lib/check-verdict.mjs'
 import {
   classifySecret, auditProject, summarise, digest, OUTBOUND_CREDENTIALS, COMPARISON_ONLY, sweep,
 } from '../scripts/check-edge-env-keys.mjs'
@@ -139,4 +142,32 @@ if (!process.env.SKIP_LIVE) {
   }
 }
 
-console.log(`\n${n} passed`)
+// -- REGRESSION 2026-09-03: the entry block that produces all of the above never fired on CI --
+// The script shipped with `import.meta.url === pathToFileURL(process.argv[1]).href`, the idiom
+// used across this repo. On this machine it matched; on the GitHub runner it did not, so the
+// process printed NOTHING and exited 0 - a check reporting success for doing nothing, invisible
+// because there was no output to be suspicious of. Everything above this line passed throughout,
+// because unit tests import the functions and never ask whether the FILE RUNS.
+//
+// So: actually run it, the way a workflow runs it, and demand that it declared a verdict.
+{
+  const r = spawnSync(process.execPath, ['scripts/check-edge-env-keys.mjs'], {
+    cwd: fileURLToPath(new URL('..', import.meta.url)), encoding: 'utf-8', timeout: 120000,
+  })
+  const out = `${r.stdout || ''}${r.stderr || ''}`
+  t('RUNNING the script produces output at all - the entry block fires', () => {
+    assert.ok(out.trim().length > 0, `spawned the check and it printed nothing (exit ${r.status})`)
+  })
+  t('and it declares one of the three states, never silence', () => {
+    const v = verdictOf(out)
+    assert.ok(v, `no ${VERDICT_MARKER} line in the output; silence reads as a pass to every caller`)
+    assert.ok(VERDICT_STATES.includes(v.state), `declared "${v.state}"`)
+  })
+  t('a pass is only ever declared with a non-zero population behind it', () => {
+    const v = verdictOf(out)
+    if (v && v.state === PASS) assert.match(v.reason, /[1-9][0-9]* credentials/)
+  })
+}
+
+console.log(`
+${n} passed`)
