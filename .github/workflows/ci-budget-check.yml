@@ -43,11 +43,25 @@ jobs:
           # Manual dispatch keeps default 7 so a short window is an explicit choice.
           CI_BUDGET_WINDOW_DAYS: ${{ inputs.window_days || 3 }}
 
+      # Dead-man's switch, and it answers "DID THIS SWEEP READ THE FLEET?", NOT "WAS THE JOB
+      # GREEN?" (2026-09-03). This step used to branch on `job.status`, and this guard exits 1 for
+      # two opposite reasons: a `HARNESS:` failure means the sweep read too little to certify
+      # anything, while CEILING / UNDECLARED / BUDGET are the findings it exists to produce. Under
+      # the old branch, a guard correctly reporting that the bill had gone over budget would have
+      # pinged /fail and looked like a guard that had stopped running - which is precisely what
+      # happened to ci-runner-watchdog and mailer-config-guard on 2026-09-03, both of them DOWN on
+      # healthchecks while pinging on schedule. This check runs WEEKLY, so that failure would have
+      # sat there for days.
+      #
+      # A run that could not certify anything still pings /fail: check-ci-budget.mjs records its
+      # HARNESS failures in ci-budget-findings.json and scripts/lib/guard-heartbeat.mjs reads them.
+      # There is no alert step in this workflow, so there is no ALERT_STEP_OUTCOME to pass.
+      # The URL is a secret, not inline: this repository is PUBLIC, and a published ping URL lets
+      # anyone hold the check green while the job is actually dead.
       - name: Heartbeat
         if: always()
-        run: |
-          if [ "${{ job.status }}" = "success" ]; then
-            curl -fsS -m 10 --retry 3 "${{ secrets.HC_PING_CI_BUDGET }}" || true
-          else
-            curl -fsS -m 10 --retry 3 "${{ secrets.HC_PING_CI_BUDGET }}/fail" || true
-          fi
+        env:
+          HEARTBEAT_GUARD: ci-cost-guard
+          HC_PING_URL: ${{ secrets.HC_PING_CI_BUDGET }}
+          GITHUB_JOB_STATUS: ${{ job.status }}
+        run: node scripts/guard-heartbeat.mjs

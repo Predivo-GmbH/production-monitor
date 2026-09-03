@@ -63,6 +63,7 @@ jobs:
       # database is not an alert either; that is precisely what let the August outage run for
       # four days.
       - name: Email when a product cannot send
+        id: alert
         if: failure()
         run: node scripts/send-mailer-alert.mjs
         env:
@@ -82,11 +83,24 @@ jobs:
       # it after 60 days of repo inactivity, or somebody renamed it, or a spend cap stopped every
       # workflow in the account. The URL is a secret, not inline: this repository is PUBLIC, and
       # a published ping URL lets anyone hold the check green while the job is actually dead.
+      #
+      # IT ANSWERS "DID THIS RUN EXAMINE THE MAILERS, AND DID ITS FINDING GET OUT?", NOT "WAS THE
+      # JOB GREEN?" (2026-09-03). This step used to branch on `job.status`, and this guard exits 1
+      # on ANY finding. So on 2026-09-03 it found that a dormant Distribution-OS STAGING
+      # environment had grown a mailer, successfully emailed Roger about it at 08:53:27Z, and then
+      # told the dead-man it was dead. `mailer-config-guard` sat DOWN on healthchecks over a
+      # staging baseline drift, and the fleet filed it as "Scheduled job stopped running".
+      #
+      # The escape hatch above is KEPT and made precise. It is about the alert failing to LEAVE,
+      # not about the guard finding something - so the ping still goes to /fail when the email
+      # step could not deliver (ALERT_STEP_OUTCOME), when this guard examined no mailer at all,
+      # and when no report was written. It no longer goes to /fail merely because there was
+      # something to report. Those two used to share one channel and they are opposite facts.
       - name: Heartbeat
         if: always()
-        run: |
-          if [ "${{ job.status }}" = "success" ]; then
-            curl -fsS -m 10 --retry 3 "${{ secrets.HC_PING_MAILER_GUARD }}" || true
-          else
-            curl -fsS -m 10 --retry 3 "${{ secrets.HC_PING_MAILER_GUARD }}/fail" || true
-          fi
+        env:
+          HEARTBEAT_GUARD: mailer-config-guard
+          HC_PING_URL: ${{ secrets.HC_PING_MAILER_GUARD }}
+          GITHUB_JOB_STATUS: ${{ job.status }}
+          ALERT_STEP_OUTCOME: ${{ steps.alert.outcome }}
+        run: node scripts/guard-heartbeat.mjs
