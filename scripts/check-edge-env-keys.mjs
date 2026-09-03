@@ -53,6 +53,7 @@
  *   node scripts/check-edge-env-keys.mjs
  */
 import { createHash } from 'node:crypto'
+import { pathToFileURL } from 'node:url'
 import { discoverLocalTokens, projectsFor } from './lib/local-management-tokens.mjs'
 
 /** Variables whose value is PRESENTED TO SUPABASE as a credential. A dead one here is an outage. */
@@ -168,7 +169,22 @@ export async function sweep({ fetchImpl = fetch, tokens } = {}) {
   return audits
 }
 
-if (import.meta.url === `file:///${process.argv[1].replace(/\\/g, '/')}`) {
+// pathToFileURL, NOT a hand-built `file:///` + backslash swap (2026-09-03, caught by
+// test/a-check-cannot-pass-without-reaching-its-dependency.test.mjs on the day this file landed).
+//
+// `import.meta.url` PERCENT-ENCODES the path. This repository lives under "Internal Projects",
+// and that space becomes %20 on one side of the comparison and stays a space on the other, so
+// the two strings never matched and THIS BLOCK NEVER RAN. Measured:
+//
+//     their comparison : file:///C:/Business/Internal Projects/.../check-edge-env-keys.mjs
+//     import.meta.url  : file:///C:/Business/Internal%20Projects/.../check-edge-env-keys.mjs
+//     $ node scripts/check-edge-env-keys.mjs   ->  exit 0, zero lines of output
+//
+// The judgement in this file is right — `summarise()` already returns 'inconclusive' for a sweep
+// that judged nothing, which is exactly the third state this whole tree is about — and none of it
+// was ever reached. A check that cannot run at all is the purest form of a job reporting success
+// for doing nothing, and it is invisible precisely because there is no output to be suspicious of.
+if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
   const audits = await sweep()
   for (const a of audits) {
     const mark = a.failures.length ? 'FAIL' : a.warnings.length ? 'warn' : ' ok '
