@@ -22,6 +22,7 @@
  * Exit 0 = judged. Exit 1 = could not tell, which is never "fine".
  */
 import { readFileSync } from 'node:fs'
+import { sayVerdict, PASS, FAIL, UNKNOWN } from './lib/check-verdict.mjs'
 import { join, sep } from 'node:path'
 
 const BO_REF = process.env.BO_PROJECT_REF || 'xoecpzfsskalvjrtcbbl'
@@ -58,7 +59,10 @@ export function judge(newest, now = Date.now(), staleHours = STALE_HOURS) {
   // That is the exact failure this guard exists to close, reproduced inside the guard.
   const t = new Date(newest).getTime()
   if (!Number.isFinite(t)) {
-    return { stale: true, hours: null, reason: `the newest scan timestamp is unreadable (${String(newest)}), so freshness cannot be established` }
+    // `unknown` because "I cannot establish freshness" is a statement about this check, not about
+    // the scan. It still reports stale so the existing alarm path is unchanged; the flag is what
+    // stops it being printed as a pass. (Additive field: the suite asserts on `.stale` only.)
+    return { stale: true, unknown: true, hours: null, reason: `the newest scan timestamp is unreadable (${String(newest)}), so freshness cannot be established` }
   }
   const hours = Math.round((now - t) / 3_600_000)
   return { stale: hours > staleHours, hours, reason: `last scan wrote ${hours} h ago` }
@@ -88,6 +92,63 @@ async function main() {
   const newest = rows.find((r) => r.last_seen_in_code_at)?.last_seen_in_code_at ?? null
   const neverScanned = rows.filter((r) => !r.last_seen_in_code_at).length
 
+  // AN EMPTY REGISTER IS A FAILED READ, NOT A QUIET FLEET (2026-09-03, found by fault injection).
+  //
+  // Made the endpoint answer 200 with `[]` -- the shape a PostgREST filter change, a renamed
+  // table, a revoked row-level grant or a wrong project ref all produce -- and this check said:
+  //
+  //     external tools: 0 live tool(s), 0 never scanned, the scan has never run
+  //     ::warning::the external-tools scan is stale (> 36h)
+  //     signal filed.                                                              exit 0
+  //
+  // Two separate defects in three lines. First, `judge(null)` cannot tell "the register is empty
+  // because the scan never ran" from "the register is empty because I could not read it", and it
+  // asserts the former, which is a claim about the WORLD made from an absence of DATA. Measured
+  // 2026-09-01: 48 live tools. The register is never empty, so zero rows is this check being
+  // broken. Second -- and this is the half that made it invisible -- it was filed at
+  // `severity: warning, needs_human: false`, which by this fleet's own paging rule can never
+  // reach anybody, and `::warning::` leaves the workflow GREEN. So the sensor announced its own
+  // blindness into a channel guaranteed not to deliver it.
+  //
+  // The wording below is borrowed deliberately from check-alarm-reachability.mjs, which got this
+  // right ("The board is never empty, so this is a failed read, not a quiet fleet. Unknown is
+  // never healthy."). It was in this repo, correct, and eight rows away.
+  if (rows.length === 0) {
+    const reason = 'the external-tools register returned no rows at all, so nothing could be judged. '
+      + 'The register is never empty — 48 live tools were counted on 2026-09-01 — so zero rows is a failed read, '
+      + 'not a fleet with no external tools. Unknown is never healthy.'
+    sayVerdict(UNKNOWN, reason)
+    console.error(`::error::${reason}`)
+    if (dry) { console.log('--dry: nothing written.'); return 1 }
+    // Filed CRITICAL and needs_human, unlike the staleness row below. A stale scan means the page
+    // is ageing; a register that cannot be read means this alarm is off, and an alarm being off is
+    // the one condition under which every other reading is worthless. Best-effort: if the board is
+    // unreachable too, the non-zero exit is the remaining wire and it must not be lost to a throw.
+    try {
+      const res = await fetch(`${BO_BASE}/functions/v1/signal-intake`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${secret}`, 'Content-Type': 'application/json', 'User-Agent': UA },
+        body: JSON.stringify({
+          source: SOURCE,
+          key: 'external-tools-register-unreadable',
+          kind: 'incident',
+          severity: 'critical',
+          state: 'open',
+          needs_human: true,
+          title: 'The external-tools freshness alarm has gone blind',
+          summary: reason + ' Until this is fixed the External Tools page can rot with nothing to notice, which is the exact failure this guard was built to prevent.',
+          detail: { rows_returned: 0, project_ref: BO_REF, threshold_hours: STALE_HOURS },
+          link: 'https://cockpit.predivo.ch/external-tools',
+        }),
+      })
+      if (!res.ok) console.error(`::error::could not file the blindness finding: HTTP ${res.status}`)
+      else console.log('signal filed: external-tools-register-unreadable (critical, needs a human).')
+    } catch (e) {
+      console.error(`::error::could not file the blindness finding: ${e.message}`)
+    }
+    return 1
+  }
+
   const v = judge(newest)
   console.log(`external tools: ${rows.length} live tool(s), ${neverScanned} never scanned, ${v.reason}`)
 
@@ -96,8 +157,13 @@ async function main() {
   // the number reached nobody. Measured the day this was fixed: 48 live tools, 17 of them never
   // scanned once. One row for the whole set, warning and needs_human false, because it is a
   // wiring gap and not an outage: the scan IS running, it is simply not reaching these entries.
-  if (!v.stale && !neverScanned) { console.log('fresh, and every tool has been scanned - nothing to raise.'); return 0 }
+  if (!v.stale && !neverScanned) {
+    sayVerdict(PASS, `${rows.length} live tool(s) read, ${v.reason}, every tool scanned.`)
+    console.log('fresh, and every tool has been scanned - nothing to raise.')
+    return 0
+  }
   if (!v.stale) {
+    sayVerdict(FAIL, `${neverScanned} of ${rows.length} external tool(s) have never been scanned`)
     console.log(`::warning::${neverScanned} of ${rows.length} external tool(s) have never been scanned`)
     if (dry) { console.log('--dry: nothing written.'); return 0 }
     const res = await fetch(`${BO_BASE}/functions/v1/signal-intake`, {
@@ -120,6 +186,9 @@ async function main() {
     console.log('signal filed: external-tools-never-scanned.')
     return 0
   }
+  // `unknown` when the timestamp itself could not be parsed: freshness was never established, so
+  // this is a blind sensor wearing a staleness verdict. `fail` when the scan genuinely is stale.
+  sayVerdict(v.unknown ? UNKNOWN : FAIL, v.reason)
   console.log(`::warning::the external-tools scan is stale (> ${STALE_HOURS}h)`)
   if (dry) { console.log('--dry: nothing written.'); return 0 }
 

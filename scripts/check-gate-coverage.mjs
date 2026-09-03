@@ -26,6 +26,7 @@ import { existsSync } from 'node:fs'
 import { execSync } from 'node:child_process'
 import { join } from 'node:path'
 import { getFleet } from '../lib/fleet.mjs'
+import { sayVerdict, PASS, FAIL, UNKNOWN } from './lib/check-verdict.mjs'
 
 // gates: 'required' = an app with auth/DB/lists/dialogs that MUST carry the v11 gates.
 //        'na'       = static marketing site or internal tool — nothing to browser-gate.
@@ -39,9 +40,51 @@ const WORKFLOW = 'staging-gates.yml'
 const LOCAL_ROOT = process.env.LOCAL_FLEET_ROOT
 const hasToken = !!(process.env.GH_TOKEN || process.env.GITHUB_TOKEN)
 
+// A CHECK THAT CANNOT LOOK MUST NOT EXIT 0 (2026-09-03, found by fault injection).
+//
+// This block used to print "gate-coverage check skipped: set FLEET_READ_TOKEN ..." and exit 0,
+// which made the weekly workflow GREEN. Run with no token in the environment — which is what a
+// revoked, expired or renamed PAT looks like from in here — and the entire guard retires itself
+// silently and permanently. Nothing in the system distinguishes "every enrolled project's gates
+// are green" from "I have not looked at a project since the token died", because both are a
+// green run with nobody reading the log.
+//
+// The rationalisation in the old comment was "skip cleanly rather than fail the nightly — the
+// check activates the moment the secret is added". That is true and it is the trap: it optimises
+// for the day the guard is being wired up, and pays for it with every day afterwards, when the
+// same silence means the opposite thing. A dormant guard has to be loud about being dormant,
+// because the only person who can arm it is the person who has stopped being told.
 if (!LOCAL_ROOT && !hasToken) {
-  console.log('gate-coverage check skipped: set FLEET_READ_TOKEN (classic PAT, repo:read) to enable, or run locally with LOCAL_FLEET_ROOT set.')
-  process.exit(0)
+  const reason = 'the v11 gate-coverage guard could not look at a single repository: no FLEET_READ_TOKEN / '
+    + 'DASHBOARD_PAT in the environment and no LOCAL_FLEET_ROOT. Nothing was checked, so nothing is known — '
+    + 'this is a dormant guard, not a fleet with healthy gates.'
+  sayVerdict(UNKNOWN, reason)
+  console.error(`::error::${reason}`)
+  // Same wire a real broken-gate finding uses, so blindness reaches a person the way a finding
+  // would. A guard that is off is worse news than a gate that is red: the red gate is at least
+  // being watched.
+  if (process.env.ALERT_SMTP_HOST) {
+    try {
+      const { createMailTransport } = await import('./lib/smtp.mjs')
+      const t = await createMailTransport({
+        host: process.env.ALERT_SMTP_HOST,
+        port: process.env.ALERT_SMTP_PORT,
+        user: process.env.ALERT_SMTP_USER,
+        pass: process.env.ALERT_SMTP_PASS,
+      })
+      await t.sendMail({
+        from: 'Gate Coverage Guard <' + process.env.ALERT_SMTP_USER + '>',
+        to: process.env.ALERT_TO,
+        subject: '[ALERT] The v11 gate-coverage guard is not checking anything',
+        html: '<p>' + reason + '</p><p>It needs a classic PAT with <code>repo:read</code> across the fleet, stored as the repository secret <code>FLEET_READ_TOKEN</code> (or <code>DASHBOARD_PAT</code>). Until then no project&rsquo;s staging gates are being watched.</p>',
+      })
+    } catch (e) {
+      console.error('alert email failed:', e.message)
+    }
+  } else {
+    console.error('NOT EMAILED: ALERT_SMTP_HOST is unset, so this blindness reached nobody but a red run.')
+  }
+  process.exit(1)
 }
 
 // Does the repo carry the staging-gates workflow? (enrolled)
@@ -133,7 +176,9 @@ if (violations.length) {
       console.error('alert email failed:', e.message)
     }
   }
+  sayVerdict(FAIL, `${violations.length} enrolled project(s) with a broken v11 gate run.`)
   console.error(`\nFAIL: ${violations.length} enrolled project(s) with a broken v11 gate run.`)
   process.exit(1)
 }
+sayVerdict(PASS, `${okList.length}/${required} required app(s) enrolled and green, ${pending.length} pending enrollment.`)
 console.log('\nAll ENROLLED gate harnesses green. (Pending apps are the tracked backfill queue, not a failure.)')

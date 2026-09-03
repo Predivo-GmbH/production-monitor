@@ -34,6 +34,7 @@ import { boardSecret, fileSignal, signal } from "./lib/fleet-signal.mjs"
 // same signature and needed the same answer. Re-exported so this module's public surface
 // (and its test) is unchanged by the move.
 import { coverageGaps, coverageLine, loadBaseline, managementApiOnly, outOfManagementApiReach, outOfReachLine } from './lib/supabase-coverage.mjs'
+import { sayVerdict, PASS, FAIL, UNKNOWN } from './lib/check-verdict.mjs'
 // ONE definition of "which environment variables are management tokens", shared with
 // expire-stale-sessions.mjs, which carries the full note on why the two used to differ and what
 // that would have cost. Short version: the two hourly sweeps are graded against the SAME
@@ -196,11 +197,28 @@ export function outOfReachSignal(unreachable) {
   })
 }
 
-export function exitDecision(findings, gaps) {
+export function exitDecision(findings, gaps, swept = null) {
   const reasons = []
   const projectBlind = findings.filter((f) => f.level === 'unreadable' && !f.isToken)
   const blocked = findings.filter((f) => f.level === 'blocked')
   const deadTokens = findings.filter((f) => f.level === 'unreadable' && f.isToken)
+  // A SWEEP THAT TOUCHED NOTHING DECIDED NOTHING (2026-09-03, found by fault injection).
+  //
+  // Every clause here reasons about findings, and a finding requires a project to have been
+  // looked at. Emptying `projects` in lib/supabase-projects-baseline.json produced no findings
+  // for the only reason that is never good news, and this check printed:
+  //
+  //     0 projects checked, 0 behind the current build, 0 unreadable
+  //     coverage: UNPROVEN — scripts/lib/supabase-projects-baseline.json is absent or empty
+  //
+  // and exited 0. It had already worked out and printed the word UNPROVEN and then handed CI a
+  // zero, which is the sharpest form of this class: the check KNEW, said so in English, and the
+  // only channel anything downstream reads said "fine". `swept` is passed explicitly rather than
+  // inferred from `findings`, because the population and its problems are different questions
+  // and conflating them is how this happened.
+  if (swept !== null && swept.length === 0) {
+    reasons.push('not one Supabase project was swept, so nothing was measured — an empty sweep is a broken check, not a current fleet')
+  }
   if (projectBlind.length) reasons.push(`${projectBlind.length} project(s) could not be read: ${projectBlind.map((f) => f.product).join(', ')}`)
   if (blocked.length) reasons.push(`${blocked.length} project(s) are behind and NOT eligible to upgrade: ${blocked.map((f) => f.product).join(', ')}`)
   if (deadTokens.length && gaps === null) reasons.push(`${deadTokens.length} management token(s) are dead and there is no project baseline, so the sweep cannot be shown to have been complete without them`)
@@ -276,8 +294,13 @@ if (process.argv[1] && process.argv[1].endsWith('check-supabase-build-currency.m
     }
   }
 
-  const { code, reasons } = exitDecision(findings, gaps)
+  const { code, reasons } = exitDecision(findings, gaps, swept)
   for (const r of reasons) console.error(`::error::${r}`)
+  // Three-valued, out loud (lib/check-verdict.mjs). A sweep that touched nothing is UNKNOWN, not
+  // a fail: nothing is known to be wrong, and nothing is known to be right either.
+  if (!swept.length) sayVerdict(UNKNOWN, 'not one Supabase project was swept — nothing was measured')
+  else if (code !== 0) sayVerdict(FAIL, reasons.join(' | '))
+  else sayVerdict(PASS, `${projects.length} project(s) swept, ${behind.length} behind, ${blind.length} unreadable`)
 
   // NOT process.exit(). On Windows, exiting while undici still holds its keep-alive sockets
   // aborts the process with a libuv assertion (UV_HANDLE_CLOSING, src\win\async.c:76) and

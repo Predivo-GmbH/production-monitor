@@ -104,6 +104,7 @@
  * Exit 0 = healthy or alarm filed successfully. Exit 1 = could not tell, which is never "fine".
  */
 import { readFileSync } from 'fs'
+import { sayVerdict, PASS, FAIL, UNKNOWN } from './lib/check-verdict.mjs'
 import { writableToIncidentBoard } from './board-drainer.mjs'
 
 const BO_REF = 'xoecpzfsskalvjrtcbbl'
@@ -180,6 +181,13 @@ export function judgeDrainer({
   if (!heartbeat) {
     return {
       verdict: 'stopped',
+      // UNKNOWN, not FAIL: this branch is reached both when the drainer genuinely never ran and
+      // when the heartbeat read came back empty because something upstream broke (a renamed
+      // table, a revoked grant, a wrong project ref — all of which answer 200 with no rows).
+      // The alarm is identical either way and stays critical; the flag only stops this being
+      // printable as a pass. Measured 2026-09-03: with the API stubbed to answer `[]`, this exact
+      // branch fired, filed correctly, and still exited 0 with nothing machine-readable saying so.
+      unknown: true,
       severity: 'critical',
       title: 'The fleet auto-fixer has never reported a run',
       summary: 'No board-drainer heartbeat exists at all. Nothing is fixing incidents automatically, and nothing would tell you.',
@@ -190,6 +198,7 @@ export function judgeDrainer({
   if (age === null || Number.isNaN(age)) {
     return {
       verdict: 'stopped',
+      unknown: true,   // "its liveness cannot be established" is by definition an unknown
       severity: 'critical',
       title: 'The fleet auto-fixer heartbeat is unreadable',
       summary: `last_seen_at is not a usable timestamp (${String(heartbeat.last_seen_at)}), so its liveness cannot be established. Unknown is not healthy.`,
@@ -432,6 +441,9 @@ async function main() {
 
   const judgement = judgeDrainer({ heartbeat: heartbeat || null, board })
   console.log(`drainer: ${judgement.verdict} — ${judgement.summary}`)
+  // Three-valued, out loud (lib/check-verdict.mjs). The house rule is that a filed alarm exits 0,
+  // so the exit code cannot distinguish "the fixer is working" from "I could not find out".
+  sayVerdict(judgement.verdict === 'ok' ? PASS : judgement.unknown ? UNKNOWN : FAIL, judgement.summary)
 
   if (dry) { console.log('--dry: nothing written.'); return judgement.verdict === 'ok' ? 0 : 0 }
 
