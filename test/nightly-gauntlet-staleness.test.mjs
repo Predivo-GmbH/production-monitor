@@ -162,11 +162,13 @@ t('the five tiered nightlies parse to 24h from their real cron text', () => {
   }
 })
 
-t('the fresh floor is sound for every schedule this check actually judges', () => {
-  // The floor's precondition (gauntlet-staleness.mjs): it may only stand in for an unknown
-  // period where OVERDUE_FACTOR x period >= the floor. Every gauntlet cron is daily, so 72h
-  // clears 26h with room. If a gauntlet is ever made sub-daily, this fails and the floor must
-  // come down with it — that is the point of asserting it rather than trusting the comment.
+t('the fresh floor is sound for representative daily crons (parse check only)', () => {
+  // NOTE — this proves the floor's precondition (OVERDUE_FACTOR x period >= floor) only for the
+  // daily cron SHAPES typed below; it does NOT read the product repos' real deploy.yml, so it
+  // will keep passing even if a real gauntlet is later made sub-daily. The precondition against
+  // the LIVE schedules is enforced in tests/ci-health/nightly-gauntlet.spec.ts, which asserts it
+  // against each real fetched period and fails loudly when 3x the interval no longer clears the
+  // floor. This case just guards that the parse+arithmetic itself is correct for a daily cron.
   for (const expr of ['30 4 * * *', '35 4 * * *', '40 4 * * *', '45 4 * * *', '50 4 * * *']) {
     const p = cronPeriodHours(expr, Date.parse('2026-09-03T04:00:00Z'))
     assert.ok(OVERDUE_FACTOR * p >= FRESH_FLOOR_HOURS, `${expr}: 3x${p}h does not clear the ${FRESH_FLOOR_HOURS}h floor`)

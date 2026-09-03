@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 // @ts-expect-error — plain-JS libs, shared with the node unit tests that own their rules.
-import { scheduleFreshness, FRESH_FLOOR_HOURS } from '../../scripts/lib/gauntlet-staleness.mjs';
+import { scheduleFreshness, FRESH_FLOOR_HOURS, OVERDUE_FACTOR } from '../../scripts/lib/gauntlet-staleness.mjs';
 // @ts-expect-error — see above.
 import { extractCronSchedules, cronPeriodHours } from '../../scripts/lib/cron-cadence.mjs';
 
@@ -127,6 +127,20 @@ for (const repo of TIERED_REPOS) {
           const periods = crons.map((c) => cronPeriodHours(c)).filter((p: number | null) => Number.isFinite(p));
           if (periods.length) periodHours = Math.min(...(periods as number[]));
         }
+      }
+
+      // FRESH-FLOOR SOUNDNESS — asserted against the REAL cron just read from deploy.yml, not a
+      // literal. The 26h fresh-floor is only a safe stand-in for an UNKNOWN period while
+      // OVERDUE_FACTOR x the real period still clears it (see gauntlet-staleness.mjs). Under the
+      // fast path (a fresh green run) the period is never fetched, so the floor could silently go
+      // unsound the day a gauntlet is made sub-daily. Here — the one place we do hold the real
+      // period — we make that unsoundness a loud finding instead: if 3x the actual interval no
+      // longer clears the floor, this fails so the floor is brought down with the schedule.
+      if (periodHours !== null) {
+        expect(
+          OVERDUE_FACTOR * periodHours,
+          `${repo} FRESH-FLOOR IS UNSOUND FOR THIS SCHEDULE — deploy.yml now fires every ${periodHours}h, so it is overdue after ${OVERDUE_FACTOR}x = ${OVERDUE_FACTOR * periodHours}h, but the unknown-period floor holds a stopped run FRESH until ${FRESH_FLOOR_HOURS}h. Lower FRESH_FLOOR_HOURS in scripts/lib/gauntlet-staleness.mjs to <= ${OVERDUE_FACTOR * periodHours}, or a stopped ${repo} gauntlet reads FRESH for up to ${FRESH_FLOOR_HOURS - OVERDUE_FACTOR * periodHours}h.`,
+        ).toBeGreaterThanOrEqual(FRESH_FLOOR_HOURS);
       }
 
       const f = scheduleFreshness({ ageHours: greenAgeHours, archived, yamlRead, cronCount, periodHours });

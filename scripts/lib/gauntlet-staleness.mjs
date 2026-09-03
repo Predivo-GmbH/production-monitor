@@ -42,11 +42,15 @@ export const OVERDUE_FACTOR = 3
  * PRECONDITION, and the reason this is a floor and not a rule: it is only sound for workflows
  * whose real interval satisfies OVERDUE_FACTOR x period >= this value, i.e. roughly 9h or
  * slower. Everything this check judges is a nightly gauntlet (a daily cron in deploy.yml, 3 x
- * 24 = 72h), so the floor is far inside the safe range — pinned against the five real cron
- * expressions in test/nightly-gauntlet-staleness.test.mjs. If a gauntlet is ever made
- * sub-daily, this floor must come down with it or it will mask a stopped schedule for up to
- * 26h. A period we HAVE looked up is never overridden by this floor (see below) — that bug
- * was written here first and caught by the boundary test.
+ * 24 = 72h), so the floor is far inside the safe range. That precondition is enforced against
+ * the LIVE deploy.yml crons, not a literal: tests/ci-health/nightly-gauntlet.spec.ts asserts
+ * OVERDUE_FACTOR x the real fetched period >= this floor whenever it looks a period up, and
+ * fails loudly the day a gauntlet is made sub-daily enough to break it. (The unit test in
+ * test/nightly-gauntlet-staleness.test.mjs only checks that representative daily crons parse to
+ * 24h — it cannot prove the floor against the real repos because it makes no GitHub calls.) If a
+ * gauntlet is ever made sub-daily, this floor must come down with it or it will mask a stopped
+ * schedule for up to 26h. A period we HAVE looked up is never overridden by this floor (see
+ * below) — that bug was written here first and caught by the boundary test.
  */
 export const FRESH_FLOOR_HOURS = 26
 
