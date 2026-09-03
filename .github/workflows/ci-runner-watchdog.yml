@@ -62,11 +62,19 @@ jobs:
       # which is independent of ours. Silence is the failure mode a red run can never report.
       # The URL is a secret, not inline: this repository is PUBLIC, and a published ping URL lets
       # anyone keep the check green while the job is actually dead.
+      #
+      # IT ANSWERS "DID THIS RUN INSPECT THE FLEET?", NOT "WAS THE JOB GREEN?" (2026-09-03). This
+      # step used to branch on `job.status`, and check-ci-runners.mjs exits 1 on ANY finding - a
+      # single-machine coverage warning about another repository is enough. So a watchdog that was
+      # working and reporting pinged /fail, healthchecks marked it DOWN, and the fleet filed
+      # "Scheduled job stopped running: ci-runner-watchdog" against a check that had pinged six
+      # minutes earlier and 780 times in total. The more useful this watchdog was, the deader it
+      # looked. The finding still travels - the step above mails it and the run is still red; only
+      # the dead-man, whose entire job is to notice SILENCE, stops calling noise silence.
+      # A run that could NOT certify the fleet still pings /fail: see scripts/lib/watchdog-heartbeat.mjs.
       - name: Heartbeat
         if: always()
-        run: |
-          if [ "${{ job.status }}" = "success" ]; then
-            curl -fsS -m 10 --retry 3 "${{ secrets.HC_PING_CI_WATCHDOG }}" || true
-          else
-            curl -fsS -m 10 --retry 3 "${{ secrets.HC_PING_CI_WATCHDOG }}/fail" || true
-          fi
+        env:
+          HC_PING_URL: ${{ secrets.HC_PING_CI_WATCHDOG }}
+          GITHUB_JOB_STATUS: ${{ job.status }}
+        run: node scripts/ci-watchdog-heartbeat.mjs
