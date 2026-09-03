@@ -100,3 +100,84 @@ export function scheduleFreshness({ ageHours, archived, yamlRead, cronCount, per
   }
   return { verdict: 'UNPROVEN', reason: `the workflow declares ${cronCount} cron(s) but none could be parsed into an interval` }
 }
+
+/**
+ * DID WE SEE THAT ABSENCE TWICE?
+ *
+ * WHY (2026-09-03 hourly check, hours after the gate above was added). Monitor run 33723882661
+ * paged: "Arivioo/ChannelMover NIGHTLY GAUNTLET HAS STOPPED RUNNING — the last scheduled run was
+ * 457.6h ago and this workflow is scheduled every 24h". It had not stopped. Its nightly ran 2h
+ * before that alarm (run 33719060817, 2026-09-03T05:29:28Z) and every night before it without a
+ * gap. The GitHub list endpoint
+ * `/repos/{repo}/actions/workflows/deploy.yml/runs?event=schedule&per_page=10` answered 200 at
+ * 06:37:49.645Z with a page whose FIRST entry was run 31865853339 from 2026-08-15 — nineteen days
+ * stale. Not a truncated page and not an ordering fault: the ten newer scheduled runs were simply
+ * absent from it, so `pickJudgeableRun` reported nothing stepped over (the alert carries no
+ * describeSkipped note, which is how we know) and the freshness arithmetic above was done on a
+ * run that had been superseded ten times over.
+ *
+ * 2.2 seconds later the Playwright retry made the identical call and got the true page — it
+ * skipped with "latest scheduled gauntlet is 'success' — healthy", which is what laundered the
+ * failure and is why check-laundered-failures.mjs is what actually reported this. The four
+ * sibling repos in the same run, judged in the same seconds through the same token, all read
+ * correctly. Re-measured the same morning: 145 further reads of that exact URL (25 serial, 120
+ * concurrent) returned the correct newest run every single time. So the bad page is rare, is not
+ * reproducible on demand, and is not something this repo can fix at its source.
+ *
+ * WHAT WAS ACTUALLY WRONG ON OUR SIDE. Every other paging path in nightly-gauntlet.spec.ts
+ * already refuses to alarm on a single observation: a failure must outlive the auto-retry window
+ * (persistence gate), an inconclusive run needs MIN_INCONCLUSIVE_TO_PAGE=2 conclusive-free runs
+ * behind it, a red run superseded by a newer commit waits for the next nightly, and ANY API error
+ * is UNPROVEN and silent. The staleness gate was the one verdict that paged on a single read —
+ * and it is the verdict least able to afford one, because it asserts something is NOT THERE. A
+ * failing run is evidence in hand and survives a bad page; an absent run is only ever an
+ * inference from a list you were handed once, so a bad list IS the finding.
+ *
+ * So a stopped schedule must be seen twice before it is announced: a second, fresh call to the
+ * same endpoint, and the two reads must name the SAME newest run AND reach the SAME verdict.
+ *
+ * WHAT THIS DOES NOT CLAIM. Two reads can both be stale; this does not make that impossible, and
+ * a second read of the same endpoint is corroboration, not independence. It buys the thing that
+ * matters here: the hourly monitor asks again in an hour, and a gauntlet that has genuinely
+ * stopped answers identically on every read forever — so a real alarm is delayed by at most one
+ * hour, while a one-off bad page is silenced outright. A benign race (a new scheduled run
+ * starting between the two reads) also lands as "not confirmed", which is the correct answer:
+ * a schedule that just fired is not a stopped schedule.
+ */
+
+/** The verdicts that PAGE — the ones asserting the schedule has stopped. RETIRED and UNPROVEN are
+ *  named and stay quiet, and FRESH is health, so none of the three needs corroborating. Kept as a
+ *  named set so a verdict added later must be classified deliberately (test/ asserts the set is
+ *  exhaustive against everything scheduleFreshness can return). */
+export const STOPPED_VERDICTS = ['OVERDUE', 'NO_SCHEDULE']
+
+/**
+ * @param {{verdict:string, newestRunId:number|string|null}} first  the read that wants to page
+ * @param {{ok:boolean, verdict?:string, newestRunId?:number|string|null}} second the confirming read
+ * @returns {{confirmed:boolean, reason:string}} confirmed=true means it is safe to announce that
+ *   this schedule has stopped; false means say so out loud and stay quiet until the next hour.
+ */
+export function corroborateStopped(first, second) {
+  if (!second?.ok) {
+    return {
+      confirmed: false,
+      reason: 'the confirming read of the scheduled-run list did not come back, so the gap was seen once and never checked',
+    }
+  }
+  if (String(second.newestRunId) !== String(first?.newestRunId)) {
+    return {
+      confirmed: false,
+      reason: `the two reads named DIFFERENT newest scheduled runs (${first?.newestRunId} then ${second.newestRunId}) — one of them is wrong and there is no way from here to tell which, so nothing about this schedule has been proven`,
+    }
+  }
+  if (second.verdict !== first?.verdict) {
+    return {
+      confirmed: false,
+      reason: `both reads named run ${second.newestRunId} but reached different verdicts (${first?.verdict} then ${second.verdict}), so the freshness of this schedule is in dispute`,
+    }
+  }
+  return {
+    confirmed: true,
+    reason: `seen twice: two separate reads of the scheduled-run list both name run ${second.newestRunId} as the newest and both say ${second.verdict}`,
+  }
+}

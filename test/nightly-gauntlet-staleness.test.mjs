@@ -11,7 +11,7 @@
  */
 import assert from 'node:assert'
 import { readFileSync } from 'node:fs'
-import { scheduleFreshness, OVERDUE_FACTOR, FRESH_FLOOR_HOURS } from '../scripts/lib/gauntlet-staleness.mjs'
+import { scheduleFreshness, corroborateStopped, STOPPED_VERDICTS, OVERDUE_FACTOR, FRESH_FLOOR_HOURS } from '../scripts/lib/gauntlet-staleness.mjs'
 import { extractCronSchedules, cronPeriodHours } from '../scripts/lib/cron-cadence.mjs'
 
 let n = 0
@@ -131,9 +131,13 @@ t('UNPROVEN and NO_SCHEDULE are different answers to different questions', () =>
 // ── the verdicts the caller acts on ──────────────────────────────────────────────────────────
 
 t('exactly two verdicts page, and they are the two that name a stopped schedule', () => {
-  const PAGES = new Set(['OVERDUE', 'NO_SCHEDULE'])
+  // Asserted against the set the SPEC actually routes on, not a copy typed in here. Until
+  // 2026-09-03 this test held its own `new Set(['OVERDUE','NO_SCHEDULE'])`, so the code could
+  // have started paging on a third verdict and this would still have gone green — the same
+  // test-restates-the-assumption fault 1a49f49 fixed for the fresh floor.
+  assert.deepEqual([...STOPPED_VERDICTS].sort(), ['NO_SCHEDULE', 'OVERDUE'])
   for (const v of ['FRESH', 'RETIRED', 'UNPROVEN', 'NO_SCHEDULE', 'OVERDUE']) {
-    assert.equal(PAGES.has(v), v === 'OVERDUE' || v === 'NO_SCHEDULE', v)
+    assert.equal(STOPPED_VERDICTS.includes(v), v === 'OVERDUE' || v === 'NO_SCHEDULE', v)
   }
 })
 
@@ -195,6 +199,105 @@ t('the spec no longer returns healthy on a green run without consulting freshnes
   const healthy = src.indexOf('— healthy')
   assert.ok(fresh !== -1 && healthy !== -1, 'both markers must exist')
   assert.ok(fresh < healthy, 'freshness must be decided before the run is called healthy')
+})
+
+
+// ── SEEING THE ABSENCE TWICE ─────────────────────────────────────────────────────────────────
+//
+// The second hole in this gate, found the same day (2026-09-03) by monitor run 33723882661. The
+// gate above did its arithmetic correctly on the run it was given; it was GIVEN THE WRONG RUN.
+// GitHub answered 200 with a page whose newest scheduled run was 19 days stale, ChannelMover's
+// nightly had actually run 2h earlier, and the alarm went out. Original behaviour, which every
+// assertion below was watched to fail against, is "one read is enough" — i.e. corroborateStopped
+// replaced by `() => ({ confirmed: true })`.
+
+t('THE DEFECT: two reads naming different newest runs prove nothing, so no page', () => {
+  // The exact live shape. Read 1 (06:37:49.645Z) judged run 31865853339 from 2026-08-15 and said
+  // OVERDUE; read 2, 2.2s later, judged run 33719060817 from 05:29Z the same morning: FRESH.
+  const v = corroborateStopped(
+    { verdict: 'OVERDUE', newestRunId: 31865853339 },
+    { ok: true, verdict: 'FRESH', newestRunId: 33719060817 },
+  )
+  assert.equal(v.confirmed, false)
+  // Both ids must be in the text or a human cannot check which read was the liar.
+  assert.match(v.reason, /31865853339/)
+  assert.match(v.reason, /33719060817/)
+})
+
+t('a schedule that has really stopped is still paged — both reads agree', () => {
+  // The alarm must survive this fix, or the fix is just a mute button.
+  const v = corroborateStopped(
+    { verdict: 'OVERDUE', newestRunId: 31865853339 },
+    { ok: true, verdict: 'OVERDUE', newestRunId: 31865853339 },
+  )
+  assert.equal(v.confirmed, true)
+  assert.match(v.reason, /seen twice/)
+})
+
+t('a removed cron seen twice on the same run still pages', () => {
+  const v = corroborateStopped(
+    { verdict: 'NO_SCHEDULE', newestRunId: 42 },
+    { ok: true, verdict: 'NO_SCHEDULE', newestRunId: 42 },
+  )
+  assert.equal(v.confirmed, true)
+})
+
+t('a confirming read that never came back is not a confirmation', () => {
+  // A 403/502/rate-limit on the second call must not be read as agreement. This repo's standing
+  // rule: an API blip never reds the hourly monitor.
+  const v = corroborateStopped({ verdict: 'OVERDUE', newestRunId: 7 }, { ok: false })
+  assert.equal(v.confirmed, false)
+  assert.match(v.reason, /did not come back/)
+})
+
+t('same newest run but disagreeing verdicts is a dispute, not a confirmation', () => {
+  const v = corroborateStopped(
+    { verdict: 'OVERDUE', newestRunId: 7 },
+    { ok: true, verdict: 'UNPROVEN', newestRunId: 7 },
+  )
+  assert.equal(v.confirmed, false)
+  assert.match(v.reason, /different verdicts/)
+})
+
+t('a new scheduled run starting between the two reads is NOT a stopped schedule', () => {
+  // The benign race, and it must land on the quiet side: read 1 saw an overdue list, read 2 saw
+  // the nightly that just fired. That is a schedule working, arriving late.
+  const v = corroborateStopped(
+    { verdict: 'OVERDUE', newestRunId: 100 },
+    { ok: true, verdict: 'FRESH', newestRunId: 200 },
+  )
+  assert.equal(v.confirmed, false)
+})
+
+t('run ids are compared by value, not by JS type', () => {
+  // GitHub ids exceed Number.MAX_SAFE_INTEGER's comfort zone and some clients hand them back as
+  // strings. A type mismatch must not silently read as "the two reads disagree" and mute a real
+  // stopped gauntlet forever.
+  const v = corroborateStopped(
+    { verdict: 'OVERDUE', newestRunId: 31865853339 },
+    { ok: true, verdict: 'OVERDUE', newestRunId: '31865853339' },
+  )
+  assert.equal(v.confirmed, true)
+})
+
+t('RATCHET: every verdict scheduleFreshness can return is classified somewhere', () => {
+  // The spec routes on three sets: FRESH passes, RETIRED/UNPROVEN skip quietly, STOPPED_VERDICTS
+  // page. A verdict added to scheduleFreshness and classified nowhere would fall through to
+  // "healthy" — which is the exact bug this whole file exists to close. Read the verdicts out of
+  // the source so adding one without classifying it fails here.
+  const src = readFileSync(new URL('../scripts/lib/gauntlet-staleness.mjs', import.meta.url), 'utf8')
+  const body = src.slice(src.indexOf('export function scheduleFreshness'))
+  const returned = new Set([...body.matchAll(/verdict:\s*'([A-Z_]+)'/g)].map((m) => m[1]))
+  assert.ok(returned.size >= 5, `expected the real verdict set, found ${[...returned].join(',')}`)
+  const classified = new Set(['FRESH', 'RETIRED', 'UNPROVEN', ...STOPPED_VERDICTS])
+  const orphans = [...returned].filter((v) => !classified.has(v))
+  assert.deepEqual(orphans, [], `unclassified freshness verdict(s): ${orphans.join(', ')}`)
+})
+
+t('STOPPED_VERDICTS does not quietly swallow the healthy or quiet verdicts', () => {
+  for (const v of ['FRESH', 'RETIRED', 'UNPROVEN']) {
+    assert.ok(!STOPPED_VERDICTS.includes(v), `${v} must never be treated as a page`)
+  }
 })
 
 console.log('\n' + n + ' passed')

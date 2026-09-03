@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 // @ts-expect-error — plain-JS libs, shared with the node unit tests that own their rules.
-import { scheduleFreshness, FRESH_FLOOR_HOURS, OVERDUE_FACTOR } from '../../scripts/lib/gauntlet-staleness.mjs';
+import { scheduleFreshness, corroborateStopped, STOPPED_VERDICTS, FRESH_FLOOR_HOURS, OVERDUE_FACTOR } from '../../scripts/lib/gauntlet-staleness.mjs';
 // @ts-expect-error — see above.
 import { extractCronSchedules, cronPeriodHours } from '../../scripts/lib/cron-cadence.mjs';
 // @ts-expect-error — see above.
@@ -72,10 +72,12 @@ for (const repo of TIERED_REPOS) {
   test(`nightly-gauntlet: ${repo} last scheduled staging gauntlet is not failing`, async ({ request }) => {
     test.skip(!ghToken, 'DASHBOARD_PAT not set');
 
-    const res = await request.get(
-      `https://api.github.com/repos/${repo}/actions/workflows/deploy.yml/runs?event=schedule&per_page=10`,
-      { headers: { Authorization: `Bearer ${ghToken}`, Accept: 'application/vnd.github.v3+json' } },
-    );
+    // One constant, used by BOTH the first read and the corroborating read below, so the second
+    // read cannot silently drift into asking a different question than the one it is confirming.
+    const runsUrl = `https://api.github.com/repos/${repo}/actions/workflows/deploy.yml/runs?event=schedule&per_page=10`;
+    const ghHeaders = { Authorization: `Bearer ${ghToken}`, Accept: 'application/vnd.github.v3+json' };
+
+    const res = await request.get(runsUrl, { headers: ghHeaders });
     test.skip(res.status() !== 200, `GitHub API returned ${res.status()} for ${repo} — skipping to avoid a false alarm`);
 
     const body = await res.json();
@@ -133,14 +135,12 @@ for (const repo of TIERED_REPOS) {
 
       if (greenAgeHours >= FRESH_FLOOR_HOURS) {
         // An archived repo legitimately stops scheduling; that is retirement, not breakage.
-        const repoRes = await request.get(`https://api.github.com/repos/${repo}`, {
-          headers: { Authorization: `Bearer ${ghToken}`, Accept: 'application/vnd.github.v3+json' },
-        });
+        const repoRes = await request.get(`https://api.github.com/repos/${repo}`, { headers: ghHeaders });
         if (repoRes.ok()) archived = !!(await repoRes.json()).archived;
 
         const wfRes = await request.get(
           `https://api.github.com/repos/${repo}/contents/.github/workflows/deploy.yml`,
-          { headers: { Authorization: `Bearer ${ghToken}`, Accept: 'application/vnd.github.v3+json' } },
+          { headers: ghHeaders },
         );
         if (wfRes.ok()) {
           const yaml = Buffer.from((await wfRes.json()).content ?? '', 'base64').toString('utf-8');
@@ -175,9 +175,56 @@ for (const repo of TIERED_REPOS) {
         f.verdict === 'RETIRED' || f.verdict === 'UNPROVEN',
         `${repo}: latest scheduled gauntlet is green but ${greenAgeHours.toFixed(1)}h old and its freshness is ${f.verdict} — ${f.reason}. Not treated as an alarm.`,
       );
+
+      // SEE THE ABSENCE TWICE BEFORE ANNOUNCING IT (2026-09-03, the second hole found in this
+      // gate the same day). On run 33723882661 this endpoint answered 200 with a page whose
+      // newest scheduled run was NINETEEN DAYS old, and ChannelMover's nightly had in fact run
+      // 2h earlier; the Playwright retry 2.2s later read the true page. The alarm below asserts
+      // that something is NOT THERE, and the only evidence for that is one list we were handed
+      // once — so unlike every other paging path in this file it could not survive a single bad
+      // read. It now re-asks and requires both reads to name the same newest run and agree.
+      // Costs one extra GitHub call ONLY on the stopped path, which is empty on a healthy fleet.
+      // Rule and full incident: scripts/lib/gauntlet-staleness.mjs.
+      if (STOPPED_VERDICTS.includes(f.verdict)) {
+        let second: { ok: boolean; verdict?: string; newestRunId?: unknown } = { ok: false };
+        const res2 = await request.get(runsUrl, { headers: ghHeaders });
+        if (res2.ok()) {
+          const pick2 = pickJudgeableRun((await res2.json()).workflow_runs ?? []);
+          if (pick2.verdict === 'JUDGE') {
+            const started2 = new Date(pick2.judged.run_started_at ?? pick2.judged.created_at).getTime();
+            // Only the RUN LIST is re-read. archived/cron come from the repo and the workflow
+            // file, which are not what a stale run page gets wrong, so re-fetching them would
+            // add calls and prove nothing.
+            const f2 = scheduleFreshness({
+              ageHours: (Date.now() - started2) / 3_600_000,
+              archived,
+              yamlRead,
+              cronCount,
+              periodHours,
+            });
+            second = { ok: true, verdict: f2.verdict, newestRunId: pick2.judged.id };
+          }
+        }
+        const seenTwice = corroborateStopped({ verdict: f.verdict, newestRunId: latest.id }, second);
+        test.skip(
+          !seenTwice.confirmed,
+          `${repo}: the newest scheduled gauntlet read as ${f.verdict} (${f.reason}) but that was NOT CONFIRMED — ${seenTwice.reason}. Staying quiet; the next hourly run asks again, and a schedule that has really stopped answers the same way every time.`,
+        );
+        expect(
+          f.verdict,
+          `${repo} NIGHTLY GAUNTLET HAS STOPPED RUNNING — ${f.reason}. Its last scheduled run PASSED, which is why nothing has gone red: this check reports on the newest scheduled run, and there has not been a new one. Nothing has tested ${repo} against live staging since ${new Date(startedMs).toISOString()}. Check whether deploy.yml's schedule was removed, the workflow was disabled, or GitHub disabled it for repository inactivity (${latest.html_url}). This was ${seenTwice.reason}.${skippedNote}`,
+        ).toBe('FRESH');
+      }
+
+      // NO VERDICT GETS A FREE PASS. The block above is entered only for the verdicts named in
+      // STOPPED_VERDICTS, so a verdict added to scheduleFreshness later and classified nowhere
+      // would fall straight through to "healthy" — the precise shape of the bug this whole gate
+      // exists to close. FRESH is the only thing allowed past here; RETIRED and UNPROVEN have
+      // already skipped out above. (test/nightly-gauntlet-staleness.test.mjs also asserts the
+      // classification is exhaustive, so this should be unreachable — which is the point.)
       expect(
         f.verdict,
-        `${repo} NIGHTLY GAUNTLET HAS STOPPED RUNNING — ${f.reason}. Its last scheduled run PASSED, which is why nothing has gone red: this check reports on the newest scheduled run, and there has not been a new one. Nothing has tested ${repo} against live staging since ${new Date(startedMs).toISOString()}. Check whether deploy.yml's schedule was removed, the workflow was disabled, or GitHub disabled it for repository inactivity (${latest.html_url}).${skippedNote}`,
+        `${repo}: freshness verdict '${f.verdict}' is not classified as fresh, retired, unproven or stopped, so this check does not know whether it is an alarm. Classify it in scripts/lib/gauntlet-staleness.mjs rather than letting it read as healthy.`,
       ).toBe('FRESH');
     }
 
