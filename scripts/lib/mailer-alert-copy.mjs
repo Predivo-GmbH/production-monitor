@@ -21,13 +21,13 @@
 // mailer; it must page UNKNOWN ("the guard lost its access"), never a customer-facing outage.
 // Crying outage on a credential fault is how a real outage stops being believed.
 
-const UNAUDITED = 'unaudited'
+export const UNAUDITED = 'unaudited'
 
 // The guard was BLIND, not the mailer proven broken: it could not reach the project (a 401/403 on
 // the Management API) or read the source at all (a failed checkout/clone). These are the `what`
 // strings check-mailer-config.mjs emits for that, and they must be classified as UNKNOWN, never as
 // a proven "cannot send email".
-const GUARD_BLIND = new Set([
+export const GUARD_BLIND = new Set([
   'the project could not be read',
   'the mailer source could not be read',
 ])
@@ -45,7 +45,8 @@ const GUARD_BLIND = new Set([
 // that genuinely PROVE a send/transport failure get the "cannot send email" wording. A new finding
 // type - or any config-drift observation - DEFAULTS to the non-customer-facing drift wording below.
 // Add a name here ONLY when it proves an actual failed or blocked send, never to silence a red.
-const PROVEN_SEND_FAILURE = new Set([
+export const PROVEN_SEND_FAILURE = new Set([
+  'no mailer found in the source at all',                           // env declared to send, zero SMTP-reading code exists -> cannot send a single message (check-mailer-config.mjs:395; board 2026-09-03)
   'the mailer is not configured at all',                            // every send throws (arivioo 2026-08-24)
   'part of the mailer configuration is missing',                    // throws, or falls back to a default nobody chose
   'the mail port is not a mail port',                               // PORT hashes to no known mail port

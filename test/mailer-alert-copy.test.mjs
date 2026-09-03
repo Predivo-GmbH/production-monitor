@@ -9,7 +9,9 @@
  * Run: node test/mailer-alert-copy.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
-import { classifyMailerAlert } from '../scripts/lib/mailer-alert-copy.mjs'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { classifyMailerAlert, PROVEN_SEND_FAILURE, GUARD_BLIND, UNAUDITED } from '../scripts/lib/mailer-alert-copy.mjs'
 
 let passed = 0
 let failed = 0
@@ -187,6 +189,55 @@ check('a proven outage still outranks a config-drift finding and names only the 
   assert.ok(!/Distribution-OS/.test(r.subject), 'a config-drift product must not be named as an outage in the subject')
   assert.match(r.title, /config drift/, 'the drift product should still be counted in the headline')
   assert.equal(r.colour, '#dc2626')
+})
+
+// 2026-09-03 board finding, verbatim: check-mailer-config.mjs:395 emits
+// fail(..., 'no mailer found in the source at all', ...) for an environment that is DECLARED to send
+// but has zero SMTP-reading code under <functions> - it cannot send a single message. That exact
+// string was NOT in the PROVEN_SEND_FAILURE allowlist, so it fell through to the drift branch and a
+// total mail outage was mailed as amber "config drift - not a send failure". It is a proven send
+// failure and must read as the red customer-outage lede.
+check('"no mailer found in the source at all" is a proven outage, not config drift', () => {
+  const noMailer = [{
+    product: 'someproduct', env: 'production', what: 'no mailer found in the source at all',
+    detail: 'nothing under supabase/functions reads any SMTP_* variable, yet this environment is declared to send.',
+  }]
+  const r = classifyMailerAlert(noMailer, { fleetProducts: 12 })
+  assert.equal(r.colour, '#dc2626', 'a product with no mail code at all cannot send -> must be red')
+  assert.match(r.subject, /cannot send email/, `subject must read as an outage: ${r.subject}`)
+  assert.match(r.title, /cannot send email/)
+  assert.match(r.subject, /someproduct/)
+  assert.ok(!/config drift/i.test(r.subject), 'a total mail outage must never be worded as config drift')
+  assert.ok(!/NOT a "cannot send email" notice/i.test(r.lede), 'a total mail outage must not carry the drift stand-down lede')
+})
+
+// The two-file contract: the classification in mailer-alert-copy.mjs must stay in step with the
+// fail() strings check-mailer-config.mjs actually emits. This is the miss that produced the bug
+// above - a new fail() string was added to the guard without being classified here, and the safe
+// drift default silently masked a real send failure. This test re-walks every fail() string in the
+// guard on each run and FAILS if one is neither proven, guard-blind, unaudited, nor a KNOWN drift.
+// KNOWN_DRIFT is the explicit set of guard findings that are genuinely NOT send failures; adding a
+// new fail() string forces a deliberate choice here rather than an accidental amber default.
+const KNOWN_DRIFT = new Set([
+  'a mailer namespace nobody declared',                  // check-mailer-config.mjs:264
+  "a SECOND mailer reading another mailer's variables",  // :270
+  'a dormant environment has grown a mailer',            // :383
+  'this is a TEST, nothing is broken',                   // :344 fire drill, never a real outage
+])
+
+check('every fail() string emitted by check-mailer-config.mjs is deliberately classified', () => {
+  const guardSrc = readFileSync(
+    fileURLToPath(new URL('../scripts/check-mailer-config.mjs', import.meta.url)), 'utf8')
+  // fail(<arg1>, <arg2>, '<classification>', ...) - arg1/arg2 never contain a comma, so the 3rd
+  // comma-separated argument is always the single-quoted classification string (escaped quotes ok).
+  const re = /fail\(\s*[^,]+,\s*[^,]+,\s*'((?:[^'\\]|\\.)*)'/g
+  const strings = new Set()
+  for (const m of guardSrc.matchAll(re)) strings.add(m[1].replace(/\\'/g, "'"))
+  assert.ok(strings.size >= 15, `expected to find the guard's fail() strings, found ${strings.size}`)
+  const unclassified = [...strings].filter((s) =>
+    !PROVEN_SEND_FAILURE.has(s) && !GUARD_BLIND.has(s) && s !== UNAUDITED && !KNOWN_DRIFT.has(s))
+  assert.deepEqual(unclassified, [],
+    `these fail() strings are not classified in mailer-alert-copy.mjs (add to PROVEN_SEND_FAILURE if a real send failure, or to KNOWN_DRIFT in this test if genuine drift): ${JSON.stringify(unclassified)}`)
 })
 
 console.log(`\n${passed} passed, ${failed} failed.`)
