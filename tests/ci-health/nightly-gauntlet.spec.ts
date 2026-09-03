@@ -5,6 +5,8 @@ import { scheduleFreshness, corroborateStopped, STOPPED_VERDICTS, FRESH_FLOOR_HO
 import { extractCronSchedules, cronPeriodHours } from '../../scripts/lib/cron-cadence.mjs';
 // @ts-expect-error — see above.
 import { pickJudgeableRun, describeSkipped } from '../../scripts/lib/gauntlet-verdict.mjs';
+// @ts-expect-error — see above.
+import { recoveredSince, failedJobNames } from '../../scripts/lib/gauntlet-recovery.mjs';
 
 /**
  * Nightly-gauntlet health.
@@ -278,6 +280,10 @@ for (const repo of TIERED_REPOS) {
     // A FAILED READ IS SAID OUT LOUD, never smoothed into a plausible sentence. "one or more
     // gates regressed against staging" reads like a finding; it is the absence of one.
     let whatFailed = 'the failing job could not be read from GitHub, so this alert cannot say which gate it was';
+    // The bare job names, kept alongside the human phrasing, so the recovery gate below looks up
+    // exactly the gates this alert is about to name. Empty = we could not read them, which never
+    // clears a page.
+    let failedNames: string[] = [];
     const jobsRes = await request.get(
       `https://api.github.com/repos/${repo}/actions/runs/${latest.id}/jobs?per_page=100`,
       { headers: { Authorization: `Bearer ${ghToken}`, Accept: 'application/vnd.github.v3+json' } },
@@ -285,6 +291,7 @@ for (const repo of TIERED_REPOS) {
     if (jobsRes.ok()) {
       const jobs = (await jobsRes.json()).jobs ?? [];
       const failed = jobs.filter((j: { conclusion: string }) => ['failure', 'timed_out'].includes(j.conclusion));
+      failedNames = failedJobNames(jobs);
       // The failing STEP is what a person needs; "gate-security" alone still sends them looking.
       const named = failed.map((j: { name: string; steps?: Array<{ name: string; conclusion: string }> }) => {
         const step = (j.steps ?? []).find((s) => ['failure', 'timed_out'].includes(s.conclusion));
@@ -297,6 +304,41 @@ for (const repo of TIERED_REPOS) {
         // cancelled matrix) and it is not the same as "we did not look".
         whatFailed = 'the run is red but no individual job reports a failure, so the fault is at the workflow level';
       }
+    }
+
+    // HAS THAT GATE PASSED SINCE? (2026-09-03, monitor run 33731470295.) Everything above decides
+    // "persistently failing" from the judged run's own age and attempt count — a good proxy when
+    // there is nothing newer to look at, and simply wrong when there is. `pick.skipped` holds
+    // scheduled runs NEWER than the judged one that gave no verdict ABOUT THE RUN, and the alert
+    // already prints them in its NOTE clause. A run can fail to conclude and still hold a perfectly
+    // conclusive result for a JOB inside it: BoatBuddy was paged at 08:10Z for `gate-security`
+    // (step "Dependency audit (blocking at high)") on a 27.4h-old run, while in the stepped-over
+    // run 33718969126 at 05:28:31Z that same job and that same step had concluded SUCCESS, on the
+    // commit that patched the advisory. The evidence was in this check's hand and it never looked.
+    // Only a positive job-level `success` suppresses; the rule and its fail-safe directions live in
+    // scripts/lib/gauntlet-recovery.mjs, unit-tested in test/gauntlet-recovery.test.mjs.
+    // COST: these reads happen only on the path that is otherwise about to PAGE and only when a
+    // newer run was stepped over — rare, and bounded by the ≤9 runs pickJudgeableRun can skip.
+    if (pick.skipped.length && failedNames.length) {
+      const newer = [];
+      for (const r of pick.skipped) {
+        // A read that fails contributes `jobs: null` — unread is not empty, and an absence of
+        // evidence must never be counted as evidence of recovery.
+        let jobsOfRun = null;
+        try {
+          const sres = await request.get(
+            `https://api.github.com/repos/${repo}/actions/runs/${r.id}/jobs?per_page=100`,
+            { headers: ghHeaders },
+          );
+          if (sres.ok()) jobsOfRun = (await sres.json()).jobs ?? [];
+        } catch { /* leave null — see above */ }
+        newer.push({ run: r, jobs: jobsOfRun });
+      }
+      const rec = recoveredSince(failedNames, newer);
+      test.skip(
+        rec.recovered,
+        `${repo}: the gate that failed in the judged scheduled gauntlet (${failedNames.join('; ')}) HAS PASSED SINCE — ${rec.reason}. That newer run gave no overall verdict, so it could not clear the run, but it did clear the gate. Not paging on a fixed gate; the next completed nightly reconfirms.`,
+      );
     }
 
     expect(
