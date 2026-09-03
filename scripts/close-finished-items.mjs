@@ -611,6 +611,65 @@ export function boardProjectRef(env = process.env) {
 
 /** Read the open board. Throws on anything that is not a clean read — the caller turns that into
  *  an unknown, because "I could not read the board" must never look like "the board is empty". */
+/**
+ * WHAT THIS RUN DECIDED, WRITTEN DOWN ON THE ROW.
+ *
+ * ══ THE GAP ═════════════════════════════════════════════════════════════════════════════════
+ *
+ * sql/098 added three columns -- `done_when`, `done_checked_at`, `done_check_result` -- and only
+ * the first was ever written by anything. Grepped across this whole repo: ZERO writes of the
+ * other two. So this job evaluated a check, decided pass / not-yet / cannot-tell, printed it to
+ * stdout on a headless laptop, and threw the answer away. Measured after the first real
+ * scheduled run on 2026-09-03: 96 rows have carried a finish-test and `done_checked_at` is null
+ * on every one of them.
+ *
+ * Three things were impossible because of it. Nobody could see WHICH checks had been evaluated
+ * or what they said. A check that fails to be executable every single hour looked identical to a
+ * check nobody had got to. And the work-board requirement's own §9 gate "nothing is fictional"
+ * is defined as the count of rows whose stated check cannot be executed -- it reads
+ * `done_check_result`, so it was pinned at `unknown` for ever, by construction.
+ *
+ * Same shape as the rest of this board's history: a column nothing writes, and a fact that
+ * exists only on a page nobody reads.
+ *
+ * Pure so it can be tested without a board. Returns null for a row this run did not judge --
+ * SKIP means "left for Roger", which is not a verdict about the check.
+ */
+export function evaluationStamp(f, now = () => new Date().toISOString()) {
+  if (!f || typeof f !== 'object') return null
+  const state = f.state
+  if (state !== PASS && state !== FAIL && state !== UNKNOWN) return null
+  return { done_checked_at: now(), done_check_result: state }
+}
+
+/**
+ * Write the stamps. One PATCH per row, failures collected rather than thrown: a board that will
+ * not take the bookkeeping must never stop the closing that already happened.
+ */
+export async function recordEvaluations(results, { env = process.env, fetchImpl = fetch, now = () => new Date().toISOString() } = {}) {
+  const stat = { written: 0, skipped: 0, failed: [] }
+  for (const r of results || []) {
+    const stamp = evaluationStamp(r && r.f, now)
+    if (!stamp || !r.item || !r.item.id) { stat.skipped++; continue }
+    try {
+      const res = await fetchImpl(`${env.SUPABASE_URL}/rest/v1/work_items?id=eq.${r.item.id}`, {
+        method: 'PATCH',
+        headers: {
+          apikey: env.SUPABASE_SERVICE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_KEY}`,
+          'Content-Type': 'application/json', Prefer: 'return=minimal',
+        },
+        body: JSON.stringify(stamp),
+        signal: AbortSignal.timeout(20_000),
+      })
+      if (!res.ok) { stat.failed.push(`${r.item.slug}: HTTP ${res.status}`); continue }
+      stat.written++
+    } catch (e) {
+      stat.failed.push(`${r.item.slug}: ${String(e && e.message).slice(0, 120)}`)
+    }
+  }
+  return stat
+}
+
 export async function readBoard({ env = process.env, fetchImpl = fetch } = {}) {
   const base = env.SUPABASE_URL
   const key = env.SUPABASE_SERVICE_KEY
@@ -960,6 +1019,15 @@ async function main() {
   } else {
     for (const o of outcomes) console.log(`     ${o.outcome.toUpperCase().padEnd(8)} ${o.item}: ${o.why}`)
     if (swept.deferred) console.log(`  CLOSER_MAX=${max} reached: ${swept.deferred} passing item(s) were left for the next run`)
+  }
+
+  // WRITE DOWN WHAT THIS RUN DECIDED. Not in --dry: a dry run must leave no trace, and a
+  // done_checked_at from a run that changed nothing would be a claim the board never earned.
+  // Failures are reported, never thrown: bookkeeping must not undo a close that already happened.
+  if (!dry) {
+    const stamped = await recordEvaluations(swept.results)
+    console.log(`  recorded on the board: ${stamped.written} verdict(s) written` +
+      `${stamped.failed.length ? `, ${stamped.failed.length} FAILED (${stamped.failed.slice(0, 3).join('; ')})` : ''}`)
   }
 
   const v = verdict({

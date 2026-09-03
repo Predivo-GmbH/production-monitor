@@ -56,7 +56,7 @@ import {
   ACTIONABLE_STATUSES, UNTOUCHABLE_STATUSES, KINDS, SKIP,
   parseDoneWhen, evaluateDoneWhen, sweep, selectItems, verdict, receiptFor, offerToBoard,
   sqlIsReadOnly, testPathIsRunnable, sentryStatusIsSettled, isDryRun, closureCap,
-  loadBoardCredentials, boardProjectRef, SENTRY_ISSUE_PATHS, isOwedToRoger, silentRowsInHisLane, selfDocumentingRef,
+  loadBoardCredentials, boardProjectRef, SENTRY_ISSUE_PATHS, isOwedToRoger, silentRowsInHisLane, selfDocumentingRef, evaluationStamp, recordEvaluations,
 } from '../scripts/close-finished-items.mjs'
 import { PASS, FAIL, UNKNOWN, reportedPass, VERDICT_MARKER } from '../scripts/lib/check-verdict.mjs'
 
@@ -884,5 +884,72 @@ t('a test_exits_zero with no path gets nothing', () => {
 t('an unknown kind, and hostile input, never produce a reference', () => {
   for (const dw of [null, undefined, 'prose', 42, [], {}, { kind: 'vibes' }, { kind: '' }]) {
     assert.equal(selfDocumentingRef(dw), null, `${JSON.stringify(dw)} must not produce a reference`)
+  }
+})
+
+
+// ══ WHAT THIS RUN DECIDED, WRITTEN DOWN ═════════════════════════════════════════════════════
+// sql/098 added done_when, done_checked_at and done_check_result; grepped across this repo, only
+// the first was ever written. Measured after the first real scheduled run on 2026-09-03: 96 rows
+// have carried a finish-test and done_checked_at is null on every one. The requirement's §9 gate
+// "nothing is fictional" reads done_check_result, so it was pinned at `unknown` for ever.
+const NOW = () => '2026-09-03T22:00:00Z'
+
+t('a judged check is stamped with its verdict', () => {
+  for (const state of ['pass', 'fail', 'unknown']) {
+    assert.deepEqual(evaluationStamp({ state }, NOW),
+      { done_checked_at: '2026-09-03T22:00:00Z', done_check_result: state })
+  }
+})
+
+t('a row LEFT FOR ROGER is not stamped — skip is not a verdict about the check', () => {
+  assert.equal(evaluationStamp({ state: 'skip' }, NOW), null)
+})
+
+t('hostile input never produces a stamp', () => {
+  for (const v of [null, undefined, 'pass', 42, [], {}, { state: 'vibes' }, { state: '' }]) {
+    assert.equal(evaluationStamp(v, NOW), null, JSON.stringify(v))
+  }
+})
+
+t('every judged row is written, and rows without an id are skipped rather than guessed at', async () => {
+  const calls = []
+  const fetchImpl = async (url, opts) => { calls.push({ url, body: JSON.parse(opts.body) }); return { ok: true, status: 204 } }
+  const stat = await recordEvaluations([
+    { item: { id: 'A', slug: 'a' }, f: { state: 'pass' } },
+    { item: { id: 'B', slug: 'b' }, f: { state: 'unknown' } },
+    { item: { slug: 'no-id' }, f: { state: 'pass' } },
+    { item: { id: 'C', slug: 'c' }, f: { state: 'skip' } },
+  ], { env: { SUPABASE_URL: 'http://x', SUPABASE_SERVICE_KEY: 'k' }, fetchImpl, now: NOW })
+  assert.equal(stat.written, 2)
+  assert.equal(stat.skipped, 2, 'the id-less row and the skipped row')
+  assert.equal(calls.length, 2)
+  assert.equal(calls[0].body.done_check_result, 'pass')
+  assert.equal(calls[1].body.done_check_result, 'unknown')
+})
+
+t('a board that refuses the bookkeeping does NOT undo the closing that already happened', async () => {
+  const fetchImpl = async () => ({ ok: false, status: 500 })
+  const stat = await recordEvaluations([{ item: { id: 'A', slug: 'a' }, f: { state: 'pass' } }],
+    { env: { SUPABASE_URL: 'http://x', SUPABASE_SERVICE_KEY: 'k' }, fetchImpl, now: NOW })
+  assert.equal(stat.written, 0)
+  assert.equal(stat.failed.length, 1, 'reported, never thrown')
+  assert.match(stat.failed[0], /HTTP 500/)
+})
+
+t('a thrown network error is collected too, not propagated', async () => {
+  const fetchImpl = async () => { throw new Error('socket hang up') }
+  const stat = await recordEvaluations([{ item: { id: 'A', slug: 'a' }, f: { state: 'fail' } }],
+    { env: { SUPABASE_URL: 'http://x', SUPABASE_SERVICE_KEY: 'k' }, fetchImpl, now: NOW })
+  assert.equal(stat.failed.length, 1)
+  assert.match(stat.failed[0], /socket hang up/)
+})
+
+t('an empty or missing result set writes nothing and never throws', async () => {
+  const fetchImpl = async () => { throw new Error('should not be called') }
+  for (const rs of [undefined, null, []]) {
+    const stat = await recordEvaluations(rs, { env: {}, fetchImpl, now: NOW })
+    assert.equal(stat.written, 0)
+    assert.equal(stat.failed.length, 0)
   }
 })
