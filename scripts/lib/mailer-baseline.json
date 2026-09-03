@@ -157,9 +157,10 @@
         {
           "env": "staging",
           "ref": "jckctrtkstejolddqzlk",
-          "config": "dormant",
-          "configNote": "deliberately unconfigured - carries only the seven auto-provisioned Supabase variables and nothing sends from it (2026-08-24 sweep). If mailer secrets ever appear here, this line is what must change.",
-          "traffic": "none"
+          "config": "required",
+          "configNote": "Was 'dormant' until 2026-09-03. Its own note said 'if mailer secrets ever appear here, this line is what must change' - and they did, deliberately: this environment could not send login mail at all, which was the fault being repaired. It now carries SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS and SMTP_FROM, matching the pattern already live on SignalScore and ChannelMover staging, where each product's staging shares its production sending mailbox. SMTP_FROM is deliberately DIFFERENT from production ('Distribution-OS STAGING'), so a test send can never be mistaken for a real message to a customer. The guard was right to fail on this: a dormant environment growing a mailer is exactly what it watches for, and the baseline - not the guard - was the thing out of date.",
+          "traffic": "none",
+          "trafficNote": "staging - sends only when a test drives it"
         }
       ]
     },
