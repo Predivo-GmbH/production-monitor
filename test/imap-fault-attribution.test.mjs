@@ -237,11 +237,27 @@ check('a refused password says reset it; anything else says do not', () => {
     new MailboxUnreachableError('x', imapflowLoginRejection()),
     'Valrano',
   )
-  assert.ok(/reset it at the mail provider/.test(refused), 'a refused login does not name the password reset')
-  assert.ok(/IMAP_PASS/.test(refused), 'a refused login does not name the secret to update')
+  assert.ok(/ANSWERED and REFUSED/.test(refused), 'a refused login no longer says the server answered')
+  assert.ok(/IMAP_PASS/.test(refused), 'a refused login does not name the secret that holds the credential')
   assert.ok(
-    !/not a wrong password/.test(refused),
-    'a refused login is being described as "not a wrong password" - the branches are inverted',
+    !/never got as far as a REFUSED login/.test(refused),
+    'a refused login is being described as one we never got - the branches are inverted',
+  )
+
+  // The over-claim this branch used to make. AUTHENTICATIONFAILED is the SAME answer for a
+  // wrong password and for a correct password the provider has stopped honouring, so the
+  // refused branch must not send Roger to reset one as though the cause were settled.
+  assert.ok(
+    /NOT proof the stored password is wrong/i.test(refused),
+    'a refusal is again being reported as proof the password is wrong',
+  )
+  assert.ok(
+    /locked out|suspended|expiry/i.test(refused),
+    'the refused branch names no cause other than a wrong password',
+  )
+  assert.ok(
+    /authenticated recently/i.test(refused),
+    'the refused branch does not name the check that tells the two causes apart',
   )
 
   const unreachable = describeOtpFailure(

@@ -39,6 +39,23 @@
  * the text. It asserted on a shape the library never produces. A fixture built to your own
  * expectation tests the expectation, not the library.
  *
+ * 2026-09-03: the wording for a REFUSED login was itself an over-claim. It read "only the
+ * password is not accepted: reset it at the mail provider", and that sentence is what put two
+ * items on Roger's board asking him to go and reset a password. Measured from the run logs this
+ * turn, the password is not wrong:
+ *     19:46:32Z  run 33674690649  "cleared 0 messages from the shared OTP test inbox"  LOGIN OK
+ *     23:45:07Z  run 33696131476  [AUTHENTICATIONFAILED] Authentication failed.        REFUSED
+ *     IMAP_PASS  last set 2026-07-09 (gh secret list) - untouched between those two lines.
+ * A password that authenticated at 19:46 and was changed by nobody is still the right password
+ * at 20:18. The mailbox is refusing a valid credential - locked out, suspended, or expired by
+ * provider policy - and `AUTHENTICATIONFAILED` is the identical answer in all of those cases.
+ * Resetting the password is the fix for exactly one of them, and doing it for the others costs
+ * Roger a trip to the provider AND leaves IMAP_PASS stale, which breaks the monitor for real.
+ *
+ * The guard did not catch this because it ASSERTED it: case 10 required the refused branch to
+ * contain "reset it at the mail provider". A test written from the same assumption as the code
+ * cannot find the assumption wrong - it only pins it in place.
+ *
  * NEVER surface `err.executedCommand` from here: that is the compiled LOGIN line.
  *
  * Lives in scripts/lib as plain JS, not inside lib/imap.ts, for one reason: it is the
@@ -77,8 +94,11 @@ function firstString(...vals) {
 
 /**
  * Did the mail server ANSWER and refuse us, or did we never get an answer at all?
- * These two lead to opposite actions - reset the password vs. do not touch the password -
- * so they must never share a sentence.
+ * These two lead to opposite actions, so they must never share a sentence.
+ *
+ * What this CANNOT tell you is WHY the credential was refused. `AUTHENTICATIONFAILED` is
+ * the same answer for a wrong password and for a correct password the provider has stopped
+ * honouring - see describeOtpFailure below for why that distinction cost a real ask.
  */
 export function isCredentialRejection(cause) {
   if (!(cause instanceof Error)) return false
@@ -108,8 +128,13 @@ export function describeOtpFailure(err, project) {
   if (err instanceof MailboxUnreachableError) {
     const action = err.credentialsRejected
       ? `The mail server ANSWERED and REFUSED the monitor's login, so the host and the mailbox are ` +
-        `both reachable and only the password is not accepted: reset it at the mail provider, then ` +
-        `put the new value in the repo secret IMAP_PASS.`
+        `both reachable and the credential is the thing in dispute. That is NOT proof the stored ` +
+        `password is wrong: a mailbox that is locked out, suspended, or past a forced expiry answers ` +
+        `exactly this to the password it accepted an hour earlier. Check that first - if this same ` +
+        `secret authenticated recently and nobody has changed IMAP_PASS since, the password is ` +
+        `correct and the mailbox is refusing it, so ask the mail provider WHY before resetting ` +
+        `anything. Only if the credential itself is dead does the fix end in a new password at the ` +
+        `provider and the new value in the repo secret IMAP_PASS.`
       : `The monitor never got as far as a REFUSED login, so this is not a wrong password and ` +
         `resetting one will not clear it: check IMAP_HOST / IMAP_PORT, whether the mail host is ` +
         `reachable and answering, and whether the mailbox is throttled, full or locked.`
