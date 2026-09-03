@@ -41,6 +41,17 @@ import { tmpdir } from 'node:os'
 import { dirname, join, parse, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+// THE FILESYSTEM ROOT OF WHATEVER MACHINE IS RUNNING THIS (added 2026-09-03).
+// 'C:/' on Windows, '/' on Linux. Every absolute fixture path below is built from it.
+// It used to be a hardcoded Windows path throughout, which meant the whole
+// suite could only ever pass on one developer's desktop: on the Linux runner 'C:/Business/...'
+// is not an absolute path at all, so any containment check against it fails. Master was red on
+// EVERY run from 09:10Z on 2026-09-03 for exactly this, and fixing only the first failing case
+// simply revealed the next one - the suite stops at the first failure, so they hide behind
+// each other. This closes the class rather than the instance.
+const ROOT = parse(resolve('.')).root.replace(/\\/g, '/')
+const PROJECTS = `${ROOT}Business/Internal Projects`
+
 import {
   ACTIONABLE_STATUSES, UNTOUCHABLE_STATUSES, KINDS, SKIP,
   parseDoneWhen, evaluateDoneWhen, sweep, selectItems, verdict, receiptFor, offerToBoard,
@@ -66,7 +77,7 @@ const ta = (name, fn) => {
 
 const item = (o = {}) => ({
   id: 'aaaaaaaa-0000-0000-0000-000000000001', slug: 'a-real-item', title: 'A real item',
-  status: 'next', documentation_ref: 'C:/Business/Internal Projects/production-monitor/package.json',
+  status: 'next', documentation_ref: `${PROJECTS}/production-monitor/package.json`,
   done_when: null, opened_at: '2026-08-01T00:00:00Z', started_at: null, claim_paths: [], ...o,
 })
 
@@ -75,7 +86,7 @@ const DW = {
   sentry: { kind: 'sentry_resolved', args: { issue_id: '141893005' } },
   query: { kind: 'query_returns_no_rows', args: { sql: 'select id from work_items where status = \'stuck\'', project_ref: 'xoecpzfsskalvjrtcbbl' } },
   url: { kind: 'url_answers', args: { url: 'https://cockpit.predivo.ch/signals', status: 200 } },
-  test: { kind: 'test_exits_zero', args: { path: 'C:/Business/Internal Projects/production-monitor/test/close-finished-items.test.mjs' } },
+  test: { kind: 'test_exits_zero', args: { path: `${PROJECTS}/production-monitor/test/close-finished-items.test.mjs` } },
   deploy: { kind: 'deploy_newer_than', args: { project_ref: 'xoecpzfsskalvjrtcbbl', function_slug: 'signal-intake', iso: '2026-08-01T00:00:00Z' } },
   metric: { kind: 'metric_below', args: { name: 'open_items', threshold: 100, days: 7 } },
   human: { kind: 'human', args: { question: 'Should we keep the Smartlead plan?' } },
@@ -89,7 +100,7 @@ const healthy = () => ({
   proveNetworkPath: async () => ({ ok: true }),
   probeUrl: async () => ({ status: 200 }),
   exists: () => true,
-  testRoots: ['C:/Business/Internal Projects'],
+  testRoots: [`${PROJECTS}`],
   runTest: async () => ({ code: 0 }),
   deployedAt: async () => ({ updated_at: '2026-09-01T10:00:00.000Z' }),
 })
@@ -110,7 +121,7 @@ const FAULTS = {
       runQuery: async () => boom(),
       proveNetworkPath: async () => ({ ok: true }),
       probeUrl: async () => ({ status: null, error: 'connect ECONNREFUSED' }),
-      exists: () => true, testRoots: ['C:/Business/Internal Projects'],
+      exists: () => true, testRoots: [`${PROJECTS}`],
       runTest: async () => ({ code: null, error: 'spawn ENOENT' }),
       deployedAt: async () => ({ updated_at: null, error: 'connect ECONNREFUSED' }),
     }
@@ -121,7 +132,7 @@ const FAULTS = {
     runQuery: async () => ({ status: 401, rows: null }),
     proveNetworkPath: async () => ({ ok: true }),
     probeUrl: async () => ({ status: 401 }),
-    exists: () => true, testRoots: ['C:/Business/Internal Projects'],
+    exists: () => true, testRoots: [`${PROJECTS}`],
     runTest: async () => ({ code: null, error: 'EACCES' }),
     deployedAt: async () => ({ updated_at: null, error: 'functions/signal-intake -> HTTP 401' }),
   }),
@@ -131,7 +142,7 @@ const FAULTS = {
     runQuery: async () => ({ status: 500, rows: null }),
     proveNetworkPath: async () => ({ ok: true }),
     probeUrl: async () => ({ status: 500 }),
-    exists: () => true, testRoots: ['C:/Business/Internal Projects'],
+    exists: () => true, testRoots: [`${PROJECTS}`],
     runTest: async () => ({ code: null, error: 'the test process was killed or timed out' }),
     deployedAt: async () => ({ updated_at: null, error: 'functions/signal-intake -> HTTP 500' }),
   }),
@@ -143,7 +154,7 @@ const FAULTS = {
     runQuery: async () => ({ status: 200, rows: [] }),
     proveNetworkPath: async () => ({ ok: false, reason: 'a hostname that cannot exist answered HTTP 200' }),
     probeUrl: async () => ({ status: 200 }),
-    exists: () => true, testRoots: ['C:/Business/Internal Projects'],
+    exists: () => true, testRoots: [`${PROJECTS}`],
     runTest: async () => ({ code: null, error: 'no exit code' }),
     deployedAt: async () => ({ updated_at: null, error: 'functions/signal-intake answered HTTP 200 with no updated_at' }),
   }),
@@ -154,7 +165,7 @@ const FAULTS = {
     runQuery: async () => ({ status: 200, rows: { count: 0 } }),                // an object, not an array
     proveNetworkPath: async () => ({ ok: true }),
     probeUrl: async () => ({ statusCode: 200 }),                                // renamed field
-    exists: () => true, testRoots: ['C:/Business/Internal Projects'],
+    exists: () => true, testRoots: [`${PROJECTS}`],
     runTest: async () => ({ exit: 0 }),                                         // no `code`
     deployedAt: async () => ({ updated_at: 'yesterday afternoon' }),             // unparseable
   }),
@@ -467,7 +478,7 @@ ta('a finish-test carrying a writing query is UNKNOWN — a refused test has not
 t('testPathIsRunnable refuses anything that is not an allow-listed test file', () => {
   // path.parse().root is 'C:\\' on Windows and '/' on POSIX; posix-style separators are used
   // throughout so the strings read the same on both and match how callers write them.
-  const base = parse(resolve('.')).root.replace(/\\/g, '/')   // 'C:/' on Windows, '/' on POSIX
+  const base = ROOT
   const roots = [`${base}Business/Internal Projects`]
   const inside = `${base}Business/Internal Projects/production-monitor/test/x.test.mjs`
   const exists = () => true
@@ -493,7 +504,7 @@ t('testPathIsRunnable refuses anything that is not an allow-listed test file', (
 ta('a test_exits_zero pointing outside the allow-listed roots is UNKNOWN and never executed', async () => {
   let ran = 0
   const deps = { ...healthy(), runTest: async () => { ran++; return { code: 0 } } }
-  const f = await evaluateDoneWhen({ kind: 'test_exits_zero', args: { path: 'C:/Windows/System32/calc.exe' } }, deps)
+  const f = await evaluateDoneWhen({ kind: 'test_exits_zero', args: { path: `${ROOT}somewhere/else/entirely/calc.exe` } }, deps)
   assert.equal(f.state, UNKNOWN)
   assert.equal(ran, 0, 'a refused path must never reach the spawner at all')
 })
