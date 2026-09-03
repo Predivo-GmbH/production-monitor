@@ -73,6 +73,38 @@ export const ROLLUP_KEY = 'many-deploys-red'
  */
 export const ROLLUP_THRESHOLD = 3
 
+/**
+ * How long a STAGING pipeline may stay red before it becomes a human's problem.
+ *
+ * WHY THIS EXISTS (2026-09-03). Roger, after coming back to the Deploy Status page for the fifth
+ * time in two days: *"I will need to know from your side that the issues will not appear again, or
+ * at least you will see it and try to fix it yourself."*
+ *
+ * He found ChannelMover red himself. This watcher HAD seen it - it filed the row at 13:43 and
+ * printed "not paging (not-eligible)" - because `needs_human` was `production`, full stop. A
+ * staging pipeline could therefore stay red FOREVER without telling anyone, at any age, and the
+ * only thing standing between that and a week of rot was Roger opening a page.
+ *
+ * The original reasoning was sound as far as it went: production is untouched, customers are fine,
+ * and paging on every staging blip is how an alarm gets ignored. What it missed is that a staging
+ * pipeline stuck red means THE PRODUCT CANNOT SHIP AT ALL - the exact question the 2026-09-01
+ * lesson said nothing was asking. On that day it also masked a live customer bug: the gate had
+ * been printing "the CSP shipped beside it only allows ..." for hours, and every support request
+ * on channelmover.com was being refused by the browser.
+ *
+ * Three hours, because a deploy cycle here is 15-25 minutes and the monitor runs hourly at :37. An
+ * agent actively fixing a red build pushes again well inside that, so this cannot cry wolf at
+ * somebody mid-repair; past three hours nobody is on it.
+ */
+export const STAGING_STUCK_HOURS = Number(process.env.DEPLOY_STAGING_STUCK_HOURS || 3)
+
+/** Hours a run has been red, or null when the timestamp is unreadable. */
+export function redForHours(run, now = new Date()) {
+  const t = Date.parse(String(run?.created_at ?? ''))
+  if (!Number.isFinite(t)) return null
+  return (now.getTime() - t) / 3_600_000
+}
+
 /** How many runs to read per repo. Enough to find the newest completed run of each deploy file. */
 const RUNS_PER_REPO = 40
 
@@ -306,7 +338,7 @@ export function isAlarm(classification) {
 }
 
 /** What ONE red pipeline says on the cockpit. */
-export function signalFor({ product, run, classification }) {
+export function signalFor({ product, run, classification, now = new Date() }) {
   // The nightly scheduled run of a deploy file gets its OWN row, never the production one. It runs
   // the gates and skips the deploy, so it says nothing about production and must not page as if it
   // did - and, just as important, the row it files is one its own lane can clear on the next green
@@ -314,20 +346,31 @@ export function signalFor({ product, run, classification }) {
   const nightly = runLane(run) === 'scheduled'
   const production = !nightly && isProductionFailure(run, classification)
   const broken = classification.kind === 'workflow-file'
+
+  // A STAGING PIPELINE STUCK RED MEANS THE PRODUCT CANNOT SHIP, and that is a human's problem even
+  // though production is untouched. See STAGING_STUCK_HOURS. An UNREADABLE age counts as stuck:
+  // the quiet path is how a thing sits forever, so a timestamp we cannot parse must escalate
+  // rather than silently qualify as "fresh".
+  const age = redForHours(run, now)
+  const stuck = !production && !nightly && (age === null || age >= STAGING_STUCK_HOURS)
+  const stuckFor = age === null ? 'an unknown length of time' : `${age.toFixed(1)}h`
+
   const title = broken
     ? `${product}: the deploy file is broken, nothing can ship`
     : nightly
       ? `${product}: the nightly check of the deploy pipeline is failing`
       : production
         ? `${product}: the production deploy is failing`
-        : `${product}: the staging deploy is failing`
+        : stuck
+          ? `${product}: cannot ship at all - staging has been red for ${stuckFor}`
+          : `${product}: the staging deploy is failing`
   return {
     source: SOURCE,
     key: deployKey(product, run.path, production, nightly ? 'scheduled' : undefined),
     kind: 'incident',
-    severity: production ? 'critical' : 'warning',
+    severity: production ? 'critical' : stuck ? 'critical' : 'warning',
     state: 'open',
-    needs_human: production,
+    needs_human: production || stuck,
     title,
     summary: `Red since ${String(run.created_at).slice(0, 16).replace('T', ' ')} UTC and still red: ${classification.why}`,
     detail: {
@@ -352,8 +395,10 @@ export function signalFor({ product, run, classification }) {
  * Only PRODUCTION failures count toward the threshold. Staging rows never page on their own, so
  * counting them would roll up a set that was never going to ring and hide the one row that was.
  */
-export function planSignals(failures) {
-  const bodies = failures.map(signalFor)
+export function planSignals(failures, now = new Date()) {
+  // `now` is threaded through so the stuck-staging escalation is testable at a fixed clock rather
+  // than depending on when the suite happens to run - the same reason signalFor takes it.
+  const bodies = failures.map((f) => signalFor({ ...f, now: f.now ?? now }))
   const pageable = bodies.filter((b) => b.needs_human)
   if (pageable.length < ROLLUP_THRESHOLD) return { rollup: null, members: bodies }
 
