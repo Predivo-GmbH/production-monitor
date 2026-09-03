@@ -592,6 +592,29 @@ jobs:
       # red about it, because a dashboard is PULL. Diverged reds at any age; merely waiting reds
       # after 24h. Compares the DEPLOYED commits, never the branch heads: on Distribution-OS those
       # two questions give +9/+17 and +9/+8, and mixing them invents a bug that is not there.
+      # AND THEN ACTUALLY SHIP IT, for the internal tools only. The step above only SAYS a product
+      # has been waiting; saying it is what the Deploy Status page already did all day on 2026-09-03
+      # while rows read "Promoting it is mine, not yours" and nothing promoted them. Roger, asked
+      # what to do about it: "Yes - auto-promote internal."
+      #
+      # BackOffice, Cockpit and Distribution-OS ONLY. A customer-facing product is his word every
+      # time, and scripts/lib/auto-promote.mjs refuses anything not on that allowlist - it is an
+      # allowlist precisely so a new product lands on the safe side with nobody remembering to
+      # edit it. At most ONE promotion per run, never while another fleet deploy is in flight
+      # (three at once got our own address refused by the shared host for 45 minutes that morning),
+      # never on a diverged product, and only when deploy-staging AND e2e-staging both concluded
+      # success on the exact commit being shipped. Every unknown is a refusal.
+      #
+      # if: success() on purpose, NOT always(): this is the one step here that CHANGES production,
+      # so it must not run on the back of a monitor run whose earlier sensors were themselves red.
+      - name: Ship the internal tools that are green and waiting
+        if: success()
+        run: node scripts/promote-internal.mjs
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_DISPATCH_TOKEN || secrets.DASHBOARD_PAT }}
+          # Set PROMOTE_INTERNAL_OFF=1 as a repo variable to stop this without editing the file.
+          PROMOTE_INTERNAL_OFF: ${{ vars.PROMOTE_INTERNAL_OFF }}
+
       - name: A product that CAN ship and has not must say so
         if: always()  # independent sensor — files its finding to the board and exits 0, like every sibling; only a failed read (unreadable repo / API error / nothing read) reds the job, so a chronic backlog cannot double-red one event or re-mail hourly.
         run: node scripts/check-promotion-backlog.mjs
