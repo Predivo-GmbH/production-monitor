@@ -5,7 +5,7 @@
  * Run: node test/board-drainer.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
-import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, stuckRootCause, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, workableFinding, parkedFields, gateFor, stripCode, actionOf, plainTitle, titleObjections, workItemSlugFor, handoffPrompt, routeToWorkBoard, prose, DEPLOY_DENY_TOOLS, agentToolFlags, signalObjects, signalPhrases, matchItem, findJoinTarget, joinMarker, expectedBusinessApplies, handedOverClearsCounter, parkedHandoverQueue, mintOpenedAt } from '../scripts/board-drainer.mjs'
+import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, stuckRootCause, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, workableFinding, parkedFields, gateFor, stripCode, actionOf, plainTitle, titleObjections, workItemSlugFor, handoffPrompt, routeToWorkBoard, prose, DEPLOY_DENY_TOOLS, agentToolFlags, signalObjects, signalPhrases, matchItem, findJoinTarget, joinMarker, expectedBusinessApplies, handedOverClearsCounter, parkedHandoverQueue, mintOpenedAt, weightFromSeverity} from '../scripts/board-drainer.mjs'
 
 let n = 0
 const t = (name, fn) => { fn(); n++; console.log(`  ok - ${name}`) }
@@ -1580,3 +1580,39 @@ await Promise.all(pending)
 
 console.log(`
 ${n} assertions passed.`)
+
+
+// ── A PRODUCER THAT ALREADY GRADED SOMETHING MUST NOT FILE IT AS "NOBODY LOOKED" ──────────────
+// Measured on the live board 2026-09-03: 54 monitor rows sat at `unjudged`, and 45 of them were
+// minted by this drainer, which had inc.severity in its hand the whole time. Identical mapping to
+// Cockpit's weightFromSeverity (commit 7103a77) because both write to the SAME board — one fault
+// filed by two producers must not sort two different ways.
+t('a graded severity becomes the matching weight', () => {
+  assert.equal(weightFromSeverity('critical'), 'critical')
+  assert.equal(weightFromSeverity('warning'), 'normal')
+  assert.equal(weightFromSeverity('info'), 'low')
+})
+
+t('warning is deliberately NOT high — it is the bulk of all signals', () => {
+  assert.notEqual(weightFromSeverity('warning'), 'high')
+  assert.notEqual(weightFromSeverity('warning'), 'critical')
+})
+
+t('casing and padding cannot change a grade', () => {
+  assert.equal(weightFromSeverity(' CRITICAL '), 'critical')
+  assert.equal(weightFromSeverity('Info'), 'low')
+})
+
+t('an unrecognised or missing severity stays honestly ungraded', () => {
+  for (const v of ['blocker', 'p1', 'sev1', '', null, undefined, 0, {}]) {
+    assert.equal(weightFromSeverity(v), null, JSON.stringify(v) + ' must not be graded')
+  }
+})
+
+t('it matches the twin in Cockpit exactly — one board, one grading', () => {
+  // If these ever diverge, the same fault filed by the two producers sorts two ways.
+  const cockpit = (sev) => ({ critical: 'critical', warning: 'normal', info: 'low' })[String(sev || '').trim().toLowerCase()] || null
+  for (const v of ['critical', 'warning', 'info', 'WARNING', ' info ', 'nonsense', null]) {
+    assert.equal(weightFromSeverity(v), cockpit(v), 'divergence on ' + JSON.stringify(v))
+  }
+})

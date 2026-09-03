@@ -133,6 +133,28 @@ export function pageFieldsOnSupersede(row) {
   return { page_due_at: null, page_suppressed_reason: 'routed-to-work-board', kept: false }
 }
 
+/**
+ * The weight a row should carry, from the severity its producer already decided.
+ *
+ * TWIN OF Cockpit `weightFromSeverity` in scripts/sync-work-board.mjs (commit 7103a77). The two
+ * producers write to the SAME board and must grade identically, or one fault filed by two paths
+ * sorts two ways. Kept as a copy rather than a shared import because these are separate
+ * repositories with no shared package; if that ever changes, delete one.
+ *
+ * PROPAGATION, NOT INFERENCE: nothing here reads a title or a summary. Cockpit sql/072 bans
+ * deriving weight from text and that ban stands. Conservative on purpose -- `warning` is the bulk
+ * of all signals, and sending those to `high` would make most of the board high.
+ *   critical -> critical | warning -> normal | info -> low | anything else -> null (stay unjudged)
+ */
+export function weightFromSeverity(severity) {
+  switch (String(severity || '').trim().toLowerCase()) {
+    case 'critical': return 'critical'
+    case 'warning': return 'normal'
+    case 'info': return 'low'
+    default: return null
+  }
+}
+
 /** True when an incident is at or above the configured severity threshold.
  *  An UNKNOWN/absent severity is treated as ABOVE the bar, never below: a row we cannot
  *  grade is a row we must not silently skip. */
@@ -1607,6 +1629,12 @@ export async function routeToWorkBoard(inc, cls, deps) {
       // owner_session/claimed_at, and sql/061 only strips the owner columns on 'next' rows.
       source: 'monitor',
       opened_by: 'board-drainer',
+      // A ROW THIS PRODUCER ALREADY GRADED MUST NOT ARRIVE SAYING "NOBODY LOOKED AT THIS YET".
+      // Measured on the live board 2026-09-03: 45 of the 54 monitor rows still sitting at
+      // `unjudged` were minted right here, by a drainer holding `inc.severity` the whole time.
+      // Omitted entirely when the severity is unrecognised, so the column default stands honestly
+      // rather than a guess being written.
+      ...(weightFromSeverity(inc?.severity) ? { priority: weightFromSeverity(inc.severity) } : {}),
       ...laneFields,
     })
     itemId = item?.id ?? null
