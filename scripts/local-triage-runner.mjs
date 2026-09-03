@@ -28,6 +28,7 @@ import { join } from 'path'
 import { pingUrl } from './lib/hc-ping.mjs'
 import { agentToolFlags, DEPLOY_DENY_POLICY_NOTE } from './lib/deploy-deny-tools.mjs'
 import { triageRunVerdict, guardVerdictProof } from './lib/triage-run-verdict.mjs'
+import { isNonTestStepFailure } from './lib/parse-failures.mjs'
 
 const REPO = process.env.LOCAL_TRIAGE_REPO || 'Arivioo/production-monitor'
 const BRANCH = 'master'
@@ -130,6 +131,32 @@ function triageMonitor(state) {
   try {
     sh(`gh run download ${run.databaseId} --repo ${REPO} -n test-results -D "${WORKDIR}"`, { timeout: 120_000 })
   } catch (e) { log(`artifact download failed (agent will investigate via gh instead): ${e.message.split('\n')[0]}`) }
+
+  // 4b. If the run failed at a NON-TEST step, nothing in this spec-triage tier's scope failed.
+  //     A monitor run can go red on the out-of-band canaries (a dead/rotated key, a vendor 5xx), a
+  //     machine-health probe or an expire-sessions sweep — none of which produce a failing
+  //     Playwright spec, and each carries its OWN named alert (send-alert's deriveFailures/
+  //     canaryRows, the 2026-08-29 canary fix). agent-triage would find nothing to triage and exit
+  //     without a verdict, and the runner would then record a MISSING attempt and ping THIS
+  //     dead-man red — a false red, because the runner is healthy. Detect it with the SAME
+  //     laundered-aware parser the alert uses, and ONLY when results.json is positively readable;
+  //     an absent/unreadable report stays conservative (fall through, run the agent, a missing
+  //     verdict reds the check as before). Live: 2026-09-03 13:13Z/14:13Z, two canary failures each
+  //     flapped agenttriage-localrunner red for one tick. Record handled (dedup) and record NO
+  //     attempt, so the verdict stays idle/green.
+  let resultsRaw = null
+  try {
+    const rp = join(WORKDIR, 'test-results', 'results.json')
+    resultsRaw = existsSync(rp) ? readFileSync(rp, 'utf-8') : null
+  } catch { resultsRaw = null }
+  if (isNonTestStepFailure(resultsRaw)) {
+    log(`monitor run #${run.databaseId} failed at a non-test step (results.json shows no failing spec) — its own alert owns it; nothing in the local triage tier's scope, so this is not a runner failure`)
+    state.lastHandledRun = run.databaseId
+    state.lastHandledAt = new Date().toISOString()
+    saveState(state)
+    log(`done with run #${run.databaseId}`)
+    return
+  }
 
   // 5. run the agent LOCALLY on the subscription — force subscription auth by dropping any API key
   const env = { ...process.env, AGENT_TRIAGE_ENABLED: '1', AGENT_TRIAGE_LOCAL: '1' }

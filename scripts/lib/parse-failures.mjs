@@ -157,6 +157,35 @@ export function failedStepRows(jobs = []) {
   return rows
 }
 
+/**
+ * The monitor run FAILED, and the local spec-triage runner (local-triage-runner.mjs) is deciding
+ * whether that failure is in ITS scope. It is NOT — and the runner must ping GREEN — when the run
+ * failed at a NON-TEST step: the out-of-band canaries (a dead/rotated key, a vendor 5xx), a
+ * machine-health probe, an expire-sessions sweep. None of those produce a failing Playwright spec,
+ * and each carries its OWN named alert (deriveFailures/canaryRows, send-alert.mjs). Reddening the
+ * agenttriage-localrunner dead-man for them is a FALSE red: the runner is healthy, nothing in its
+ * spec-triage scope failed. (Observed live 2026-09-03 13:13Z/14:13Z: two consecutive canary
+ * failures each flapped that dead-man red for one tick, because agent-triage found nothing to
+ * triage and the runner then recorded a MISSING attempt.)
+ *
+ * Return TRUE (out of scope → green) ONLY when results.json is positively readable AND shows zero
+ * unrecovered spec failures. Return FALSE (conservative → the run may go red) when the report is
+ * absent or unreadable — then we cannot PROVE no spec failed, so we must not colour the check
+ * green. Uses the laundered-aware extractFailures so a failed-then-skipped spec (isUnrecovered but
+ * not `unexpected`) is never mistaken for a clean report — the exact false-green this fleet guards.
+ *
+ * @param {string|null|undefined} resultsRaw  text of test-results/results.json, or null if absent
+ * @returns {boolean} true = non-test-step failure, out of this tier's scope; false = conservative
+ */
+export function isNonTestStepFailure(resultsRaw) {
+  if (resultsRaw == null) return false
+  let parsed
+  try { parsed = JSON.parse(resultsRaw) } catch { return false }
+  if (!Array.isArray(parsed.suites)) return false
+  const failing = parsed.suites.flatMap((s) => extractFailures(s, null))
+  return failing.length === 0
+}
+
 /** Normalise a canary-results.json failure record into an alert row. */
 export function canaryRows(canaryFailures = []) {
   return (canaryFailures ?? []).map((c) => ({

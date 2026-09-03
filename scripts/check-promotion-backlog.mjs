@@ -64,12 +64,17 @@ async function main() {
     'User-Agent': 'promotion-backlog',
   }
   let apiErrors = 0
+  // WHY the last failed call failed, in the same idiom check-deploy-failures.mjs uses
+  // (`GET <path> -> HTTP <status>`). Throwing this away is the 2026-09-03 20:10Z defect: see
+  // describeUnreadable() below. Kept as the LAST reason rather than a list because the causes
+  // that blind this sweep are fleet-wide (an empty allowance, a dead token), not per-repo.
+  let lastApiError = null
   async function gh(path) {
     try {
       const r = await fetch(`https://api.github.com${path}`, { headers: H })
-      if (!r.ok) { apiErrors++; return null }
+      if (!r.ok) { apiErrors++; lastApiError = `GET ${path} -> HTTP ${r.status}`; return null }
       return await r.json()
-    } catch { apiErrors++; return null }
+    } catch (e) { apiErrors++; lastApiError = `GET ${path} -> ${e.message}`; return null }
   }
 
   /** The head sha of the most recent run whose named job actually SUCCEEDED. Never the run colour. */
@@ -89,13 +94,27 @@ async function main() {
   const unreadable = []
 
   for (const repo of FLEET) {
+    // Only an error raised while reading THIS product may be offered as this product's cause.
+    const errorsBefore = apiErrors
     const prod = await lastDeployedSha(repo, /deploy/i, 'deploy')
     const staging = await lastDeployedSha(repo, /deploy/i, 'deploy-staging')
-    if (!prod || !staging) { unreadable.push(`${repo} (prod=${prod ? 'ok' : 'unknown'}, staging=${staging ? 'ok' : 'unknown'})`); continue }
+    if (!prod || !staging) {
+      unreadable.push(describeUnreadable({
+        repo, prod: !!prod, staging: !!staging, cause: apiErrors > errorsBefore ? lastApiError : null,
+      }))
+      continue
+    }
     if (prod === staging) { results.push({ ...classifyBacklog({ name: repo, status: 'identical', aheadBy: 0, oldestUnshippedAt: null }, { maxAgeH: MAX_AGE_H }), repo }); continue }
 
+    const cmpErrorsBefore = apiErrors
     const cmp = await gh(`/repos/${OWNER}/${repo}/compare/${prod}...${staging}`)
-    if (!cmp) { unreadable.push(`${repo} (compare failed)`); continue }
+    if (!cmp) {
+      unreadable.push(describeUnreadable({
+        repo, prod: true, staging: true, comparing: true,
+        cause: apiErrors > cmpErrorsBefore ? lastApiError : null,
+      }))
+      continue
+    }
 
     // The OLDEST commit still waiting, which is what "how long has this sat" means.
     const oldest = (cmp.commits || [])[0]?.commit?.committer?.date || null
@@ -160,6 +179,33 @@ async function main() {
 }
 
 // ── pure helpers (importable for tests) ───────────────────────────────────────
+
+/**
+ * WHY one product's shipping state could not be read — the cause, not just the fact.
+ *
+ * THE DEFECT THIS FIXES (2026-09-03 20:10Z, monitor run 33800656551). The shared GitHub REST
+ * allowance was empty (0/5000, reset 20:29:21Z). This sweep printed eight identical annotations,
+ * `could not read shipping state for <product> (prod=unknown, staging=unknown)`, and named no
+ * cause — the `gh()` closure knew the status and dropped it on the floor. Eight products reported
+ * unreadable, one per line, reads exactly like eight broken deploy pipelines. The sibling sensor
+ * `check-deploy-failures.mjs` failed 0.5s later on the SAME token and said, in one line,
+ * `deploy-watch could not tell red from green: GET /repos/... -> HTTP 403`. That line is what made
+ * the hour diagnosable; these eight contributed nothing. monitor.yml already carries this exact
+ * lesson on its IMAP step — "the step that knew the real cause was the one nobody could see".
+ *
+ * ABSENCE OF A CAUSE IS ITSELF INFORMATION, so it gets its own sentence rather than a blank: if no
+ * API call failed while reading this product, the API answered and there genuinely was no
+ * successful deploy job of that name to find. That is a different problem with a different fix,
+ * and the old message could not tell the two apart. Pure.
+ */
+export function describeUnreadable({ repo, prod, staging, cause, comparing = false }) {
+  const what = comparing
+    ? `${repo} (compare failed)`
+    : `${repo} (prod=${prod ? 'ok' : 'unknown'}, staging=${staging ? 'ok' : 'unknown'})`
+  return cause
+    ? `${what} - ${cause}`
+    : `${what} - the GitHub API answered; no successful deploy job of that name was found`
+}
 
 /** The board signal for one product that is behind or split. Pure. */
 export function signalFor(r) {

@@ -8,7 +8,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { classifyBacklog, rank, DEFAULT_MAX_AGE_H } from '../scripts/lib/promotion-backlog.mjs'
-import { signalFor, exitCode, SOURCE } from '../scripts/check-promotion-backlog.mjs'
+import { signalFor, exitCode, SOURCE, describeUnreadable } from '../scripts/check-promotion-backlog.mjs'
 
 const NOW = new Date('2026-09-03T12:00:00Z')
 const hoursAgo = (h) => new Date(NOW.getTime() - h * 3_600_000).toISOString()
@@ -125,4 +125,51 @@ test('the filed signal never pages Roger - it lands on /signals for Claude to pr
   const stale = signalFor({ repo: 'backoffice', level: 'stale', ageH: 30, reason: 'B: waited' })
   assert.equal(stale.needs_human, false)
   assert.match(stale.title, /waiting too long/)
+})
+
+// ── "I could not look" must name WHY it could not look ────────────────────────
+// Regression for monitor run 33800656551 (2026-09-03 20:10Z). The shared GitHub REST allowance was
+// empty (0/5000, reset 20:29:21Z). This sweep emitted eight annotations reading
+// `could not read shipping state for <product> (prod=unknown, staging=unknown)` and named no cause,
+// so the run summary looked like eight broken deploy pipelines. The real fact was one refused
+// allowance that healed itself 19 minutes later.
+
+test('THE 20:10Z RED: a refused API call is named with its status, not laundered into "unknown"', () => {
+  const line = describeUnreadable({
+    repo: 'ChannelMover',
+    prod: false,
+    staging: false,
+    cause: 'GET /repos/Predivo-GmbH/ChannelMover/actions/runs?per_page=30 -> HTTP 403',
+  })
+  assert.match(line, /HTTP 403/, 'the status is the whole diagnosis - it must survive to the log')
+  assert.match(line, /ChannelMover/)
+  // The old line said only this much, and that was the defect.
+  assert.notEqual(line, 'ChannelMover (prod=unknown, staging=unknown)')
+})
+
+test('a blind read and an empty read are DIFFERENT problems and must not print the same sentence', () => {
+  const refused = describeUnreadable({ repo: 'Valrano', prod: false, staging: false, cause: 'GET /x -> HTTP 403' })
+  const answered = describeUnreadable({ repo: 'Valrano', prod: false, staging: false, cause: null })
+  assert.notEqual(refused, answered, 'one needs waiting out, the other needs a workflow fixed')
+  assert.match(answered, /the GitHub API answered/, 'silence about the cause sent the reader hunting an outage')
+  assert.match(answered, /no successful deploy job/)
+  assert.doesNotMatch(answered, /HTTP/, 'must not imply an API failure that did not happen')
+})
+
+test('the half-read case still reports WHICH half was read, so the cause is not over-claimed', () => {
+  const line = describeUnreadable({ repo: 'ReplyFlow', prod: true, staging: false, cause: 'GET /y -> HTTP 403' })
+  assert.match(line, /prod=ok/)
+  assert.match(line, /staging=unknown/)
+  assert.match(line, /HTTP 403/)
+})
+
+test('a failed compare carries its cause too - it was the one unreadable path with no detail at all', () => {
+  const line = describeUnreadable({ repo: 'BoatBuddy', prod: true, staging: true, comparing: true, cause: 'GET /compare -> HTTP 502' })
+  assert.match(line, /compare failed/)
+  assert.match(line, /HTTP 502/)
+})
+
+test('a network error, not just an HTTP status, reaches the log', () => {
+  const line = describeUnreadable({ repo: 'signalscore', prod: false, staging: false, cause: 'GET /z -> fetch failed' })
+  assert.match(line, /fetch failed/)
 })
