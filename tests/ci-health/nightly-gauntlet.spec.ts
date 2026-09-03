@@ -306,6 +306,26 @@ for (const repo of TIERED_REPOS) {
       }
     }
 
+    // AN UNREADABLE JOBS ENDPOINT IS A WARN, NEVER A PAGE (2026-09-03, BoatBuddy run 33591920887).
+    // Everything below decides "persistently failing" and phrases the alert from the judged run's
+    // JOB list, and the recovery gate that follows can only ask "has that gate passed since?" when
+    // it knows the gate's NAME. When this endpoint could not be read we have neither: `failedNames`
+    // is empty, so the recovery check is skipped, and the run still counts as `isFail && persistent`
+    // — so the page fires asserting "the failing job could not be read from GitHub", a staging
+    // regression we never actually observed. Proven that night: this endpoint returned non-200 for
+    // the monitor's DASHBOARD_PAT (it was readable with another PAT, rate limit 3384/5000 — a
+    // token/permission failure, not availability) while `gate-security` had in fact concluded
+    // SUCCESS in the newer scheduled run 33718969126, so the page chased a gate that had already
+    // recovered. A jobs-read failure is a GitHub/token problem, not proof of a regression, and this
+    // file already skips on exactly that shape for the runs-list read above (`res.status() !== 200`).
+    // Skipping here does not blind the monitor: the DASHBOARD_PAT-present floor test still fails if
+    // the token vanishes entirely, and the next hourly run re-reads — a real persistent failure with
+    // a readable job list still pages through the unchanged path below.
+    test.skip(
+      !jobsRes.ok(),
+      `${repo}: the judged scheduled gauntlet (${latest.id}) concluded '${latest.conclusion}', but its job list could not be read from GitHub (jobs endpoint returned ${jobsRes.status()}). Not paging — an unreadable jobs endpoint is a monitor/token problem, not a proven staging regression, and without the failing gate's name the recovery check cannot ask whether it has passed since. The next hourly monitor re-reads.${skippedNote}`,
+    );
+
     // HAS THAT GATE PASSED SINCE? (2026-09-03, monitor run 33731470295.) Everything above decides
     // "persistently failing" from the judged run's own age and attempt count — a good proxy when
     // there is nothing newer to look at, and simply wrong when there is. `pick.skipped` holds
