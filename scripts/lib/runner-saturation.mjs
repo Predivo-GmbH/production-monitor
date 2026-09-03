@@ -58,14 +58,22 @@ export function auditRunnerSaturation({ perRepo, queuedOurs = {} }) {
         `queueing behind each other. The fix is more runners for ${repo} or a bigger CI machine. ` +
         `It is NOT Roger's work PC: he retired that on 2026-08-25 and again on 2026-09-03.`,
       )
-    } else {
+    } else if (list.length === 0) {
       alerts.push(
-        `JOBS QUEUED WHILE ${repo.toUpperCase()}'S OWN RUNNERS ARE IDLE: ${waiting} job(s) waiting ` +
-        `with ${idle} of ${list.length} runners doing nothing. This is not capacity and more ` +
-        `hardware would fix nothing: those jobs are asking for a runner label this repository does ` +
-        `not offer, or it has no runner registered at all.`,
+        `NO RUNNER REGISTERED FOR ${repo.toUpperCase()}: ${waiting} job(s) are queued asking for our ` +
+        `runner label while this repository has no online runner registered at all. This is not ` +
+        `capacity and more hardware would fix nothing: those jobs are asking for a runner label this ` +
+        `repository does not offer, or it has no runner registered at all.`,
       )
     }
+    // else: idle > 0. This repository has online runners sitting IDLE while a job is queued for our
+    // label. Because `waiting` counts only jobs asking for a label we carry (see @param queuedOurs),
+    // an idle runner here CAN take that job - it is a job about to start (this commit measured a
+    // 3.0s median queue wait), not a misconfiguration. The watchdog samples the queue instantly
+    // every 10 minutes, so alerting here would email a label-mismatch that `idle > 0` itself
+    // disproves - the same "a true sentence becomes a false alarm" failure cancelled-gate.mjs was
+    // added to stop. Stay silent. (2026-09-03, incident
+    // production-monitor:f2875ad:saturation-idle-branch-asserts-disproven-cause.)
   }
 
   const queuedTotal = Object.values(queuedOurs).reduce((a, n) => a + (n > 0 ? n : 0), 0)

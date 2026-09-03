@@ -55,15 +55,26 @@ test('idle runners in OTHER repositories never excuse a full one', () => {
   assert.doesNotMatch(alerts[0], /more hardware would fix nothing/)
 })
 
-test('jobs waiting while that repository own runners sit idle is the opposite problem', () => {
+// An idle runner with a job queued for OUR label is a job about to START (this commit measured a
+// 3.0s median queue wait), not a misconfiguration - `queuedOurs` counts only jobs asking for a
+// label we carry, so an idle runner here CAN take it. The 10-minute watchdog samples the queue
+// instantly, so alerting on this transient emailed Roger a label-mismatch its own idle count
+// disproves. Stay silent. (2026-09-03, incident f2875ad:saturation-idle-branch-asserts-disproven-cause.)
+test('idle runners with a job just queued are about to start, not a fault - stay silent', () => {
   const { alerts } = auditRunnerSaturation({
     perRepo: [{ repo: 'cockpit', runners: [on(false), on(false), on(false), on(false)] }],
     queuedOurs: { cockpit: 2 },
   })
-  assert.equal(alerts.length, 1)
-  assert.match(alerts[0], /OWN RUNNERS ARE IDLE/)
-  assert.match(alerts[0], /more hardware would fix nothing/)
-  assert.doesNotMatch(alerts[0], /SATURATED/, 'adding a machine here would fix nothing')
+  assert.deepEqual(alerts, [], 'four idle runners and a queued job is a job about to start')
+})
+
+// The LEAD's exact shape: online=2, busy=1, waiting=1 -> idle=1. A runner IS free to take the job.
+test('one idle runner alongside one busy one and a queued job emits no misconfiguration claim', () => {
+  const { alerts } = auditRunnerSaturation({
+    perRepo: [{ repo: 'cockpit', runners: [on(true), on(false)] }],
+    queuedOurs: { cockpit: 1 },
+  })
+  assert.deepEqual(alerts, [], 'an idle runner exists that can take the job - not saturated, not misconfigured')
 })
 
 test('offline runners are not counted as capacity we have', () => {
@@ -81,6 +92,7 @@ test('a repository with no runners at all is a registration problem, not a capac
     queuedOurs: { cockpit: 1 },
   })
   assert.equal(alerts.length, 1)
-  assert.match(alerts[0], /OWN RUNNERS ARE IDLE/)
+  assert.match(alerts[0], /NO RUNNER REGISTERED FOR COCKPIT/)
   assert.match(alerts[0], /no runner registered at all/)
+  assert.doesNotMatch(alerts[0], /SATURATED/, 'a registration gap is not a capacity problem')
 })
