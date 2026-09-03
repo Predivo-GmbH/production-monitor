@@ -42,6 +42,7 @@ import { homedir } from 'os'
 import { pathToFileURL } from 'url'
 import { DEPLOY_DENY_TOOLS, agentToolFlags, DEPLOY_DENY_POLICY_NOTE } from './lib/deploy-deny-tools.mjs'
 import { adoptionTarget, closurePlan, resolvedPatch, sameEntitySignals, ACTIVE_SIGNAL_STATES } from './lib/signal-closure.mjs'
+import { readAllRows } from './lib/read-all-rows.mjs'
 
 // ── config ──────────────────────────────────────────────────────────────────────────────
 const BO_REF = 'xoecpzfsskalvjrtcbbl'
@@ -1689,6 +1690,14 @@ export async function routeToWorkBoard(inc, cls, deps) {
  */
 export function workBoardDeps(secret, base = BO_BASE) {
   const H = { apikey: secret, Authorization: `Bearer ${secret}`, 'User-Agent': NON_BROWSER_UA, 'Content-Type': 'application/json' }
+  // The paging reader readAllRows drives: a plain GET returning the row array, no limit/offset of
+  // its own (readAllRows adds order+limit+offset per page). Throws on a non-OK, same as every read
+  // below, so a truncated or failed page can never masquerade as "that is all the rows".
+  const restRead = async (p) => {
+    const res = await fetch(`${base}/rest/v1/${p}`, { headers: H })
+    if (!res.ok) throw new Error(`read HTTP ${res.status}: ${(await res.text()).slice(0, 160)}`)
+    return await res.json()
+  }
   return {
     log,
     async findItem(slug) {
@@ -1820,12 +1829,12 @@ export function workBoardDeps(secret, base = BO_BASE) {
      *  row somebody declared. Measured 2026-09-03: 64 drainer rows are open, 4 of them are in one
      *  of those two states, and this filter is why they are never considered. */
     async listRetirableItems() {
-      const res = await fetch(`${base}/rest/v1/work_items`
+      // Paged, not &limit=500: this pass must load EVERY drainer-minted open row or it silently
+      // leaves the ones past the cap open forever (id.asc so pages cannot overlap or skip).
+      return await readAllRows(restRead, `work_items`
         + `?source=eq.monitor&opened_by=eq.board-drainer&status=in.(${[...RETIREABLE_ITEM_STATUSES].join(',')})`
-        + `&select=id,slug,title,source,status,opened_by,opened_at,started_at,owner_session,blocked_owner,blocked_question,documentation_ref&limit=500`,
-        { headers: H })
-      if (!res.ok) throw new Error(`work_items read HTTP ${res.status}: ${(await res.text()).slice(0, 160)}`)
-      return await res.json()
+        + `&select=id,slug,title,source,status,opened_by,opened_at,started_at,owner_session,blocked_owner,blocked_question,documentation_ref`,
+        { order: 'id.asc' })
     },
 
     /** EVERY signal, in every state — not just the terminal ones.
@@ -1835,11 +1844,13 @@ export function workBoardDeps(secret, base = BO_BASE) {
      *  tally that reports 38 rows as "the incident cannot be located" when the incident is sitting
      *  right there in `superseded` is a report nobody can act on). Measured 2026-09-03: 731 rows. */
     async listAllSignals() {
-      const res = await fetch(`${base}/rest/v1/fleet_signals`
-        + '?select=id,source,key,title,severity,state,summary,detail,link,resolved_at,last_seen_at,first_seen_at&limit=2000',
-        { headers: H })
-      if (!res.ok) throw new Error(`fleet_signals read HTTP ${res.status}: ${(await res.text()).slice(0, 160)}`)
-      return await res.json()
+      // Paged, not &limit=2000: the server caps a request at 1000 rows with no error, and this
+      // docblock's promise ("EVERY signal, in every state") is exactly what a silent truncation
+      // breaks — candidateIncidentsFor() would then find nothing for the dropped rows and the pass
+      // would report success for retiring nothing. id.asc gives a total order so no row is skipped.
+      return await readAllRows(restRead, `fleet_signals`
+        + '?select=id,source,key,title,severity,state,summary,detail,link,resolved_at,last_seen_at,first_seen_at',
+        { order: 'id.asc' })
     },
 
     /** The evidence row that Cockpit sql/077 counts before it will accept an `auto:` close.

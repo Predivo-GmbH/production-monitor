@@ -40,6 +40,7 @@ import { readFileSync } from 'fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { sayVerdict, PASS, FAIL, UNKNOWN } from './lib/check-verdict.mjs'
+import { readAllRows } from './lib/read-all-rows.mjs'
 
 // RESOLVED, NEVER HARDCODED. This was 'C:/Users/roger_rwjnmnz/.claude.json' and the job failed
 // on its very first real run: it is scheduled on LAPTOP-88N97BGG, where the user is
@@ -243,11 +244,15 @@ async function main() {
     return 1
   }
   const since = new Date(Date.now() - WINDOW_DAYS * DAY).toISOString()
+  // Paged (id.asc), not &limit=5000: the server caps a request at 1000 rows with no error, so a
+  // board over 1000 rows would make every gate below compute a confident verdict over an arbitrary
+  // 1000-row sample. readAllRows throws rather than truncate; a wrong-but-clean PASS is the failure
+  // this whole file exists to catch.
   const [rows, openedInWindow, closedInWindow, mergedRows] = await Promise.all([
-    boardGet('work_items?select=slug,status,priority,source,opened_at,state_since,blocked_owner,blocked_question,done_when,done_check_result&limit=5000'),
-    boardGet(`work_items?opened_at=gte.${since}&select=priority&limit=5000`),
-    boardGet(`work_items?closed_at=gte.${since}&select=slug&limit=5000`),
-    boardGet(`work_items?merged_into=not.is.null&select=slug&limit=5000`).catch(() => []),
+    readAllRows(boardGet, 'work_items?select=slug,status,priority,source,opened_at,state_since,blocked_owner,blocked_question,done_when,done_check_result', { order: 'id.asc' }),
+    readAllRows(boardGet, `work_items?opened_at=gte.${since}&select=priority`, { order: 'id.asc' }),
+    readAllRows(boardGet, `work_items?closed_at=gte.${since}&select=slug`, { order: 'id.asc' }),
+    readAllRows(boardGet, `work_items?merged_into=not.is.null&select=slug`, { order: 'id.asc' }).catch(() => []),
   ])
 
   const m = measureBoard({

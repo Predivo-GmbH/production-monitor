@@ -39,6 +39,7 @@ import { readFileSync } from 'fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { sayVerdict, PASS, UNKNOWN } from './lib/check-verdict.mjs'
+import { readAllRows } from './lib/read-all-rows.mjs'
 
 // RESOLVED, NEVER HARDCODED. This was 'C:/Users/roger_rwjnmnz/.claude.json' and the job failed
 // on its very first real run: it is scheduled on LAPTOP-88N97BGG, where the user is
@@ -131,7 +132,9 @@ async function main() {
     return 0
   }
 
-  const rows = await board('work_items?status=not.in.(done,abandoned)&select=id,slug,title,status,priority,owner_session,blocked_owner,merged_into,opened_at,state_since,last_evidence_at&limit=5000')
+  // Paged (id.asc), not &limit=5000: the server caps a request at 1000 rows with no error, so past
+  // 1000 open rows this would bundle "the untouched ones" from an arbitrary sample and miss the rest.
+  const rows = await readAllRows(board, 'work_items?status=not.in.(done,abandoned)&select=id,slug,title,status,priority,owner_session,blocked_owner,merged_into,opened_at,state_since,last_evidence_at', { order: 'id.asc' })
   const picked = selectForTheNoBundle({ rows })
   if (!picked.length) {
     console.log(`  no "when there is time" row has gone ${UNTOUCHED_DAYS} days untouched — nothing to ask about`)
