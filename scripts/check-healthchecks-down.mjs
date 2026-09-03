@@ -48,7 +48,7 @@
 import { readFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
-import { beaconFor, partitionDownChecks, reprievedResolution } from './lib/alarm-state.mjs'
+import { beaconFor, partitionDownChecks, reprievedResolution, ranAndReportedFailure } from './lib/alarm-state.mjs'
 
 const BO_REF = 'xoecpzfsskalvjrtcbbl'
 const BO_BASE = `https://${BO_REF}.supabase.co`
@@ -169,7 +169,17 @@ export function idNote(check) {
   return ` Its id at healthchecks is "${slug}", which is not its name - that is an old id, not a different check.`
 }
 
-/** What a DOWN check says on the cockpit, in words that name the consequence. */
+/**
+ * What a DOWN check says on the cockpit, in words that name the consequence.
+ *
+ * DOWN IS NOT ONE FACT (2026-09-03). healthchecks calls a check `down` both when it went silent
+ * AND when it ran and pinged /fail — and its own mail distinguishes them. The evidence is already
+ * here: a fresh last_ping inside the check's own schedule means the job RAN and reported a failure,
+ * not that it stopped. Reporting that as "Scheduled job stopped running" (critical + needs_human)
+ * puts a job that is checking in on schedule onto Roger's lane as a dead job — the false red this
+ * whole file is being hardened against. So a demonstrably-fresh down check is worded as the
+ * dev-owned failure it is, and only a check that has genuinely gone silent keeps the dead-man claim.
+ */
 export function signalFor(check, now = Date.now()) {
   const silent = minsSince(check.last_ping, now)
   const howLong = silent === null
@@ -177,6 +187,22 @@ export function signalFor(check, now = Date.now()) {
     : silent < 120
       ? `Last checked in ${silent} minutes ago.`
       : `Last checked in ${Math.round(silent / 60)} hours ago.`
+
+  if (ranAndReportedFailure(check, now)) {
+    return {
+      source: SOURCE,
+      key: check.slug || check.name,
+      kind: 'incident',
+      severity: 'warning',
+      state: 'open',
+      needs_human: false,
+      title: `Scheduled job ran and reported a failure: ${check.name}`,
+      summary: `${howLong} It is still checking in on schedule and reported a failure on its last run, so this is a dev-owned issue to look into — not a job that stopped running.${check.desc ? ' ' + check.desc : ''}${idNote(check)}`.trim(),
+      detail: { name: check.name, slug: check.slug, status: check.status, last_ping: check.last_ping, tags: check.tags || '', classification: 'ran-and-reported-failure' },
+      link: 'https://cockpit.predivo.ch/signals',
+    }
+  }
+
   return {
     source: SOURCE,
     key: check.slug || check.name,
@@ -217,28 +243,36 @@ export function recoveredCheckKeys({ openKeys, allCheckKeys, downKeys }) {
  * @returns {{rollup: object|null, members: object[]}}
  */
 export function planSignals(down, now = Date.now()) {
-  if (down.length < ROLLUP_THRESHOLD) {
-    // One or two dead jobs are one or two faults. Unchanged behaviour: each may page on its own.
-    return { rollup: null, members: down.map((c) => signalFor(c, now)) }
+  // "The fleet went dark" is a claim about jobs that STOPPED. A check that ran and pinged /fail is
+  // not dark — it is a dev-owned failure — so it never counts toward the rollup and is always filed
+  // on its own (signalFor words it as a warning). Only genuinely-silent checks feed the rollup.
+  const ranFailed = down.filter((c) => ranAndReportedFailure(c, now))
+  const silent = down.filter((c) => !ranAndReportedFailure(c, now))
+  const ranFailedMembers = ranFailed.map((c) => signalFor(c, now))
+
+  if (silent.length < ROLLUP_THRESHOLD) {
+    // One or two genuinely-dark jobs are one or two faults. Unchanged behaviour: each may page on
+    // its own; the ran-and-failed ones ride alongside as warnings.
+    return { rollup: null, members: [...silent.map((c) => signalFor(c, now)), ...ranFailedMembers] }
   }
 
-  const names = down.map((c) => c.slug || c.name)
+  const names = silent.map((c) => c.slug || c.name)
   const gate = names.find((n) => GATE_CHECKS[n])
 
   // Plain words, consequence first. He should not have to know what a healthchecks slug is to
   // understand that nothing has run since yesterday.
   const title = gate
-    ? `Nothing is running: ${down.length} scheduled jobs are dark`
-    : `${down.length} scheduled jobs have stopped running`
+    ? `Nothing is running: ${silent.length} scheduled jobs are dark`
+    : `${silent.length} scheduled jobs have stopped running`
   const summary = (gate
-    ? `${GATE_CHECKS[gate]}. That is one fault, not ${down.length}, so this is the only alert for it. `
-    : `They stopped inside the same window, so this is most likely one cause and not ${down.length}. `)
+    ? `${GATE_CHECKS[gate]}. That is one fault, not ${silent.length}, so this is the only alert for it. `
+    : `They stopped inside the same window, so this is most likely one cause and not ${silent.length}. `)
     // THE LIST HE READS IS A LIST OF NAMES. The line above says he should not have to know what a
     // healthchecks slug is, and then this sentence printed slugs at him - including
     // "my-first-check", which is the fleet's central hourly monitor wearing the id healthchecks
     // hands the first check on a new account. Names here; the ids stay in `detail`, where a machine
     // reads them.
-    + `Dark right now: ${down.map((c) => c.name || c.slug).join(', ')}.`
+    + `Dark right now: ${silent.map((c) => c.name || c.slug).join(', ')}.`
 
   return {
     rollup: {
@@ -250,12 +284,13 @@ export function planSignals(down, now = Date.now()) {
       needs_human: true,
       title,
       summary,
-      detail: { count: down.length, jobs: names, gate: gate ?? null },
+      detail: { count: silent.length, jobs: names, gate: gate ?? null },
       link: 'https://cockpit.predivo.ch/signals',
     },
-    // Still filed, still on the board, still carrying every detail, but not eligible to ring.
+    // Silent members: still filed, still carrying every detail, but not eligible to ring.
     // `warning` plus needs_human:false is the pair upsert_signal records as 'not-eligible'.
-    members: down.map((c) => ({ ...signalFor(c, now), severity: 'warning', needs_human: false })),
+    // Ran-and-failed members are already warnings from signalFor and ride alongside.
+    members: [...silent.map((c) => ({ ...signalFor(c, now), severity: 'warning', needs_human: false })), ...ranFailedMembers],
   }
 }
 

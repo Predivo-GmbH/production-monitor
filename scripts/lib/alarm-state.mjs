@@ -102,6 +102,34 @@ export function toleranceMinutes(check, fallback = DEFAULT_TOLERANCE_MINUTES) {
 }
 
 /**
+ * Is this DOWN check down because it RAN AND PINGED /fail, rather than because it went silent?
+ *
+ * healthchecks marks a check `down` for two very different reasons, and its own mail names them:
+ *   - "received a failure signal"       the job ran, hit its /fail URL; last_ping is FRESH.
+ *   - "success signal did not arrive"   the job went silent; last_ping is STALE, aged past the
+ *                                        check's own allowance (that is the very moment healthchecks
+ *                                        flips it down for silence).
+ *
+ * The checks-list API does not label the last ping's KIND, but last_ping FRESHNESS is a faithful
+ * proxy: a fail ping updates last_ping to now, so a down check whose last_ping is still inside its
+ * own timeout+grace ran within that window and did not stop. Only a job that has genuinely stopped
+ * lets last_ping age past its own tolerance.
+ *
+ * Conservative in the SAME direction as the beacon rule — UNKNOWN IS NOT ALIVE. A missing or
+ * unparseable last_ping, or one aged past tolerance, returns false, so the alarm keeps its full
+ * "stopped running" claim. A future-dated ping is not a reading and is refused too. Only a
+ * demonstrably fresh ping softens the claim, so this can only ever DOWNGRADE a false page, never
+ * hide a real dead job.
+ */
+export function ranAndReportedFailure(check, now = Date.now()) {
+  const t = Date.parse(check?.last_ping || '')
+  if (!Number.isFinite(t)) return false
+  const ageMinutes = (now - t) / 60_000
+  if (ageMinutes < 0) return false
+  return ageMinutes <= toleranceMinutes(check)
+}
+
+/**
  * Is there proof this job ran recently enough?
  *
  * @param check       the healthchecks check, as returned by the API

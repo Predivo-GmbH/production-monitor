@@ -15,7 +15,7 @@
 import assert from 'node:assert'
 import {
   livenessVerdict, partitionDownChecks, reprievedResolution, toleranceMinutes,
-  beaconFor, LIVENESS_BEACONS, DEFAULT_TOLERANCE_MINUTES,
+  beaconFor, LIVENESS_BEACONS, DEFAULT_TOLERANCE_MINUTES, ranAndReportedFailure,
 } from '../scripts/lib/alarm-state.mjs'
 import { planRun, readBeaconReadings, ROLLUP_THRESHOLD } from '../scripts/check-healthchecks-down.mjs'
 
@@ -56,6 +56,29 @@ t('a cron check carries only grace, and that alone is used', () => {
 t('a check with neither falls back to the documented default, not to zero', () => {
   assert.equal(toleranceMinutes({}), DEFAULT_TOLERANCE_MINUTES)
   assert.equal(toleranceMinutes({ timeout: 0, grace: 0 }), DEFAULT_TOLERANCE_MINUTES)
+})
+
+// ── DOWN-because-it-pinged-/fail is not DOWN-because-it-went-silent ────────────────────────────
+// A fresh last_ping inside the check's own tolerance is proof the job RAN and reported a failure.
+// Only a stale ping is the dead-man it claims to be. Same conservative direction as the beacon:
+// anything unknown, missing, future-dated or aged-out keeps the full "stopped running" claim.
+t('a cron check that pinged 1 min ago, well inside its 90 min grace, ran and reported a failure', () => {
+  assert.equal(ranAndReportedFailure({ schedule: '*' + '/10 * * * *', grace: 5400, last_ping: ago(1) }, NOW), true)
+})
+
+t('the same check, silent past its own tolerance, is NOT a fresh failure — it really stopped', () => {
+  assert.equal(ranAndReportedFailure({ schedule: '*' + '/10 * * * *', grace: 5400, last_ping: ago(91) }, NOW), false)
+  assert.equal(ranAndReportedFailure({ schedule: '*' + '/10 * * * *', grace: 5400, last_ping: ago(89) }, NOW), true)
+})
+
+t('a check that never pinged, or has an unreadable ping, is not a fresh failure', () => {
+  for (const bad of [null, undefined, '', 'not-a-date']) {
+    assert.equal(ranAndReportedFailure({ grace: 5400, last_ping: bad }, NOW), false)
+  }
+})
+
+t('a future-dated ping is not a reading, so it does not soften the claim either', () => {
+  assert.equal(ranAndReportedFailure({ grace: 5400, last_ping: new Date(NOW + 60_000).toISOString() }, NOW), false)
 })
 
 // ── A GENUINE OUTAGE STILL GOES RED AND STAYS RED ─────────────────────────────────────────────

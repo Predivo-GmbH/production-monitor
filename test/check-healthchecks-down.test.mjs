@@ -70,8 +70,56 @@ t('a job that has never checked in says so, rather than printing a nonsense age'
 })
 
 t('the check description is used when there is one — it says what stopped happening', () => {
-  const sig = signalFor({ name: 'x', slug: 'x', status: 'down', last_ping: ago(10), desc: 'Books the daily invoices.' }, NOW)
+  // ago(300) with the default 180 min tolerance: genuinely silent, so this stays the "stopped
+  // running" branch the test name describes (a fresh ping would be the ran-and-failed branch below).
+  const sig = signalFor({ name: 'x', slug: 'x', status: 'down', last_ping: ago(300), desc: 'Books the daily invoices.' }, NOW)
+  assert.equal(sig.severity, 'critical')
+  assert.match(sig.title, /stopped running/)
   assert.match(sig.summary, /Books the daily invoices\./)
+})
+
+// ── DOWN because it RAN AND PINGED /fail is not DOWN because it went silent ─────
+// The real 2026-09-03 case: ci-runner-watchdog (n_pings 782, last ping 1 min ago) and
+// mailer-config-guard (last ping 41 min ago, 360 min grace) were both DOWN because their last run
+// pinged /fail, yet each was announced as "Scheduled job stopped running" (critical + needs_human)
+// and landed on Roger's lane as a dead job. A fresh ping inside the check's own window is proof the
+// job ran; only a stale one is the dead-man it claims to be.
+t('a check that pinged /fail INSIDE its own window is a dev-owned failure, not a dead job', () => {
+  const sig = signalFor({ name: 'ci-runner-watchdog', slug: 'ci-runner-watchdog', status: 'down', grace: 5400, schedule: '*' + '/10 * * * *', last_ping: ago(1) }, NOW)
+  assert.equal(sig.severity, 'warning')
+  assert.equal(sig.needs_human, false)
+  assert.match(sig.title, /ran and reported a failure/)
+  assert.doesNotMatch(sig.title, /stopped running/)
+  assert.equal(sig.detail.classification, 'ran-and-reported-failure')
+})
+
+t('a check that went SILENT past its own tolerance still keeps the dead-man claim', () => {
+  const sig = signalFor({ name: 'ci-runner-watchdog', slug: 'ci-runner-watchdog', status: 'down', grace: 5400, schedule: '*' + '/10 * * * *', last_ping: ago(200) }, NOW)
+  assert.equal(sig.severity, 'critical')
+  assert.equal(sig.needs_human, true)
+  assert.match(sig.title, /stopped running/)
+})
+
+t('ran-and-failed jobs never count toward the "fleet went dark" rollup', () => {
+  // Three checks down, but all three pinged /fail moments ago: not one is dark, so no rollup and
+  // every one is a warning — none reaches Roger as a stopped job.
+  const ranFailed = (name) => ({ name, slug: name, status: 'down', grace: 5400, schedule: '*' + '/10 * * * *', last_ping: ago(1) })
+  const { rollup, members } = planSignals([ranFailed('a'), ranFailed('b'), ranFailed('c')], NOW)
+  assert.equal(rollup, null)
+  assert.equal(members.length, 3)
+  assert.ok(members.every((m) => m.severity === 'warning' && m.needs_human === false))
+})
+
+t('a real fleet-dark rollup ignores ran-and-failed noise mixed in with it', () => {
+  const silent = (name) => ({ name, slug: name, status: 'down', last_ping: ago(600) })
+  const ranFailed = (name) => ({ name, slug: name, status: 'down', grace: 5400, schedule: '*' + '/10 * * * *', last_ping: ago(1) })
+  const { rollup, members } = planSignals([silent('a'), silent('b'), silent('c'), ranFailed('r')], NOW)
+  assert.equal(rollup.detail.count, 3, 'the rollup counts only the three genuinely-dark jobs')
+  assert.deepEqual(rollup.detail.jobs, ['a', 'b', 'c'])
+  assert.equal(members.length, 4)
+  const ranFailedMember = members.find((m) => m.key === 'r')
+  assert.equal(ranFailedMember.needs_human, false)
+  assert.match(ranFailedMember.title, /ran and reported a failure/)
 })
 
 // ── both accounts, never silently one ──────────────────────────────────────────
