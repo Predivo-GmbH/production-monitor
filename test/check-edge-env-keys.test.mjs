@@ -14,6 +14,7 @@ import assert from 'node:assert'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { verdictOf, VERDICT_MARKER, VERDICT_STATES, PASS } from '../scripts/lib/check-verdict.mjs'
+import { tokensFromEnv } from '../scripts/check-edge-env-keys.mjs'
 import {
   classifySecret, auditProject, summarise, digest, OUTBOUND_CREDENTIALS, COMPARISON_ONLY, sweep,
 } from '../scripts/check-edge-env-keys.mjs'
@@ -168,6 +169,26 @@ if (!process.env.SKIP_LIVE) {
     if (v && v.state === PASS) assert.match(v.reason, /[1-9][0-9]* credentials/)
   })
 }
+
+
+// -- the CI token path, added when this check was wired into monitor.yml (2026-09-03) --
+// A runner has no credential files, so without this the check would report UNKNOWN on every
+// scheduled run: true, useless, and the kind of permanent amber an alarm gets trained to ignore.
+t('a SUPABASE_TOKEN_* variable is picked up, and its name is the id (never its value)', () => {
+  const got = tokensFromEnv({ SUPABASE_TOKEN_REPLYFLOW: 'sbp_x', PATH: '/usr/bin' })
+  assert.equal(got.length, 1)
+  assert.equal(got[0].id, 'SUPABASE_TOKEN_REPLYFLOW')
+})
+
+t('an empty or whitespace variable is NOT a token - an unset secret renders as empty string', () => {
+  // The failure this repo already had once: a step wired to a secret that does not exist gets an
+  // empty string, and an empty string that counts as a token turns a blind run into a green one.
+  assert.deepEqual(tokensFromEnv({ SUPABASE_TOKEN_A: '', SUPABASE_TOKEN_B: '   ' }), [])
+})
+
+t('only the SUPABASE_TOKEN_ prefix counts, so an unrelated secret is never sent to the API', () => {
+  assert.deepEqual(tokensFromEnv({ SUPABASE_TOKEN: 'x', GH_TOKEN: 'y', MY_SUPABASE_TOKEN_Z: 'z' }), [])
+})
 
 console.log(`
 ${n} passed`)

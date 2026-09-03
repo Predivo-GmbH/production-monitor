@@ -510,6 +510,25 @@ jobs:
           SUPABASE_TOKEN_DISTRIBUTIONOS: ${{ secrets.SUPABASE_TOKEN_DISTRIBUTIONOS }}
           SUPABASE_TOKEN_MUELLER: ${{ secrets.SUPABASE_TOKEN_MUELLER }}
           SUPABASE_TOKEN_REPLYFLOW: ${{ secrets.SUPABASE_TOKEN_REPLYFLOW }}
+      # THE 93-MINUTE REPLYFLOW OUTAGE OF 2026-09-02, asked as a question a schedule can answer.
+      # A rotation updated every consumer it could find - `gh secret list` and each product's
+      # Credentials.txt - and revoked the old key. Neither list is the one that RUNS: the edge
+      # function env still held the revoked value in SB_SECRET_KEY, which every ReplyFlow function
+      # reads first, and 34 users could not sign in until a human noticed.
+      #
+      # It sweeps every project the tokens below open, rather than a named list, so a product added
+      # later is covered without editing this file. It exits non-zero when it judged nothing at all,
+      # because a sweep with an empty population is a broken sweep and not an all-clear.
+      - name: No project is presenting a key its own project has revoked
+        if: always()
+        run: node scripts/check-edge-env-keys.mjs
+        env:
+          SUPABASE_TOKEN_BACKOFFICE: ${{ secrets.SUPABASE_TOKEN_BACKOFFICE }}
+          SUPABASE_TOKEN_CHANNELMOVER: ${{ secrets.SUPABASE_TOKEN_CHANNELMOVER }}
+          SUPABASE_TOKEN_DISTRIBUTIONOS: ${{ secrets.SUPABASE_TOKEN_DISTRIBUTIONOS }}
+          SUPABASE_TOKEN_MUELLER: ${{ secrets.SUPABASE_TOKEN_MUELLER }}
+          SUPABASE_TOKEN_REPLYFLOW: ${{ secrets.SUPABASE_TOKEN_REPLYFLOW }}
+
       - name: The fleet auto-fixer is still fixing things
         if: always()  # independent sensor — must run even if the monitor step above failed. check-drainer-progress.mjs exits 0 on a filed alarm (only a failed read reds the job), so this cannot double-red one event.
         run: node scripts/check-drainer-progress.mjs

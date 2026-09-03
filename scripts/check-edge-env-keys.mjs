@@ -156,9 +156,30 @@ export async function loadProject(ref, token, { fetchImpl = fetch } = {}) {
 }
 
 /** The live sweep over every project a token on this disk opens. */
+/**
+ * TOKENS FROM THE ENVIRONMENT, because a CI runner has no credential files.
+ *
+ * discoverLocalTokens() reads the credential files under the fleet checkout. That is the right
+ * source on a workstation and there is nothing to read on a GitHub runner, so on CI this check
+ * would report UNKNOWN forever - true, useless, and exactly the kind of permanent amber an alarm
+ * gets trained to ignore. The monitor already hands its siblings the same tokens by name.
+ */
+export function tokensFromEnv(env = process.env) {
+  const out = []
+  for (const [k, v] of Object.entries(env)) {
+    if (!/^SUPABASE_TOKEN_[A-Z0-9_]+$/.test(k)) continue
+    const token = String(v || '').trim()
+    if (token) out.push({ token, id: k })
+  }
+  return out
+}
+
 export async function sweep({ fetchImpl = fetch, tokens, withMeta = false } = {}) {
   const seen = new Map()
-  const list = tokens ?? discoverLocalTokens()
+  // Env first: on CI it is the only source, and on a workstation a token passed in deliberately
+  // should beat one found by scanning. Both are de-duplicated by project ref below anyway.
+  const fromEnv = tokensFromEnv()
+  const list = tokens ?? (fromEnv.length ? fromEnv : discoverLocalTokens())
   for (const t of list) {
     const { projects } = await projectsFor(t.token, { fetchImpl })
     for (const p of projects) if (!seen.has(p.ref)) seen.set(p.ref, { name: p.name, token: t.token })
