@@ -71,8 +71,27 @@
  *   check-edge-code-live.mjs with the empty-population branch deleted from verdict()
  *     -> 1 failure (emptyinput), 95 passing.                   The empty-input family.
  *
- * The second is the one that matters most: with the emptyinput fault absent, that defect passes
- * all three network faults cleanly, which is precisely how it survived until it was injected.
+ * The second is the one that matters most as a DESIGN lesson: with the emptyinput fault absent,
+ * that defect passes all three network faults cleanly, which is precisely how it survived until it
+ * was injected.
+ *
+ * -- AND THEN IT CAUGHT ONE NOBODY WAS LOOKING FOR -------------------------------------------
+ *
+ * Hours after this file was written, a peer session committed `scripts/check-edge-env-keys.mjs`.
+ * It had been untracked during the audit, so it was outside the glob; the moment it was committed
+ * the next run went red on it, on all four faults, with nobody looking.
+ *
+ * Its judgement was already CORRECT -- `summarise()` returns 'inconclusive' for a sweep that judged
+ * nothing, which is this very contract, arrived at independently. None of it had ever been reached:
+ * its main-module guard compared a hand-built `file:///` + backslash swap against `import.meta.url`,
+ * which PERCENT-ENCODES the path, and this repository lives under "Internal Projects". The space was
+ * `%20` on one side and a space on the other, so the block never ran and the file exited 0 with no
+ * output, always, from the day it landed.
+ *
+ * A check that cannot run AT ALL is the purest form of this class, and it is invisible precisely
+ * because there is no output to be suspicious of: no wrong sentence, no misleading count, no branch
+ * to review. Just a silent zero. It is the single best argument for the glob: a hand-maintained
+ * list would have said 22 subjects and been entirely right about 22.
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

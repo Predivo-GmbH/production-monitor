@@ -163,8 +163,10 @@ which is how #4 stayed invisible.
 > **No check in this repository may report a pass without having reached its dependency.**
 
 It enforces that the only way the failure can actually be caught: by breaking the dependency and
-running the check. **96 assertions** — 22 tracked checks × 4 faults, plus the population assertion,
-plus 7 on the primitive itself.
+running the check. **100 assertions** — 23 tracked checks × 4 faults, plus the population
+assertion, plus 7 on the primitive itself. (It was 96 over 22 checks when written; a peer committed
+the twenty-third while this pass was finishing, and the guard picked it up and failed it without
+anyone asking. See "The seventh defect" below.)
 
 Three properties make it a class-closer rather than a seventh local fix:
 
@@ -197,7 +199,7 @@ faults cleanly. **A network-only guard would have shipped green over three of th
 which is how they survived two previous audits. *The dependency a check fails to reach is not always
 remote, and a guard that only knows one kind of dependency measures that kind, not coverage.*
 
-**Whole repo: 51 of 51 unit suites green, 121s.**
+**Whole repo: every unit suite green.**
 
 ---
 
@@ -249,9 +251,60 @@ file.
 
 ### Outside this repo
 
-* `scripts/check-edge-env-keys.mjs` and its suite are a peer session's uncommitted work in this
-  shared checkout. Not touched, and correctly outside the guard, which reads tracked files only.
-  Once committed it is covered automatically — by the glob, without anyone remembering to add it.
+Nothing. The one item filed here while this pass was running — `scripts/check-edge-env-keys.mjs`,
+a peer session's uncommitted work — was committed before this pass ended and became the seventh
+defect, below.
+
+---
+
+## The seventh defect, found by the guard hours after the guard was written
+
+**This is the only part of this pass nobody did by hand, and it is the part that matters most.**
+
+`scripts/check-edge-env-keys.mjs` was uncommitted peer work when the census was taken, so it sat
+outside the guard, which reads tracked files only. Its author committed it (`29e6c04`) while this
+pass was finishing. The next run of the suite went red on it immediately, on all four faults, with
+nobody looking for it.
+
+Its judgement is **correct** — `summarise()` already returns `'inconclusive'` for a sweep that
+judged nothing, with the comment *"A sweep that judged nothing is not a pass. It is a broken
+sweep."* That is exactly the third state this pass is about, written independently and written well.
+
+**None of it had ever been reached.** The main-module guard was:
+
+```js
+if (import.meta.url === `file:///${process.argv[1].replace(/\/g, '/')}`) {
+```
+
+`import.meta.url` percent-encodes the path. This repository lives under **"Internal Projects"**, so
+the space becomes `%20` on one side of the comparison and stays a space on the other:
+
+```
+their comparison : file:///C:/Business/Internal Projects/.../check-edge-env-keys.mjs
+import.meta.url  : file:///C:/Business/Internal%20Projects/.../check-edge-env-keys.mjs
+MATCH?           : false
+
+$ node scripts/check-edge-env-keys.mjs
+exit 0, and zero lines of output
+```
+
+**A check that cannot run at all is the purest form of this class**, and it is invisible precisely
+because there is no output to be suspicious of. There is no wrong sentence to catch, no misleading
+count, no branch to review — just a silent zero. It would have reported a healthy fleet forever,
+from a file whose own header documents the 93-minute ReplyFlow outage it was written to catch.
+
+Fixed to use `pathToFileURL`, the idiom the neighbouring checks in this same directory already use.
+With the network refused it now makes 17 outbound attempts and reports `INCONCLUSIVE`, exit 1. Its
+own suite is untouched and green: 14 passed, including a live sweep over 22 projects and 63
+credentials. Receipt: `9e82554`.
+
+**Why this is the strongest evidence in the audit.** Every other finding here was found by a session
+that went looking. This one was found by a machine, on a file written by somebody who had never read
+the guard, minutes after it landed, with no human in the loop. That is the difference between fixing
+seven instances and closing a class — and it is entirely a consequence of the population being a
+glob rather than a list. A hand-maintained list would have said 22 and been right about 22.
+
+Guard now: **100 assertions, 23 tracked checks × 4 faults, 0 failing. Whole repo green.**
 
 ---
 
