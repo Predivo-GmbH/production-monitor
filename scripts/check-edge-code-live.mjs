@@ -65,6 +65,7 @@ import { tmpdir } from 'os'
 
 import { boardSecret, fileSignal, signal } from './lib/fleet-signal.mjs'
 import { findTokenForProject } from './lib/supabase-token.mjs'
+import { sayVerdict, PASS, FAIL, UNKNOWN } from './lib/check-verdict.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const FLEET_ROOT = process.env.FLEET_ROOT || 'C:/Business/Internal Projects'
@@ -170,8 +171,29 @@ export function verdict({ findings, unproven = [], unreadable = [] }) {
     (unproven.length ? `, ${unproven.length} UNPROVEN` : '') +
     (unreadable.length ? `, ${unreadable.length} COULD NOT BE READ` : '')
 
+  // AN EMPTY POPULATION IS NOT A CLEAN ONE (2026-09-03, found by fault injection).
+  //
+  // Every branch below reasons about products this check ATTEMPTED. None of them asked whether
+  // there were any products to attempt. Emptying `repos` in lib/edge-code-baseline.json made
+  // this function fall through BLIND (needs `unreadable`), STALE (needs a finding) and PARTIAL
+  // (needs `unreadable`) and land on OK, which printed:
+  //
+  //     OK  every deployed edge function is at or ahead of its committed code (0 of 0 product(s) read)
+  //
+  // and exited 0. The slice count was right there in the sentence and still the verdict was OK,
+  // which is the whole lesson: a number printed beside a verdict does not change the verdict,
+  // and the exit code is what a workflow reads. A baseline that is empty, unparsed into the
+  // wrong key, or filtered to nothing by a future edit is a broken SENSOR, and a broken sensor
+  // is an incident about this check -- never a statement about the fleet.
+  if (!read && !unproven.length && !unreadable.length) {
+    return { state: 'UNKNOWN', code: 1, level: 'error', file: false, unknown: true,
+      headline: 'edge-code currency was not established for a single product, because there were none to check — '
+        + 'lib/edge-code-baseline.json yielded an empty repo list. Nothing was measured, so nothing is known; '
+        + 'this is a broken check, not a clean fleet' }
+  }
+
   if (!read && unreadable.length) {
-    return { state: 'BLIND', code: 1, level: 'error', file: false,
+    return { state: 'BLIND', code: 1, level: 'error', file: false, unknown: true,
       headline: `edge-code currency could not be established for any product (${slice})` }
   }
   const summary = summarise(findings)
@@ -388,6 +410,10 @@ async function main() {
 
   // A read that failed is not a clean bill of health, and neither is a clean read of a slice.
   const v = verdict({ findings, unproven, unreadable })
+  // Three-valued, out loud (lib/check-verdict.mjs). The exit code cannot carry this on its own:
+  // 0 legitimately means both "healthy" and "unhealthy and already filed", so a machine reading
+  // only the exit code cannot tell a clean fleet from a blind sensor.
+  sayVerdict(v.unknown ? UNKNOWN : v.file ? FAIL : PASS, v.headline)
   if (v.level === 'error') { console.error(`::error::${v.headline}`); return v.code }
   if (v.level === 'warning') console.error(`::warning::${v.headline}`)
   else console.log(`  OK  ${v.headline} (grace ${graceMs / HOUR_MS}h)`)
