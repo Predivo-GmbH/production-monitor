@@ -7,7 +7,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { machineOf, auditRunnerMachines, loadExpectedMachines } from '../scripts/lib/runner-machines.mjs'
+import { machineOf, auditRunnerMachines, loadExpectedMachines, loadRetiredMachines } from '../scripts/lib/runner-machines.mjs'
 
 const EXPECTED = ['DESKTOP-124K6MV', 'LAPTOP-88N97BGG']
 
@@ -123,3 +123,51 @@ test('the work PC is not a CI machine and must not reappear in the baseline', ()
   )
 })
 
+
+// ---------------------------------------------------------------------------------------------
+// 2026-09-03. Removing the work PC from the baseline was only half of it. The alert a future
+// session actually READS said "UNKNOWN MACHINE: ... Add it or remove it" - it offered putting the
+// machine back as an equally good option, which is precisely what happened on 2026-09-01. The
+// decision has to reach the reader, not sit in a file the alerting code never opens.
+const RETIRED = [{ machine: 'DESKTOP-124K6MV', decided: '2026-08-25', why: 'It is the work PC Roger uses, not a CI host.' }]
+const ONE = ['LAPTOP-88N97BGG']
+
+test('runners on a retired machine are an instruction to DELETE, never "add it or remove it"', () => {
+  const { alerts } = auditRunnerMachines([
+    { repo: 'cockpit', runners: [online('wsl-LAPTOP-88N97BGG-cockpit'), online('wsl-DESKTOP-124K6MV-cockpit')] },
+  ], { expected: ONE, retired: RETIRED })
+  const retired = alerts.filter((a) => a.startsWith('RETIRED MACHINE'))
+  assert.equal(retired.length, 1)
+  assert.match(retired[0], /DELETE those runners/)
+  assert.match(retired[0], /Do NOT add DESKTOP-124K6MV to the baseline/)
+  assert.match(retired[0], /work PC/, 'the alert must carry WHY, or the next reader re-decides it')
+  assert.equal(alerts.filter((a) => a.startsWith('UNKNOWN MACHINE')).length, 0,
+    'a retired machine must never be reported with the ambiguous "add it or remove it" wording')
+})
+
+test('a retired machine does not count as alive, so removing it raises no single-machine noise', () => {
+  const { alerts } = auditRunnerMachines([
+    { repo: 'cockpit', runners: [online('wsl-LAPTOP-88N97BGG-cockpit'), online('wsl-DESKTOP-124K6MV-cockpit')] },
+    { repo: 'predivo', runners: [online('wsl-LAPTOP-88N97BGG-predivo')] },
+  ], { expected: ONE, retired: RETIRED })
+  assert.equal(alerts.filter((a) => a.startsWith('SINGLE MACHINE')).length, 0,
+    'one real machine plus one retired one is the correct state, not 14 repositories of noise')
+  assert.equal(alerts.length, 1, 'the only thing worth saying is: delete those runners')
+})
+
+test('a machine that is genuinely new is still reported the old way', () => {
+  const { alerts } = auditRunnerMachines([
+    { repo: 'cockpit', runners: [online('wsl-LAPTOP-88N97BGG-cockpit'), online('wsl-NEWBOX-99AAAAAA-cockpit')] },
+  ], { expected: ONE, retired: RETIRED })
+  const unknown = alerts.filter((a) => a.startsWith('UNKNOWN MACHINE'))
+  assert.equal(unknown.length, 1)
+  assert.match(unknown[0], /NEWBOX-99AAAAAA/)
+})
+
+test('the retired list on disk names the work PC and says why, not just that', () => {
+  const retired = loadRetiredMachines()
+  const desk = retired.find((r) => r.machine === 'DESKTOP-124K6MV')
+  assert.ok(desk, "DESKTOP-124K6MV must be in `retired`: absence with no recorded reason is what a monitor reads as failure")
+  assert.ok((desk.why || '').length > 40, 'a retired entry without a reason teaches the next reader nothing')
+  assert.ok(desk.decided, 'record WHEN it was decided, so a later session can see it is not stale drift')
+})

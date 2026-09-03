@@ -27,7 +27,7 @@
  * it manufactures confidence.
  */
 import { writeFileSync } from 'node:fs'
-import { auditRunnerMachines, loadExpectedMachines } from './lib/runner-machines.mjs'
+import { auditRunnerMachines, loadExpectedMachines, loadRetiredMachines } from './lib/runner-machines.mjs'
 import { looksLikeRunnerLoss, confirmRunnerLoss, describeRunnerLoss, recentFailedRuns } from './lib/runner-loss.mjs'
 import { cancelledRequiredGates, describeCancelledGate, recentCancelledRuns } from './lib/cancelled-gate.mjs'
 
@@ -282,7 +282,7 @@ if (apiErrors) {
 // scripts/lib/runner-machines.mjs. Deliberately NOT wired to the RUNNER_LABEL flip: a missing
 // machine is a thing to tell Roger about, not a reason to start paying GitHub while the other
 // machine is working perfectly well.
-const machineAudit = auditRunnerMachines(perRepo, { expected: loadExpectedMachines() })
+const machineAudit = auditRunnerMachines(perRepo, { expected: loadExpectedMachines(), retired: loadRetiredMachines() })
 alerts.push(...machineAudit.alerts)
 for (const [machine, coveredRepos] of Object.entries(machineAudit.machines)) {
   console.log(`machine ${machine.padEnd(16)}: online in ${coveredRepos.length} repo(s)`)

@@ -1,13 +1,16 @@
 // WHICH PHYSICAL MACHINE IS ACTUALLY DOING OUR CI - and the alarm for when one of them stops.
 //
 // WHY THIS EXISTS (2026-09-01). The CI runner watchdog counted ONLINE RUNNERS PER REPOSITORY and
-// was satisfied by one. We run two machines, an office PC and a laptop, each with its own set of
-// runners in every repository. On 2026-08-25 all 24 of the office PC's runners had their
-// registrations DELETED by GitHub - the machine's WSL distro does not start at boot, nothing
-// restarted it, and GitHub removes a runner registration that has been offline too long. The
-// watchdog stayed green for a week, because the laptop's runners kept every repository's count
-// above zero. Half the fleet's CI capacity vanished and the only symptom was that jobs took
-// longer and one machine wore all the work.
+// was satisfied by one. The laptop's runners kept every repository's count above zero, so a whole
+// machine could leave the fleet without a single check going red.
+//
+// CORRECTION (2026-09-03). The commit that first wrote this file said the office PC's 24 runners
+// had been "deleted by GitHub" after being offline too long. That was never true. We deleted them
+// ON PURPOSE on 2026-08-25 when Roger retired his work PC as a CI host, and wrote it down twice.
+// The watchdog then read a deliberate retirement as damage and a session "repaired" it by putting
+// 24 runners back on his machine, which he had not agreed to. So this file now tracks BOTH lists:
+// machines that must be present, and machines that must NOT be - because absence with no recorded
+// reason is indistinguishable from failure, and the next reader will helpfully undo the decision.
 //
 // The lesson, and the rule this file encodes: A COUNT THAT AGGREGATES TWO MACHINES CANNOT SEE
 // ONE OF THEM DIE. Ask per machine, not per repository.
@@ -42,18 +45,31 @@ export function machineOf(runnerName) {
   return m ? m[1] : null
 }
 
-export function loadExpectedMachines() {
+function loadBaseline() {
   const here = dirname(fileURLToPath(import.meta.url))
-  const raw = JSON.parse(readFileSync(join(here, 'ci-runner-machines-baseline.json'), 'utf8'))
-  return raw.machines
+  return JSON.parse(readFileSync(join(here, 'ci-runner-machines-baseline.json'), 'utf8'))
+}
+
+export function loadExpectedMachines() {
+  return loadBaseline().machines
+}
+
+/**
+ * Machines that are deliberately NOT CI hosts, with the reason the decision was made.
+ * Runners found on one of these are the fault; the machine's silence is correct.
+ */
+export function loadRetiredMachines() {
+  return loadBaseline().retired || []
 }
 
 /**
  * @param {Array<{repo: string, runners: Array<{name: string, status: string}>}>} perRepo
- * @param {{expected: string[]}} opts  machines we expect to exist (the baseline file)
+ * @param {{expected: string[], retired?: Array<{machine: string, why?: string, decided?: string}>}} opts
+ *   `expected` = machines that must be present; `retired` = machines that must NOT be (the baseline file)
  * @returns {{machines: object, alerts: string[], unattributed: string[]}}
  */
-export function auditRunnerMachines(perRepo, { expected }) {
+export function auditRunnerMachines(perRepo, { expected, retired = [] }) {
+  const retiredBy = new Map((retired || []).map((r) => [r.machine, r]))
   const machines = {}          // machine -> Set of repos where it has an ONLINE runner
   const unattributed = []      // runner names we could not attribute to a machine
   const reposWithRunners = []
@@ -85,9 +101,19 @@ export function auditRunnerMachines(perRepo, { expected }) {
   }
 
   // A machine we did NOT expect is not an error, but it must not pass unremarked - it is either a
-  // new machine nobody wrote down or a name that changed under us.
+  // new machine nobody wrote down, a name that changed under us, or a machine somebody RETIRED.
+  // The retired case must never be offered "add it or remove it": that ambiguity is exactly how a
+  // decision Roger made got undone on 2026-09-01. It gets one instruction, and it carries the why.
   for (const m of Object.keys(machines)) {
-    if (!expected.includes(m)) {
+    if (expected.includes(m)) continue
+    const r = retiredBy.get(m)
+    if (r) {
+      alerts.push(
+        `RETIRED MACHINE: ${m} has online runners and it is NOT a CI host. DELETE those runners. ` +
+        `Do NOT add ${m} to the baseline - it is absent on purpose` +
+        (r.decided ? ` (decided ${r.decided})` : '') + '. ' + (r.why || ''),
+      )
+    } else {
       alerts.push(`UNKNOWN MACHINE: ${m} has online runners but is not in the baseline. Add it or remove it.`)
     }
   }
@@ -95,7 +121,7 @@ export function auditRunnerMachines(perRepo, { expected }) {
   // 2. Only worth asking once at least two machines are actually alive - with one machine left,
   //    "this repo has one machine" is the same fact as the MACHINE GONE alert above, and saying it
   //    once per repository would bury it.
-  const alive = Object.keys(machines).filter((m) => machines[m].size > 0)
+  const alive = Object.keys(machines).filter((m) => machines[m].size > 0 && !retiredBy.has(m))
   if (alive.length >= 2) {
     for (const repo of reposWithRunners) {
       const covering = alive.filter((m) => machines[m].has(repo))

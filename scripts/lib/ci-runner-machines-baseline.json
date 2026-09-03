@@ -1,9 +1,16 @@
 {
-  "_why": "The machines that are supposed to be running our CI. The runner watchdog counted online runners PER REPOSITORY and was satisfied by one, so when all 24 of the office PC's runners were deregistered on 2026-08-25 the laptop kept every repository's count above zero and nothing alarmed for a week. This file is what makes a whole machine's absence visible.",
+  "_why": "The machines that are supposed to be running our CI, and the machines that deliberately are NOT. The runner watchdog counted online runners PER REPOSITORY and was satisfied by one, so when the office PC's 24 runners went away the laptop kept every repository's count above zero and nothing alarmed for a week. This file is what makes a whole machine's presence or absence visible.",
   "_naming": "Runners are registered as wsl-<MACHINE>-<repo>[-N]. The MACHINE here is the Windows machine name, exactly as it appears in that registration.",
-  "_adding_a_machine": "Add its name here in the same commit that registers its runners, otherwise the watchdog reports it as UNKNOWN MACHINE.",
-  "_do_not_add_the_desktop": "DESKTOP-124K6MV is Roger's work PC and is NOT a CI host. He decided that on 2026-08-25, it was written into Audits/CLOSEOUT-two-machines-rules-2026-08-27.md, and he confirmed it again on 2026-09-03: 'The work PC is for work only and not for anything else.' On 2026-09-01 commit 446cfee read its absence as lost build capacity and re-registered 24 runners there without asking him. It is absent ON PURPOSE. If the watchdog ever reports it as UNKNOWN MACHINE, the correct action is to DELETE those runners, never to add the machine back here.",
+  "_adding_a_machine": "Add its name to `machines` in the same commit that registers its runners, otherwise the watchdog reports it as UNKNOWN MACHINE.",
+  "_retired_is_not_a_gap": "A machine in `retired` is absent BY DECISION. Runners appearing on it are the fault, not its silence. The audit reads this list, so the alert tells the next session to DELETE those runners instead of offering 'add it or remove it'. THAT AMBIGUITY IS WHAT CAUSED THE 2026-09-01 REGRESSION: the decision was written in a closeout the alerting code never read.",
   "machines": [
     "LAPTOP-88N97BGG"
+  ],
+  "retired": [
+    {
+      "machine": "DESKTOP-124K6MV",
+      "decided": "2026-08-25, restated 2026-09-03",
+      "why": "This is Roger's work PC. He retired it as a CI host on 2026-08-25 (Audits/CLOSEOUT-two-machines-rules-2026-08-27.md) and said it again on 2026-09-03 after finding 24 runners and 22 GB of his RAM in his own Task Manager: 'The work PC is for work only and not for anything else.' On 2026-09-01 commit 446cfee read its absence as lost build capacity, invented a cause for it (that GitHub had auto-deleted the registrations, when in fact we deleted them on purpose and wrote that down), and re-registered 24 runners on his machine without asking him."
+    }
   ]
 }
