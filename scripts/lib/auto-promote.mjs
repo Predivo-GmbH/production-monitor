@@ -74,7 +74,15 @@ export function decide(p) {
   if (p.compareStatus === 'diverged') {
     return { promote: false, reason: `${repo}: staging and production have drifted apart - this needs merging, not promoting` }
   }
-  if (p.compareStatus !== 'behind' && p.compareStatus !== 'ahead') {
+  // ONLY "ahead" is promotable. The compare is prod...staging (base=prod, head=staging), so
+  // GitHub's "ahead" means staging holds commits production does not - the real promote case.
+  // "behind" means staging is BEHIND production (production already has newer code): there is
+  // nothing to promote, and shipping would dispatch main HEAD the cited staging run never covered.
+  // The sibling reader promotion-backlog.mjs:62 treats the identical call as "ahead" only.
+  if (p.compareStatus === 'behind') {
+    return { promote: false, reason: `${repo}: nothing to promote, production is already ahead of staging` }
+  }
+  if (p.compareStatus !== 'ahead') {
     return { promote: false, reason: `${repo}: could not establish how staging relates to production (compare said "${p.compareStatus ?? 'nothing'}") - refusing to ship blind` }
   }
   // THE FULL GATE SET, on the very run that produced this staging build. Roger's condition was

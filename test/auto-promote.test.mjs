@@ -11,7 +11,7 @@ import { decide, pickOne, isAutoPromotable, AUTO_PROMOTABLE, REQUIRED_STAGING_JO
 const green = { 'deploy-staging': 'success', 'e2e-staging': 'success' }
 const ok = (o = {}) => ({
   repo: 'backoffice', prodSha: 'aaaaaaa', stagingSha: 'bbbbbbb',
-  compareStatus: 'behind', stagingJobs: green, fleetBusy: false, ...o,
+  compareStatus: 'ahead', stagingJobs: green, fleetBusy: false, ...o,
 })
 
 test('THE LINE THAT MUST NOT MOVE: no customer-facing product is ever auto-promoted', () => {
@@ -74,6 +74,18 @@ test('nothing to promote when production already has the commit', () => {
   const d = decide(ok({ prodSha: 'ccc', stagingSha: 'ccc' }))
   assert.equal(d.promote, false)
   assert.match(d.reason, /already has it/)
+})
+
+test('DIRECTION: "behind" is REFUSED - staging behind production means nothing to promote', () => {
+  // The compare is prod...staging, so "behind" = staging is behind production, i.e. production
+  // already holds newer code. Promoting here would ship main HEAD the staging run never covered.
+  const d = decide(ok({ compareStatus: 'behind' }))
+  assert.equal(d.promote, false)
+  assert.match(d.reason, /already ahead of staging/)
+})
+
+test('DIRECTION: only "ahead" promotes - staging ahead of production is the real promote case', () => {
+  assert.equal(decide(ok({ compareStatus: 'ahead' })).promote, true)
 })
 
 test('THE FULL GATE SET, on the exact commit - a missing job is a refusal, not a pass', () => {
