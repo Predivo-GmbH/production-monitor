@@ -268,3 +268,52 @@ months. The question a monitoring audit has to ask is not *what does this check 
 And the reason this is a guard and not a seventh fix: **six agents fixing six instances correctly is
 still zero defence against the seventh.** The population has to be discovered by the machine, on
 every run, or the audit is just a snapshot of what one session happened to look at.
+
+---
+
+## What the guard caught in its first hours (2026-09-03, appended after the fact)
+
+Three more instances, all found by the ratchet rather than by reading. Worth recording because two
+of the three were written by someone who had just finished writing the guard, which is the point.
+
+**1. `check-edge-env-keys.mjs` — the new check could not run at all.** It shipped with the entry
+condition every script in this repo uses:
+
+```js
+import.meta.url === pathToFileURL(process.argv[1] || '').href
+```
+
+That matched on the development workstation and did not match on the GitHub runner. On CI the
+process printed nothing and exited 0. All four faults failed with *"reported a PASS ... verdict NONE
+DECLARED"* over an **empty stdout**, and the empty stdout is the proof: the judgement inside — which
+already returned `inconclusive` for a sweep that judged nothing, the exact third state this document
+is about — was never reached. Comparing two URL strings compares two *spellings* of a path; percent
+encoding, a symlinked checkout and a relative `argv[1]` each let one file spell itself two ways. It
+now compares the two **realpaths** and asks the filesystem, which has one answer.
+
+Seventeen unit tests were green throughout. They imported the functions and never asked whether the
+file *runs*. Three assertions now spawn it the way a workflow does and demand output and a declared
+state.
+
+**2. `check-laundered-failures.mjs` — the prose was right and the contract was not.** With no
+`results.json` it printed `UNPROVEN` and then, in the next line, *"This is NOT an all-clear"* — and
+exited 0. Exit 0 is deliberate there (a missing report is the Playwright step's alarm, not this
+script's) but an exit code is the only thing most callers read, and 0 means fine to every one of
+them. All four of its exit paths now declare a state. **An honest sentence in a log is not a
+contract; the caller never reads it.**
+
+**3. The guard was merged and scheduled nowhere.** Thirty-three checks are wired into `monitor.yml`
+by name. The new one was the thirty-fourth and was not among them, so it ran nowhere — the same
+defect it was written to catch, in the same day, by the same hand. And it could not simply be added:
+it discovered its tokens by reading the credential files under the fleet checkout, which do not
+exist on a runner, so every scheduled run would have reported `UNKNOWN`. True, useless, and the kind
+of permanent amber an alarm gets trained to ignore.
+
+Proven live in run 33737571286 on master: *22 projects locally, 10 projects and 35 credentials from
+CI, 0 failing, verdict pass.*
+
+**That difference is the one thing here still open.** The runner holds five `SUPABASE_TOKEN_*`
+secrets and the workstation holds tokens for all twenty-two projects, so the scheduled run judges
+**ten of twenty-two**. It is not wrong — every credential it judged, it judged correctly — but a
+reader of the log cannot tell that twelve projects were never looked at, and "0 failing" over an
+unstated population is the shape this whole audit is about.
