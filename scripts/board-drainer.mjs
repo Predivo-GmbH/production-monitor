@@ -1558,6 +1558,23 @@ export async function routeToWorkBoard(inc, cls, deps) {
     if (join && join.ambiguous) {
       deps.log?.(`    ${join.count} live in-progress items match at tier ${join.tier} — too ambiguous to join safely, opening a row instead`)
     }
+    // The lane this minted item lands in is DERIVED from the classification, never hardcoded.
+    // classify() already decided who this finding belongs to. The SECOND call site — the parked-
+    // handover queue at :2634 — routes EVERY parked finding here regardless of cls.owner, so a
+    // claude-owned dev task the auto-fixer merely gave up on would otherwise be re-minted onto
+    // Roger's lane: work we own landing on his list. Mint from cls.owner instead:
+    //   owner 'claude' -> status 'next', no blocked_owner (Cockpit sql/061 strips owner cols on 'next');
+    //   anything else   -> status 'blocked' / blocked_owner 'roger', the lane Cockpit sql/062 shows him.
+    // The safe default is Roger's lane: an unknown or absent owner is one a person should see, not one
+    // silently parked on 'next' where nobody looks.
+    const mintForClaude = String(cls?.owner || '').toLowerCase() === 'claude'
+    // The board asks the reader to DO something, so blocked_question is the prescribed ACTION, not a
+    // restatement of the problem. actionOf() strips the 'Roger -'/'Claude -' prefix; fall back to the
+    // title only when the finding carries no action at all.
+    const action = actionOf(inc)
+    const laneFields = mintForClaude
+      ? { status: 'next', blocked_question: action || title }
+      : { status: 'blocked', blocked_owner: 'roger', blocked_question: action || title }
     const item = await deps.createItem({
       slug,
       title,
@@ -1581,17 +1598,16 @@ export async function routeToWorkBoard(inc, cls, deps) {
       // unparseable one, falls back to the column default rather than making an item look younger
       // than it is. Ageing an item is safe; rejuvenating one is the bug being fixed.
       ...mintOpenedAt(inc),
-      // This item is here BECAUSE the drainer classified it as needing Roger's hands. It must land
-      // in his lane. Cockpit sql/062 derives the lane from `status`: only 'blocked'/'awaiting_signoff'
-      // reach 'your_turn' (needs_you=true); 'next' is matched one branch earlier and derives lane='next',
-      // needs_you=false — where he never sees it (Dashboard tile, session-start NEEDS ROGER, work_board).
-      // So mint it 'blocked' with blocked_owner 'roger'. Nothing is lost: sql/061 only strips the owner
-      // columns on 'next' rows, and this item is minted with no owner_session/claimed_at either way.
-      status: 'blocked',
+      // The lane is DERIVED (see laneFields above), not hardcoded. Cockpit sql/062 derives the lane
+      // from `status`: only 'blocked'/'awaiting_signoff' reach 'your_turn' (needs_you=true) — where a
+      // finding that genuinely needs Roger's hands must land (Dashboard tile, session-start NEEDS
+      // ROGER, work_board). A claude-owned finding handed here by the parked-handover queue instead
+      // gets 'next' (lane='next', needs_you=false), which is correct: the machine still owns it and it
+      // must NOT sit on Roger's list. Nothing is lost either way: this item is minted with no
+      // owner_session/claimed_at, and sql/061 only strips the owner columns on 'next' rows.
       source: 'monitor',
       opened_by: 'board-drainer',
-      blocked_owner: 'roger',
-      blocked_question: title,
+      ...laneFields,
     })
     itemId = item?.id ?? null
     created = true

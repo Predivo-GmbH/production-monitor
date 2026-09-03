@@ -1179,6 +1179,41 @@ ta('a hand-off is born unowned, from the monitor, and in the lane Roger can see'
   assert.ok(needsYou(item), 'a handed-off item MUST be one work_board.needs_you can see (Cockpit sql/062)')
 })
 
+ta('PARKED claude-owned finding routed through the queue NEVER mints blocked_owner=roger', async () => {
+  // The mechanism behind board-drainer re-owning dev work to Roger (2026-08-20/23, and 09-03): the
+  // parked-handover queue (:2634) calls routeToWorkBoard for ANY parked finding regardless of
+  // cls.owner. A finding classify() decided is Claude's must be minted on 'next', not Roger's lane.
+  const b = fakeBoard()
+  const inc = {
+    source: 'production-monitor', key: 'fleet-signals-list-detail-drops-who-must-act',
+    title: 'The list view drops who_must_act, so the detail shows nobody to act',
+    severity: 'warning', status: 'blocked', opened_at: '2026-09-01T10:00:00Z',
+    who_must_act: 'Claude - re-queue to a non-concurrent engineering run and author the coercion migration',
+    root_cause: 'The list->detail join drops the column.',
+  }
+  const cls = classify(inc)
+  assert.equal(cls.owner, 'claude', 'precondition: classify() owns this to Claude')
+  // Called EXACTLY as the parked-handover queue at :2634 does.
+  await routeToWorkBoard(inc, { ...cls, reason: 'auto-fix gave up after 3 attempts' }, b.deps)
+  const item = [...b.items.values()][0]
+  assert.equal(item.status, 'next', "a claude-owned parked finding lands on 'next', not Roger's lane")
+  assert.notEqual(String(item.blocked_owner || '').toLowerCase(), 'roger', 'it NEVER mints blocked_owner=roger')
+  assert.ok(!needsYou(item), 'and it is not something work_board.needs_you shows Roger')
+})
+
+ta('blocked_question is the prescribed ACTION, never byte-identical to the title', async () => {
+  // The board renders "Action: <blocked_question>". Set to the title it states the PROBLEM, not what
+  // to DO. It comes from the prescribed action (actionOf), falling back to the title only when the
+  // finding carries no action at all.
+  const b = fakeBoard()
+  const inc = rogerInc()
+  await routeToWorkBoard(inc, classify(inc), b.deps)
+  const item = [...b.items.values()][0]
+  const { title } = plainTitle(inc)
+  assert.notEqual(item.blocked_question, title, 'blocked_question is not a copy of the title')
+  assert.equal(item.blocked_question, actionOf(inc), 'it is the prescribed action, prefix stripped')
+})
+
 // ── the queue: a hand-off costs no agent run and no blast-radius budget ───────────────────
 
 t('QUEUE: hand-offs are recorded without an agent and do NOT eat the per-run cap', () => {
