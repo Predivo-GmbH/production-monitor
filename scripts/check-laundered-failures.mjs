@@ -31,12 +31,18 @@
  */
 import { readFileSync, existsSync } from 'fs'
 import { findLaunderedFailures } from './lib/parse-failures.mjs'
+import { sayVerdict, PASS, FAIL, UNKNOWN } from './lib/check-verdict.mjs'
 
 const RESULTS = process.env.PLAYWRIGHT_RESULTS || 'test-results/results.json'
 
 if (!existsSync(RESULTS)) {
   console.log(`UNPROVEN: ${RESULTS} does not exist, so no test was checked for a laundered failure.`)
   console.log('This is NOT an all-clear. The Playwright step and send-alert.mjs report a missing report.')
+  // The prose above already said this is not an all-clear, and said it to a human who may never
+  // read the log. Exit 0 is deliberate here - the missing report is somebody else's alarm - but an
+  // exit code is the only thing most callers read, and 0 means "fine" to every one of them. Say the
+  // third state out loud so the blindness travels with the run.
+  sayVerdict(UNKNOWN, `${RESULTS} does not exist, so no test was checked for a laundered failure`)
   process.exit(0)
 }
 
@@ -45,6 +51,7 @@ try {
   results = JSON.parse(readFileSync(RESULTS, 'utf-8'))
 } catch (e) {
   console.log(`UNPROVEN: cannot parse ${RESULTS} (${e.message}), so no test was checked.`)
+  sayVerdict(UNKNOWN, `${RESULTS} is unreadable (${e.message}), so no test was checked`)
   process.exit(0)
 }
 
@@ -57,6 +64,7 @@ if (laundered.length === 0) {
     + `or passed on a retry. Checked ${stats.expected ?? '?'} passed / ${stats.unexpected ?? '?'} failed / `
     + `${stats.flaky ?? '?'} flaky / ${stats.skipped ?? '?'} skipped.`,
   )
+  sayVerdict(PASS, `no laundered failure across ${stats.expected ?? '?'} passed / ${stats.unexpected ?? '?'} failed / ${stats.flaky ?? '?'} flaky`)
   process.exit(0)
 }
 
@@ -72,4 +80,5 @@ for (const row of laundered) {
 console.log('')
 console.log('A retry that does not re-test cannot clear the attempt that failed. Fix the spec so the')
 console.log('retry either re-tests or fails — do not silence this step.')
+sayVerdict(FAIL, `${laundered.length} test(s) failed and were not counted as failures`)
 process.exit(1)
