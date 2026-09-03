@@ -44,6 +44,29 @@ const UA = 'promotion-backlog/1.0'
 
 const OWNER = process.env.PROMO_OWNER || 'Predivo-GmbH'
 
+// How far back the run history is searched for a deploy job that actually SUCCEEDED.
+//
+// ⭐ THE 22:19Z RED (monitor run 33810988565). This sweep read backoffice fine at 22:04:58Z
+// ("5 commit(s) waiting 33.5h") and called it UNREADABLE fifteen minutes later, which exits 1 and
+// reds the hourly monitor. Nothing about backoffice had changed. The window was a single page of
+// 30 runs of the WHOLE repo, and backoffice fires Sync Outreach, Secret Scan, IMAP Poll, edge
+// deploys and staging gates all hour: at 22:19 those 30 runs reached back only to 17:47:42Z, and
+// the last successful production `deploy` job was run 33786226567 at 17:43:23Z (sha 6f35d6c).
+// It missed by FOUR MINUTES.
+//
+// The bug is the unit. A window counted in RUNS goes blind fastest on the repo that deploys most,
+// because in every `Deploy` run the `deploy` job is SKIPPED on a staging push (measured on
+// 33800039519 / 33797511598 / 33793868640: `deploy-staging` success, `deploy` skipped). So the one
+// event being searched for is the RAREST thing in the window, and the busier the repo the further
+// out of reach it gets — the sensor loses sight of production exactly where shipping matters most.
+//
+// Paging until it is found makes the search proportional to the answer instead of to the noise.
+// The cap keeps it bounded on a shared allowance, and `exhausted` records whether the history
+// genuinely ran out — because "no successful deploy job" is an inference from however far you
+// looked, and a bounded look must say so rather than assert an absolute absence.
+const RUNS_PER_PAGE = 100
+export const MAX_RUN_PAGES = 4
+
 // Products that ship a website to the shared host and have a staging environment.
 const FLEET = (process.env.PROMO_FLEET || 'ChannelMover,ScoutCopilot,Valrano,BoatBuddy,ReplyFlow,backoffice,distribution-os,signalscore')
   .split(',').map((s) => s.trim()).filter(Boolean)
@@ -78,18 +101,33 @@ async function main() {
     } catch (e) { apiErrors++; lastApiError = `GET ${path} -> ${e.message}`; return null }
   }
 
-  /** The head sha of the most recent run whose named job actually SUCCEEDED. Never the run colour. */
-  async function lastDeployedSha(repo, isWanted, jobName) {
-    const runs = await gh(`/repos/${OWNER}/${repo}/actions/runs?per_page=30`)
-    if (!runs?.workflow_runs) return null
-    for (const run of runs.workflow_runs) {
-      if (!isWanted(String(run.name || ''))) continue
-      const jobs = await gh(`/repos/${OWNER}/${repo}/actions/runs/${run.id}/jobs?per_page=50`)
-      const job = (jobs?.jobs || []).find((j) => j.name === jobName)
-      if (job?.conclusion === 'success') return run.head_sha
+  // ONE page of run history per repo, and ONE jobs read per run, shared by BOTH lookups below.
+  // The prod and staging scans walk the SAME runs, so without this every app-deploy run was read
+  // twice and every history page fetched twice, on a token whose allowance is shared fleet-wide.
+  const pages = new Map()   // `${repo}#${page}`  -> runs[] | null   (null = that read failed)
+  const jobsOf = new Map()  // `${repo}#${runId}` -> jobs[] | null
+  async function runsPage(repo, page) {
+    const key = `${repo}#${page}`
+    if (!pages.has(key)) {
+      const r = await gh(`/repos/${OWNER}/${repo}/actions/runs?per_page=${RUNS_PER_PAGE}&page=${page}`)
+      pages.set(key, r?.workflow_runs || null)
     }
-    return null
+    return pages.get(key)
   }
+  async function jobsFor(repo, runId) {
+    const key = `${repo}#${runId}`
+    if (!jobsOf.has(key)) {
+      const j = await gh(`/repos/${OWNER}/${repo}/actions/runs/${runId}/jobs?per_page=50`)
+      jobsOf.set(key, j?.jobs || null)
+    }
+    return jobsOf.get(key)
+  }
+  const lastDeployed = (repo, jobName) => findLastDeployedSha({
+    getRunsPage: (page) => runsPage(repo, page),
+    getJobs: (runId) => jobsFor(repo, runId),
+    isWanted: isAppDeployRun,
+    jobName,
+  })
 
   const results = []
   const unreadable = []
@@ -102,11 +140,16 @@ async function main() {
     // more frequent, won the scan. This board then reported backoffice and Distribution-OS against
     // an edge-functions sha - Distribution-OS's "behind 8" on Roger's deploy page was really
     // behind 1. Measured across all eight products; only those two change.
-    const prod = await lastDeployedSha(repo, isAppDeployRun, 'deploy')
-    const staging = await lastDeployedSha(repo, isAppDeployRun, 'deploy-staging')
+    const prodRes = await lastDeployed(repo, 'deploy')
+    const stagingRes = await lastDeployed(repo, 'deploy-staging')
+    const prod = prodRes.sha
+    const staging = stagingRes.sha
     if (!prod || !staging) {
       unreadable.push(describeUnreadable({
         repo, prod: !!prod, staging: !!staging, cause: apiErrors > errorsBefore ? lastApiError : null,
+        // How far the half that came back EMPTY actually looked. Reporting the other half's span
+        // would overstate the search that failed.
+        searched: prod ? stagingRes : prodRes,
       }))
       continue
     }
@@ -204,13 +247,60 @@ async function main() {
  * successful deploy job of that name to find. That is a different problem with a different fix,
  * and the old message could not tell the two apart. Pure.
  */
-export function describeUnreadable({ repo, prod, staging, cause, comparing = false }) {
+/**
+ * The head sha of the most recent run whose named job actually SUCCEEDED — never the run colour,
+ * and never merely the most recent run that LOOKS like a deploy.
+ *
+ * Walks run history a page at a time and STOPS at the first success, so a repo that deploys often
+ * costs one page and a repo drowning in unrelated workflow noise keeps looking instead of going
+ * blind. See MAX_RUN_PAGES for the 22:19Z red that this shape exists for.
+ *
+ * Returns `{ sha, scanned, oldest, exhausted }`. `exhausted` is true ONLY when the repo's history
+ * genuinely ended inside the cap; a null sha with `exhausted:false` means "not found this far
+ * back", which is a different sentence and must stay one. Fetchers are injected so the paging is
+ * testable without a network.
+ */
+export async function findLastDeployedSha({
+  getRunsPage, getJobs, isWanted, jobName,
+  maxPages = MAX_RUN_PAGES,
+  // A short page is how "the history ran out" is detected, so the size the FETCHER actually asks
+  // for has to be the size compared against. Reading it off a module constant instead silently
+  // mislabels a bounded search as an exhausted one the moment the two disagree.
+  pageSize = RUNS_PER_PAGE,
+}) {
+  let scanned = 0
+  let oldest = null
+  for (let page = 1; page <= maxPages; page++) {
+    const runs = await getRunsPage(page)
+    // A failed read is NOT an empty history. Bail without claiming the history ran out; the
+    // caller's apiErrors counter is what turns this into a named cause.
+    if (!runs) return { sha: null, scanned, oldest, exhausted: false }
+    for (const run of runs) {
+      scanned++
+      if (run?.created_at) oldest = run.created_at
+      if (!isWanted(String(run?.name || ''))) continue
+      const jobs = await getJobs(run.id)
+      const job = (jobs || []).find((j) => j.name === jobName)
+      if (job?.conclusion === 'success') return { sha: run.head_sha, scanned, oldest, exhausted: false }
+    }
+    if (runs.length < pageSize) return { sha: null, scanned, oldest, exhausted: true }
+  }
+  return { sha: null, scanned, oldest, exhausted: false }
+}
+
+export function describeUnreadable({ repo, prod, staging, cause, comparing = false, searched = null }) {
   const what = comparing
     ? `${repo} (compare failed)`
     : `${repo} (prod=${prod ? 'ok' : 'unknown'}, staging=${staging ? 'ok' : 'unknown'})`
-  return cause
-    ? `${what} - ${cause}`
-    : `${what} - the GitHub API answered; no successful deploy job of that name was found`
+  if (cause) return `${what} - ${cause}`
+  // HOW FAR IT LOOKED is part of the claim. The old sentence asserted a flat absence after reading
+  // ONE page of 30 runs, which is how backoffice was called unreadable at 22:19Z while its
+  // production deploy sat four minutes past the edge of the window.
+  const span = !searched ? ''
+    : searched.exhausted
+      ? ` in this repo's entire run history (${searched.scanned} run(s))`
+      : ` in the last ${searched.scanned} run(s)${searched.oldest ? `, back to ${searched.oldest}` : ''}`
+  return `${what} - the GitHub API answered; no successful deploy job of that name was found${span}`
 }
 
 /** The board signal for one product that is behind or split. Pure. */
