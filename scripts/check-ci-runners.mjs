@@ -29,6 +29,7 @@
 import { writeFileSync } from 'node:fs'
 import { auditRunnerMachines, loadExpectedMachines } from './lib/runner-machines.mjs'
 import { looksLikeRunnerLoss, confirmRunnerLoss, describeRunnerLoss, recentFailedRuns } from './lib/runner-loss.mjs'
+import { cancelledRequiredGates, describeCancelledGate, recentCancelledRuns } from './lib/cancelled-gate.mjs'
 
 const OWNER = process.env.CI_RUNNER_OWNER || 'Predivo-GmbH'
 const TOKEN = process.env.GH_TOKEN || process.env.GITHUB_TOKEN
@@ -242,6 +243,24 @@ for (const repo of repos) {
         confirmed = confirmRunnerLoss(ann)
       }
       alerts.push(describeRunnerLoss({ repo, run, job, confirmed }))
+    }
+  }
+
+  // WAS A REQUIRED GATE CANCELLED RATHER THAN FAILED? (an invisible release blocker)
+  //
+  // The block above catches a runner destroyed mid-job (conclusion=failure, no completed steps).
+  // This catches the sibling blind spot the same PRESENCE-watchers also miss: a required GATE that
+  // concluded `cancelled` — a job the production `deploy` needs:, killed at its own timeout while
+  // the run's other jobs succeeded. A cancelled job is not a red run, so nothing else here sees it;
+  // that is exactly how ChannelMover run 33680699080 blocked a release with every watcher green.
+  // See scripts/lib/cancelled-gate.mjs for the signature and why it cannot fire on a superseded run.
+  // Same bounded, cheap shape as the runner-loss block above; the run conclusion is `cancelled` when
+  // a gate is singled out, so status=cancelled is the correct cheap prefilter.
+  const cancelledRuns = await gh(`repos/${OWNER}/${repo}/actions/runs?status=cancelled&per_page=10`)
+  for (const run of recentCancelledRuns(cancelledRuns?.workflow_runs, { lookbackMinutes: RUNNER_LOSS_LOOKBACK_MIN })) {
+    const jobs = await gh(`repos/${OWNER}/${repo}/actions/runs/${run.id}/jobs?per_page=50`, {}, { soft: true })
+    for (const job of cancelledRequiredGates(jobs?.jobs)) {
+      alerts.push(describeCancelledGate({ repo, run, job }))
     }
   }
 }
