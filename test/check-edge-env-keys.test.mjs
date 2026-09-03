@@ -99,6 +99,41 @@ t('DEFECT: zero credentials judged reports INCONCLUSIVE, not pass', () => {
   assert.equal(summarise([a]).verdict, 'inconclusive')
 })
 
+// ── A PROJECT WE COULD NOT OPEN IS NOT A PROJECT WE CLEARED ───────────────────────────────
+// The exact partial-failure blindness of the 2026-09-02 outage: the sweep discovers many projects,
+// twenty load clean, and the ONE holding the revoked key answers non-200 on /secrets and is dropped
+// before it can be judged. Before this test, checked>0 and failing===0 printed PASS while the guilty
+// project was never looked at. The ratchet in a-check-cannot-pass-without-reaching-its-dependency
+// only injects all-or-nothing faults (every project fails together -> inconclusive), so this partial
+// shape lived under it. summarise() is now told which projects were unreadable and must not pass.
+const partialFetch = async (url) => {
+  const projA = { ref: 'rA', name: 'CleanProj' }
+  const projB = { ref: 'rB', name: 'ReplyFlow' }   // the one whose env holds the revoked key, unread
+  if (url === 'https://api.supabase.com/v1/projects') return new Response(JSON.stringify([projA, projB]), { status: 200 })
+  if (url.includes('/projects/rA/')) {
+    if (url.includes('/api-keys/legacy')) return new Response(JSON.stringify({ enabled: false }), { status: 200 })
+    if (url.includes('/api-keys')) return new Response(JSON.stringify([{ api_key: 'live-secret', type: 'secret', name: 'default' }]), { status: 200 })
+    if (url.includes('/secrets')) return new Response(JSON.stringify([{ name: 'SB_SECRET_KEY', value: digest('live-secret') }]), { status: 200 })
+  }
+  if (url.includes('/projects/rB/')) {
+    if (url.includes('/secrets')) return new Response('upstream error', { status: 500 })   // <- the partial failure
+    if (url.includes('/api-keys/legacy')) return new Response(JSON.stringify({ enabled: false }), { status: 200 })
+    if (url.includes('/api-keys')) return new Response(JSON.stringify([{ api_key: 'x', type: 'secret', name: 'default' }]), { status: 200 })
+  }
+  return new Response('not found', { status: 404 })
+}
+// The await is at top level (the harness's t() runs its body synchronously), then the asserts below
+// close over the result. This mirrors the LIVE section further down.
+const partial = await sweep({ fetchImpl: partialFetch, tokens: [{ token: 'sbp_test' }], withMeta: true })
+t('DEFECT: one project answers 500 while the rest load clean — verdict is NOT pass', () => {
+  assert.equal(partial.audits.length, 1, 'only CleanProj loaded')
+  assert.equal(partial.audits[0].name, 'CleanProj')
+  assert.deepEqual(partial.unreadable.map((u) => u.name), ['ReplyFlow'], 'the project that answered 500 is recorded as unreadable, not dropped silently')
+  const v = summarise(partial.audits, { unreadable: partial.unreadable }).verdict
+  assert.notEqual(v, 'pass', 'a sweep that could not read a project must never report pass')
+  assert.equal(v, 'inconclusive')
+})
+
 t('a clean project passes and says how many it judged', () => {
   const a = auditProject({
     name: 'p', ref: 'r', legacyDisabled: true, known,

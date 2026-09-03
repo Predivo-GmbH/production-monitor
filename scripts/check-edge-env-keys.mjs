@@ -127,17 +127,29 @@ export function auditProject({ name, ref, secrets, known, legacyDisabled }) {
   }
 }
 
-/** One line per project, and the verdict a caller can assert on. */
-export function summarise(audits) {
+/**
+ * One line per project, and the verdict a caller can assert on.
+ *
+ * `unreadable` is the projects the sweep discovered but could NOT open — /api-keys or /secrets did
+ * not answer 200, so loadProject() returned null and the project was dropped before it was judged.
+ * It is passed in separately because `audits` holds only the projects that loaded, and an array of
+ * the projects we DID look at can never say which ones we could not. A project we could not read is
+ * not a project we cleared: any unreadable project makes the verdict inconclusive, never a pass —
+ * the exact "a check that cannot look must not say fine" contract this whole tree enforces. A real
+ * `fail` still wins, because a revoked key we DID find is the outage, and it needs a person now.
+ */
+export function summarise(audits, { unreadable = [] } = {}) {
   const failing = audits.filter((a) => a.failures.length)
   const checked = audits.reduce((n, a) => n + a.checked, 0)
+  // Blind = judged nothing at all, OR judged everything it could reach but could not reach some.
+  const blind = checked === 0 || unreadable.length > 0
   return {
     projects: audits.length,
     checked,
     failing: failing.length,
     warnings: audits.reduce((n, a) => n + a.warnings.length, 0),
-    // A sweep that judged nothing is not a pass. It is a broken sweep.
-    verdict: checked === 0 ? 'inconclusive' : failing.length ? 'fail' : 'pass',
+    unreadable: unreadable.length,
+    verdict: failing.length ? 'fail' : blind ? 'inconclusive' : 'pass',
   }
 }
 
@@ -185,15 +197,20 @@ export async function sweep({ fetchImpl = fetch, tokens, withMeta = false } = {}
     for (const p of projects) if (!seen.has(p.ref)) seen.set(p.ref, { name: p.name, token: t.token })
   }
   const audits = []
+  const unreadable = []
   for (const [ref, p] of seen) {
     const loaded = await loadProject(ref, p.token, { fetchImpl })
-    if (!loaded) continue
+    // A project we discovered but could not open is NOT a project we cleared. Record it by name so
+    // the run can say "I could not look at ReplyFlow" instead of dropping it into silence and
+    // reporting the twenty that DID load as if they were the whole population.
+    if (!loaded) { unreadable.push({ name: p.name, ref }); continue }
     audits.push(auditProject({ name: p.name, ref, ...loaded }))
   }
   // The caller needs to tell "no token to look with" apart from "looked and every project
-  // refused", and an array of audits cannot say which happened. Opt-in so every existing
-  // caller and test keeps the plain array.
-  return withMeta ? { audits, tokens: list.length } : audits
+  // refused" apart from "looked at twenty and one refused". An array of audits can say none of
+  // those, so the meta payload carries the token count AND the projects that would not open.
+  // Opt-in so every existing caller and test keeps the plain array.
+  return withMeta ? { audits, unreadable, tokens: list.length } : audits
 }
 
 // WHY THIS IS NOT `import.meta.url === pathToFileURL(process.argv[1]).href` (2026-09-03).
@@ -218,23 +235,29 @@ function invokedDirectly() {
 }
 
 if (invokedDirectly()) {
-  const { audits, tokens } = await sweep({ withMeta: true })
+  const { audits, unreadable, tokens } = await sweep({ withMeta: true })
   for (const a of audits) {
     const mark = a.failures.length ? 'FAIL' : a.warnings.length ? 'warn' : ' ok '
     console.log(`[${mark}] ${a.name} (${a.ref}) — ${a.checked} credentials judged, legacy keys ${a.legacyDisabled ? 'disabled' : 'enabled'}`)
     for (const r of [...a.failures, ...a.warnings]) console.log(`         ${r.level.toUpperCase()} ${r.name}: ${r.reason}`)
   }
-  const s = summarise(audits)
+  // Name every project we could not open, so a blind spot is stated, never dropped into silence.
+  for (const u of unreadable) console.log(`[????] ${u.name} (${u.ref}) — could not be read at all; its /api-keys or /secrets did not answer 200, so it was NEVER judged`)
+  const s = summarise(audits, { unreadable })
   console.log(`
-${s.projects} projects, ${s.checked} credentials judged, ${s.failing} failing, ${s.warnings} warnings — ${s.verdict.toUpperCase()}`)
+${s.projects} projects judged, ${unreadable.length} unreadable, ${s.checked} credentials judged, ${s.failing} failing, ${s.warnings} warnings — ${s.verdict.toUpperCase()}`)
 
-  // Three states, never two. "It judged nothing" is not "nothing is wrong": say WHICH kind of
-  // blindness it was, because "no management token on this host" is a deployment mistake and
-  // "every project refused to load" is an outage, and they need different people.
+  // Three states, never two. "It judged nothing" is not "nothing is wrong", and "it judged twenty
+  // and could not open the twenty-first" is not "twenty are clean". Say WHICH kind of blindness it
+  // was — "no management token on this host" is a deployment mistake, "every project refused" is an
+  // outage, and "these named projects refused while the rest loaded" is the partial one that used
+  // to print PASS. They need different people, so name the projects.
   if (s.verdict === 'inconclusive') {
     const why = tokens === 0
       ? 'no Supabase management token is readable on this host, so not one project was looked at'
-      : `${tokens} management token(s) found, but every project failed to load — nothing was judged`
+      : unreadable.length
+        ? `${unreadable.length} of ${unreadable.length + s.projects} project(s) could not be read at all — ${unreadable.map((u) => u.name).join(', ')} — so the sweep cannot say they are clean`
+        : `${tokens} management token(s) found, but every project failed to load — nothing was judged`
     sayVerdict(UNKNOWN, why)
     console.log(`INCONCLUSIVE: ${why}`)
     process.exit(1)
