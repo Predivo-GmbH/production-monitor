@@ -9,6 +9,7 @@
  */
 import assert from 'node:assert'
 import { judgeDrainer, summariseBoard } from '../scripts/check-drainer-progress.mjs'
+import { NOT_A_FINDING_SOURCES } from '../scripts/board-drainer.mjs'
 
 let n = 0
 const t = (name, fn) => { fn(); n++; console.log(`  ok - ${name}`) }
@@ -264,6 +265,32 @@ t('REGRESSION GUARD: re-introducing a source allow list makes out-of-reach non-e
   assert.equal(b.inReach, 2, 'the old guard reached only two of the five')
   assert.deepEqual(b.outOfReach, ['monitoring-hygiene/c', 'external-tools-scan/d'],
     'and the alarm names exactly the findings nobody would ever have looked at')
+})
+
+t('THE LIST-GROWS DIRECTION: adding a real fault source to the DRAINER deny list makes out-of-reach non-empty', () => {
+  // The defect this incident opened on: when the alarm's denominator WAS the drainer's own
+  // NOT_A_FINDING_SOURCES (`const NOT_A_FINDING = NOT_A_FINDING_SOURCES`), quieting a noisy
+  // producer by adding its source to the deny list dropped it from BOTH populations at once, so
+  // outOfReach stayed structurally [] and the alarm could not fire on the very findings the fixer
+  // had just stopped working. This test drives the REAL default `workableFinding` — not an
+  // injected substitute like the guard above — against a deny list that has grown by one real
+  // source, and asserts the gap opens. It fails against `const NOT_A_FINDING = NOT_A_FINDING_SOURCES`.
+  const GROWN = 'monitoring-hygiene'
+  const had = NOT_A_FINDING_SOURCES.has(GROWN)
+  NOT_A_FINDING_SOURCES.add(GROWN) // simulate the one-line "quiet the producer" edit on the drainer
+  try {
+    const b = summariseBoard([
+      row('commit-review', 'a'),
+      row('monitoring-hygiene', 'c'),                              // now refused by the drainer...
+      row('monitoring-hygiene', 'e', { work_item: 'some-slug' }),  // ...but this one has an owner
+    ]) // DEFAULT isWorkable = the real workableFinding, which reads the grown NOT_A_FINDING_SOURCES
+    assert.equal(b.findings, 3, "the alarm's own list is unchanged, so the rows are still findings")
+    assert.equal(b.inReach, 1, 'only commit-review is still in the drainer\'s reach')
+    assert.deepEqual(b.outOfReach, ['monitoring-hygiene/c'],
+      'the newly-denied, unowned finding surfaces as never-tried — the alarm can fire again')
+  } finally {
+    if (!had) NOT_A_FINDING_SOURCES.delete(GROWN) // leave the shared set exactly as found
+  }
 })
 
 t('summariseBoard: parkedPublished counts exactly the rows carrying detail.parked=true', () => {

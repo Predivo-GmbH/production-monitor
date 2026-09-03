@@ -114,7 +114,7 @@
  * Exit 0 = healthy or alarm filed successfully. Exit 1 = could not tell, which is never "fine".
  */
 import { readFileSync } from 'fs'
-import { workableFinding, NOT_A_FINDING_SOURCES } from './board-drainer.mjs'
+import { workableFinding } from './board-drainer.mjs'
 
 const BO_REF = 'xoecpzfsskalvjrtcbbl'
 const BO_BASE = `https://${BO_REF}.supabase.co`
@@ -149,12 +149,29 @@ const minsSince = (iso, now) => (iso ? Math.round((now - new Date(iso).getTime()
  *  rows are this machinery's own heartbeat and this very alarm — counting either would make the
  *  alarm louder by measuring itself — and drills and delivery receipts are not faults.
  *
- *  IMPORTED, not copied, since 2026-09-02, and it is the same set the drainer filters on. Two
- *  hand-kept lists is how the numerator and the denominator came to disagree in the first place.
- *  It does NOT make the reach assertion below vacuous: that assertion compares the drainer's
- *  actual filter FUNCTION against this population, so it fires the moment `workableFinding` starts
- *  refusing rows for any reason other than this list — which is exactly the defect it caught. */
-const NOT_A_FINDING = NOT_A_FINDING_SOURCES
+ *  STATED INDEPENDENTLY OF THE DRAINER, and deliberately so (2026-09-03, reverting the 2026-09-02
+ *  `= NOT_A_FINDING_SOURCES` import). This is the alarm's DENOMINATOR filter, not the drainer's
+ *  reach filter, and the whole point of `outOfReach` is the GAP between the two: findings this
+ *  list still counts but `workableFinding` refuses. If the two populations are the SAME set, that
+ *  gap is structurally empty for every well-formed row — a finding not in this list is, by
+ *  construction, also not in the drainer's deny list, so `workableFinding` accepts it and it can
+ *  never land in `outOfReach`. Importing the drainer's list made the "never tried" half vacuous:
+ *  the one edit that most needs catching — someone adding a real fault source to the drainer's
+ *  deny list to quiet a noisy producer — would drop that source from BOTH the numerator and the
+ *  denominator in the same stroke, so the fixer stops working it AND the alarm stays green.
+ *
+ *  These two lists holding the same VALUES today is fine; they must not be the same OBJECT. Keep
+ *  this narrow and hand-stated: the machinery's own rows, drills, and delivery receipts — the
+ *  sources that are not findings by their nature. The drainer's deny list is then free to grow
+ *  past this one, and every source it grows by shows up here as out-of-reach. The reach assertion
+ *  still also imports the drainer's actual FUNCTION, so a divergence of any OTHER shape
+ *  (`workableFinding` refusing a row for a new reason) fires too — both directions are covered now,
+ *  the list-grows one by this independence and the function-diverges one by the imported function. */
+const NOT_A_FINDING = new Set([
+  'work-board', 'board-drainer',
+  'test', 'probe', 'wrapper', '__drill__', '__migration_probe__',
+  'report', 'closer-digest', 'notification-closer', 'notification-hc-up', 'notification-report',
+])
 
 /**
  * Turn the raw active board into the two numbers the verdict needs, and nothing else.
