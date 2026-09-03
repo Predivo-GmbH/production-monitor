@@ -66,7 +66,16 @@ function Register-BoardTask {
   # interactive session; RunLevel stays Limited because neither job needs elevation. Pattern taken
   # from C:/ClaudeShared/scripts/fix-gh-runner-anchor-at-startup.ps1, which registers the fleet's
   # runner tasks on this same laptop.
-  $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U -RunLevel Limited
+  # THE ACCOUNT NAME IS RESOLVED, NEVER ASSEMBLED. This script first built its principal as
+  # "$env:USERDOMAIN\$env:USERNAME", and registering over SSH failed with 0x80070534 - "no mapping
+  # between account names and security IDs was done" - because USERDOMAIN is not populated the same
+  # way in a non-interactive remote session, so the string was malformed and Windows could not
+  # resolve it. WindowsIdentity always returns the fully-qualified DOMAIN\user of whoever is
+  # actually running this, interactive or not. Same reasoning as
+  # C:/ClaudeShared/scripts/fix-gh-runner-anchor-at-startup.ps1, which reads UserId off an existing
+  # task rather than hardcoding one, "because a username baked in here would be wrong on one of them".
+  $runAsUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+  $principal = New-ScheduledTaskPrincipal -UserId $runAsUser -LogonType S4U -RunLevel Limited
 
   Unregister-ScheduledTask -TaskName $Name -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
   Register-ScheduledTask -TaskName $Name -Action $action -Trigger $Trigger -Settings $settings `
