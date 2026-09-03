@@ -146,5 +146,48 @@ check('a proven failure still outranks an all-unaudited fleet', () => {
   assert.match(r.subject, /arivioo/)
 })
 
+// 2026-09-03 board finding, verbatim: run 33730188124 had one failing row, Distribution-OS STAGING,
+// what='a dormant environment has grown a mailer' (check-mailer-config.mjs:382) - the environment
+// GREW a mailer (the inverse of losing one), yet it mailed "Distribution-OS cannot send email ...
+// customers get nothing" while the same run's table printed that product's SMTP OK. That finding is
+// neither unaudited nor guard-blind, so the old default-proven blocklist swept it into the outage
+// bucket. It is config drift: amber, never a customer-facing outage.
+const dormantDrift = [
+  { product: 'Distribution-OS', env: 'staging', what: 'a dormant environment has grown a mailer', detail: 'recorded as deliberately unconfigured, but it now carries SMTP_HOST, SMTP_PORT. Either it started sending and the baseline is stale, or something was set here by mistake.' },
+]
+
+check('a dormant-drift-only run is NEVER the customer-outage lede', () => {
+  const r = classifyMailerAlert(dormantDrift, { fleetProducts: 12 })
+  assert.ok(!/cannot send email/i.test(r.subject), `subject still claims an outage: ${r.subject}`)
+  assert.ok(!/cannot send email/i.test(r.title), `headline still claims an outage: ${r.title}`)
+  assert.ok(!/get nothing/i.test(r.lede), 'lede must not tell Roger customers get nothing for a config-drift observation')
+  assert.notEqual(r.colour, '#dc2626', 'config drift is not a red outage')
+  assert.match(r.subject, /Distribution-OS/)
+  assert.match(r.subject, /drift/i)
+  assert.match(r.lede, /NOT a "cannot send email" notice/i)
+  assert.match(r.title, /dormant environment has grown a mailer/)
+})
+
+check('a NEW finding type defaults to non-customer-facing drift wording, not to "cannot send email"', () => {
+  // The whole point of the allowlist: an unforeseen finding type inherits the SAFE wording.
+  const novel = [{ product: 'someproduct', env: 'production', what: 'a brand-new finding nobody has classified yet', detail: '...' }]
+  const r = classifyMailerAlert(novel, { fleetProducts: 12 })
+  assert.ok(!/cannot send email/i.test(r.subject), `a new finding type must not default to an outage claim: ${r.subject}`)
+  assert.ok(!/get nothing/i.test(r.lede))
+  assert.notEqual(r.colour, '#dc2626')
+})
+
+check('a proven outage still outranks a config-drift finding and names only the proven product', () => {
+  const r = classifyMailerAlert([
+    { product: 'arivioo', env: 'production', what: 'the mailer is not configured at all', detail: '...' },
+    ...dormantDrift,
+  ], { fleetProducts: 12 })
+  assert.match(r.subject, /cannot send email/)
+  assert.match(r.subject, /arivioo/)
+  assert.ok(!/Distribution-OS/.test(r.subject), 'a config-drift product must not be named as an outage in the subject')
+  assert.match(r.title, /config drift/, 'the drift product should still be counted in the headline')
+  assert.equal(r.colour, '#dc2626')
+})
+
 console.log(`\n${passed} passed, ${failed} failed.`)
 process.exit(failed ? 1 : 0)
