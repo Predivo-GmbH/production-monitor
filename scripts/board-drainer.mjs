@@ -1811,6 +1811,64 @@ export function workBoardDeps(secret, base = BO_BASE) {
       })
       if (!res.ok) log(`    evidence NOT attached (HTTP ${res.status}) — the item exists but carries no prompt yet`)
     },
+
+    // ── reads and writes used ONLY by the retirement pass (retireSettledDrainerRows) ─────────
+
+    /** The rows THIS producer minted that are still open and still machine-owned.
+     *  `status=in.(next,blocked)` is the filter, not `not.in.(done,abandoned)`: in_progress and
+     *  awaiting_signoff are states only a session can reach, and this pass must never even LOAD a
+     *  row somebody declared. Measured 2026-09-03: 64 drainer rows are open, 4 of them are in one
+     *  of those two states, and this filter is why they are never considered. */
+    async listRetirableItems() {
+      const res = await fetch(`${base}/rest/v1/work_items`
+        + `?source=eq.monitor&opened_by=eq.board-drainer&status=in.(${[...RETIREABLE_ITEM_STATUSES].join(',')})`
+        + `&select=id,slug,title,source,status,opened_by,opened_at,started_at,owner_session,blocked_owner,blocked_question,documentation_ref&limit=500`,
+        { headers: H })
+      if (!res.ok) throw new Error(`work_items read HTTP ${res.status}: ${(await res.text()).slice(0, 160)}`)
+      return await res.json()
+    },
+
+    /** EVERY signal, in every state — not just the terminal ones.
+     *  Filtering to `state=in.(resolved,closed)` would be cheaper and wrong: a superseded signal
+     *  would then come back as NOT FOUND, and "not found" and "not finished" are two different
+     *  answers that this pass is required to keep apart (they take the same action today, but a
+     *  tally that reports 38 rows as "the incident cannot be located" when the incident is sitting
+     *  right there in `superseded` is a report nobody can act on). Measured 2026-09-03: 731 rows. */
+    async listAllSignals() {
+      const res = await fetch(`${base}/rest/v1/fleet_signals`
+        + '?select=id,source,key,title,severity,state,summary,detail,link,resolved_at,last_seen_at,first_seen_at&limit=2000',
+        { headers: H })
+      if (!res.ok) throw new Error(`fleet_signals read HTTP ${res.status}: ${(await res.text()).slice(0, 160)}`)
+      return await res.json()
+    },
+
+    /** The evidence row that Cockpit sql/077 counts before it will accept an `auto:` close.
+     *  A SEPARATE function from addEvidence above, which hardcodes `verified: false` — and that
+     *  hardcoding is correct for everything else this file writes, because sql/055 says verified
+     *  is "true ONLY when a machine check confirmed the thing". The machine check here is this
+     *  pass reading fleet_signals live, in this run, and finding the state terminal. It throws
+     *  rather than logging, because unlike a hand-off prompt this row is load-bearing: without it
+     *  the close that follows is refused and the item is left in an unexplained half-state. */
+    async addVerifiedEvidence(itemId, ev) {
+      const res = await fetchWithTransportRetry(`${base}/rest/v1/work_evidence`, {
+        method: 'POST', headers: { ...H, Prefer: 'return=minimal' },
+        body: JSON.stringify({ item_id: itemId, kind: ev.kind, title: ev.title, detail: ev.detail, link: ev.link ?? null, verified: ev.verified === true }),
+      })
+      if (!res.ok) throw new Error(`work_evidence insert HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`)
+    },
+
+    /** The close itself, and it READS BACK what it wrote. `Prefer: return=representation` so a
+     *  PATCH that matched no row returns [] instead of a silent success — the failure shape that
+     *  makes a job report "retired 4" while the board still shows four open rows. */
+    async closeItem(itemId, patch) {
+      const res = await fetchWithTransportRetry(`${base}/rest/v1/work_items?id=eq.${encodeURIComponent(itemId)}`, {
+        method: 'PATCH', headers: { ...H, Prefer: 'return=representation' }, body: JSON.stringify(patch),
+      })
+      if (!res.ok) throw new Error(`work_items close HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`)
+      const rows = await res.json()
+      return rows[0] || null
+    },
+
     /**
      * `superseded`, never `resolved`. Resolved means the problem is gone; this problem is very
      * much still here, it simply lives on the work board now. The distinction is not cosmetic:
@@ -1983,6 +2041,330 @@ export async function sweepFinishedWork(deps, { dryRun = false } = {}) {
     }
   }
   return out
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// THE ROW THIS PRODUCER MINTED RETIRES ITSELF WHEN THE INCIDENT BEHIND IT IS GENUINELY GONE.
+//
+// -- THE MEASUREMENT (production xoecpzfsskalvjrtcbbl, 2026-09-03) -------------------------
+//
+// 215 rows are open on the work board. 125 of them can be closed by NOTHING that exists: no
+// producer walks back to them, no sweep looks at them, and Roger is the only mechanism. 64 of
+// the open rows were minted right here (`source='monitor'`, `opened_by='board-drainer'`), and
+// the oldest of the two this pass would close has been sitting there since 2026-08-21 about a
+// fault whose signal was marked resolved on 2026-09-02.
+//
+// sweepFinishedWork() above walks the link one way — WORK FINISHED, so close the signal. This
+// walks it the other — INCIDENT CLEARED, so close the row. Neither direction can substitute for
+// the other: the sweep only ever fires on an item that is ALREADY done, so a row whose fault
+// simply went away on its own is exactly the row nothing has ever been able to touch.
+//
+// -- WHY `superseded` IS THE WHOLE DANGER HERE, AND NOT A FOOTNOTE ------------------------
+//
+// In Cockpit's sibling pass, excluding `superseded` protects 106 of 731 signals. Here it is far
+// sharper than that, because `superseded` IS WHAT THIS FILE WRITES WHEN IT MINTS THE ROW:
+// supersedeSignal() sets `state='superseded'` AND stamps `resolved_at` at the same moment the
+// work item is created (see its own header: "Resolved means the problem is gone; this problem is
+// very much still here, it simply lives on the work board now"). A pass that read `resolved_at`
+// as proof of anything, or that accepted `superseded` as terminal, would close EVERY row the
+// drainer has ever minted, one tick after minting it. Measured: 38 of the 61 open rows whose
+// incident can be located sit at exactly that state. The whole mechanism turns on one line.
+//
+// -- THE DESIGN, COPIED DELIBERATELY FROM Cockpit/scripts/sync-work-board.mjs ---------------
+//
+// The DECISION is pure and offline (drainerRetirementDecision + candidateIncidentsFor); the run
+// does the reads and the writes. Every guard is therefore reachable by a test that hands it one
+// object, which is the only reason a guard can be defect-injected at all.
+// ══════════════════════════════════════════════════════════════════════════════════════════
+
+/** Written into `signed_off_by`, and it is a sentence rather than a name on purpose: Cockpit
+ *  sql/077 lets an `auto:%` sign-off through only against two proofs, and the string a person
+ *  reads on the closed row should say which machine judgement closed it. Deliberately DIFFERENT
+ *  from Cockpit's 'auto:the-signal-that-raised-it-cleared': the two passes retire different
+ *  populations (`opened_by='fleet-signals'` there, `opened_by='board-drainer'` here) and a shared
+ *  string would make the audit trail unable to say which one acted. */
+export const RETIRED_BY = 'auto:the-incident-that-raised-it-cleared'
+
+/** The only two incident states this pass will CLOSE on. `superseded` is absent for the reason in
+ *  the header, and `acknowledged` is absent because it means "attached to a live job, still on
+ *  /signals until a person ticks it off" (Roger, 2026-08-28) — the opposite of finished.
+ *  Measured 2026-09-03: the live table holds resolved 618, superseded 106, open 7 — no row is in
+ *  `closed` at all today. It stays in the set anyway, because a state this pass does not
+ *  recognise must fail towards leaving the row alone, never towards a silent redefinition. */
+export const TERMINAL_INCIDENT_STATES = new Set(['resolved', 'closed'])
+
+/** The item statuses a machine may retire out of, and the list is SHORTER than the sibling's.
+ *  `in_progress` is absent for the same reason as there: only work_open reaches it, so it means a
+ *  session declared this work. `awaiting_signoff` is absent, where Cockpit allows it, because on
+ *  THIS board that status means a session has already finished something and put the question to
+ *  Roger (sql/062 puts it in `your_turn`). Answering a question he has been asked, with a monitor
+ *  going quiet, is precisely the thing the rule about his lane forbids. Measured 2026-09-03: 3
+ *  drainer rows are in_progress and 1 is awaiting_signoff. */
+const RETIREABLE_ITEM_STATUSES = new Set(['next', 'blocked'])
+
+/** Cockpit sql/055/062: once a row is here, somebody has judged it. */
+const CLOSED_ITEM_STATUSES = new Set(['done', 'abandoned'])
+
+/** The one value `resolvedPatch()` writes into `detail.resolved_by` when sweepFinishedWork closes
+ *  a signal against a FINISHED work item. Reading that resolve back as proof that a work item may
+ *  be closed is circular: the signal is only resolved because an item was already done. It matters
+ *  after a re-open — the item comes back to `next`, the signal stays `resolved`, and without this
+ *  line the very next run would close it again and quietly undo the re-open. Measured 2026-09-03:
+ *  2 live signals carry exactly this value. */
+const CIRCULAR_RESOLVE_AUTHOR = 'board-drainer/signal-closure'
+
+/**
+ * EVERY incident that could be the one behind this row, found two ways and unioned.
+ *
+ *   1. by DERIVATION — workItemSlugFor(source, key), the same function that minted the slug. This
+ *      is the ordinary case and it is exact.
+ *   2. by the incident's OWN written pointer — detail.work_item, which routeToWorkBoard writes.
+ *      Needed because adoptionTarget() can point a signal at an item minted under a DIFFERENT
+ *      hash (the 2026-08-27 key rename stranded two such items), and a row reached only by
+ *      derivation would then look unattributable.
+ *
+ * TWO HITS MEANS NEITHER CLOSES IT. That is not a theoretical shape: `upsert_incident` dedups on
+ * the PAIR (source, key), so one fault arriving through two channels is two rows — 12 such pairs
+ * in 659 rows on 2026-09-02 — and adoption then folds both onto ONE item. That item stands for
+ * both faults, so one of them clearing does not finish it. Measured 2026-09-03: 1 of the 64 open
+ * drainer rows has two incidents mapping onto it.
+ *
+ * Pure, and separate from the decision so the ambiguity can be tested without a database.
+ */
+export function candidateIncidentsFor(slug, signals) {
+  const out = new Map()
+  if (!slug) return []
+  for (const s of signals || []) {
+    if (!s) continue
+    if (workItemSlugFor({ source: s.source, key: s.key }) === slug || s?.detail?.work_item === slug) {
+      // Keyed by id so a row reachable BOTH ways is one candidate, not two — otherwise the
+      // ordinary case (derivation and pointer agreeing) would read as ambiguous and nothing would
+      // ever retire, which is the failure mode that looks exactly like "there was nothing to do".
+      out.set(s.id ?? `${s.source}|${s.key}`, s)
+    }
+  }
+  return [...out.values()]
+}
+
+/**
+ * THE WHOLE DECISION, PURE. No network, no credentials, no clock beyond the timestamps handed in.
+ *
+ * @param item       one work_items row (the columns listRetirableItems selects)
+ * @param signal     the single incident behind it, or null when none could be located
+ * @param ambiguous  true when candidateIncidentsFor found more than one
+ * @returns {{act:'retire'|'leave', reason:string, receipt?:string, state?:string, resolved_at?:string}}
+ *
+ * `reason` is not decoration. The pass tallies it and prints the tally, because "left alone 62" is
+ * a count and a count is not a report — the board sat unactionable for a month behind numbers that
+ * were all individually correct.
+ */
+export function drainerRetirementDecision({ item, signal = null, ambiguous = false }) {
+  const status = String(item?.status || '')
+
+  // ── PROVENANCE: only rows this producer minted ──────────────────────────────────────────
+  // Measured 2026-09-03 on the 215 open rows: 89 declaration/agent, 64 monitor/board-drainer,
+  // 37 monitor/agent, 8 declaration/monitoring-signals-closer, 5 monitor/fleet-signals, 6
+  // gate/agent, and the rest single rows. `source='monitor'` alone would sweep in the 37 rows an
+  // agent opened and the 5 the Cockpit pass owns; the PAIR is the only thing that isolates ours.
+  if (item?.source !== 'monitor') return { act: 'leave', guard: 'not a monitor row', reason: `source is ${item?.source || '(none)'}, not a machine-raised monitor row` }
+  if (item?.opened_by !== 'board-drainer') return { act: 'leave', guard: 'raised by another producer', reason: `raised by ${item?.opened_by || '(nobody recorded)'}, not by this producer` }
+
+  // ── NEVER REOPEN, NEVER RE-CLOSE ────────────────────────────────────────────────────────
+  // A done/abandoned row carries somebody's judgement — Roger's sign-off, or a session's
+  // 'auto:live-in-production+documented'. sql/077 refuses to let a machine set `abandoned` at all,
+  // because dropping work is a decision. This pass makes no decisions about closed rows in either
+  // direction: listRetirableItems does not even ASK for them, and this line is the second lock.
+  if (CLOSED_ITEM_STATUSES.has(status)) return { act: 'leave', guard: 'already closed by somebody', reason: `already ${status} — a closed row is somebody's judgement, and this pass never reverses one` }
+
+  // ── A HUMAN, OR A SESSION, HAS SINCE WORKED IT ──────────────────────────────────────────
+  if (!RETIREABLE_ITEM_STATUSES.has(status)) return { act: 'leave', guard: 'a session declared this row', reason: `status is ${status}, which only a session can set — somebody declared this row` }
+  if (item.owner_session) return { act: 'leave', guard: 'a session holds a claim on it', reason: 'a session holds a claim on it' }
+  // THE DURABLE MARK, and the reason it is not redundant with owner_session. Claims are RELEASED —
+  // by the stopped-session sweep and by parking (Cockpit sql/061) — so owner_session goes back to
+  // null on a row somebody really did work. `started_at` does not: sql/096 stamps it once when a
+  // row first enters in_progress and its trigger refuses every later attempt to clear it, exactly
+  // so it stays "the honest record that somebody began the row". Measured 2026-09-03: 16 of the 64
+  // open drainer rows carry started_at and NONE carries an owner_session. Without this line those
+  // 16 rows are indistinguishable from rows nobody has ever touched.
+  if (item.started_at) return { act: 'leave', guard: 'a session started this row once', reason: 'a session started this row once (started_at is stamped once and can never be cleared)' }
+
+  // ── THE RAISING SYSTEM MUST ACTUALLY SAY SO ─────────────────────────────────────────────
+  // NOT FOUND IS NOT FIXED. "I cannot find the incident behind this" reads exactly like "the
+  // incident behind this is gone", and the difference is the whole of factory-docs
+  // 11-autonomous-ops: a check that cannot say "I don't know" says "fine". This says I don't know.
+  if (!signal) return { act: 'leave', guard: 'the incident cannot be located', reason: 'no incident with this slug is in the raising system — not found is not fixed' }
+  if (ambiguous) return { act: 'leave', guard: 'two incidents map onto this slug', reason: 'more than one incident maps onto this slug, so which one cleared cannot be told' }
+  // The incident's own written pointer names a DIFFERENT item. Adoption and joining both repoint
+  // an incident at another task (adoptionTarget, markSignalJoined), and closurePlan refuses the
+  // mirror case for the same reason: this incident's clearing is evidence about THAT task, and
+  // finishing that task does not finish this row.
+  const pointer = signal?.detail?.work_item
+  if (pointer && pointer !== item.slug) return { act: 'leave', guard: 'the incident belongs to another row', reason: `the incident points at work item ${pointer}, a different row from this one (${item.slug})` }
+
+  // TERMINAL ONLY — the one line the header is about.
+  // EVERY guard in this function is ONE LINE for a reason: the defect-injection tests in
+  // test/board-drainer.test.mjs prove a guard by DELETING its line, and a guard spread over an
+  // `if (...) {` block leaves an orphan `return` behind that will not even parse — so the
+  // injection fails on a syntax error instead of proving anything about the guard.
+  const notFinished = signal.state === 'superseded'
+    ? 'the incident is superseded, which is what this drainer writes when it MINTS the row — it means "this lives on the work board now", never "finished"'
+    : `the incident is ${signal.state || '(no state)'}, which is not a finished state`
+  if (!TERMINAL_INCIDENT_STATES.has(signal.state)) return { act: 'leave', guard: `the incident is ${signal.state || '(no state)'}, not finished`, reason: notFinished }
+  // NEVER READ YOUR OWN CLOSE BACK AS PROOF. See CIRCULAR_RESOLVE_AUTHOR.
+  if (signal?.detail?.resolved_by === CIRCULAR_RESOLVE_AUTHOR) return { act: 'leave', guard: 'a circular receipt', reason: 'this incident was resolved BECAUSE a work item finished, so using it to finish a work item is circular' }
+  // A terminal state with no moment attached is a state word with nothing behind it, and the
+  // receipt this pass writes quotes that moment. No timestamp, no close.
+  const resolvedAt = Date.parse(signal.resolved_at || '')
+  if (!Number.isFinite(resolvedAt)) return { act: 'leave', guard: 'finished with no moment attached', reason: 'the incident reads finished but carries no resolved_at, so there is no moment to point at' }
+  // A RESOLVE STAMPED BEFORE THE ROW EXISTED belongs to an earlier episode of the same incident.
+  // The same anti-cheat prodref.mjs applies to a watch proof: a check that was already green
+  // proves nothing about the fix.
+  const openedAt = Date.parse(item.opened_at || '')
+  if (Number.isFinite(openedAt) && resolvedAt < openedAt) return { act: 'leave', guard: 'the resolve predates the row', reason: `the incident's resolve (${signal.resolved_at}) is older than the row it would close (${item.opened_at})` }
+  // SEEN AGAIN AFTER BEING CALLED FIXED. closurePlan() orders last_seen_at against the work item's
+  // close for the mirror case; here it is ordered against the incident's own resolve. Measured
+  // 2026-09-03 across the 618 resolved signals: 137 carry a last_seen_at AFTER their resolved_at,
+  // and the smallest of those gaps is 8.3 seconds with a median of 5.5 minutes — so this is a
+  // producer genuinely touching the row again, not two columns stamped in one transaction. 3 of
+  // the 64 open drainer rows are held back by this line.
+  const seenAt = Date.parse(signal.last_seen_at || '')
+  if (Number.isFinite(seenAt) && seenAt > resolvedAt) return { act: 'leave', guard: 'seen again after being called finished', reason: `the producer saw it again at ${signal.last_seen_at}, after calling it finished at ${signal.resolved_at}` }
+
+  // ── NEVER INVENT A RECEIPT ──────────────────────────────────────────────────────────────
+  // sql/077's second proof needs a verified evidence row carrying a LIVE LINK, and this pass
+  // writes that row itself — so the link had better be the incident's own and not something this
+  // code made up. It is a floor and it is honestly a low one: measured 2026-09-03, 692 of the 731
+  // signals carry the same `https://cockpit.predivo.ch/signals`, and 0 of the 61 locatable rows
+  // were stopped by this line. It stays because the day a producer files a signal with no link is
+  // the day this pass would otherwise close a row against a receipt that points nowhere.
+  const receipt = signal.link ? String(signal.link).trim() : ''
+  if (!/^https?:\/\//i.test(receipt)) return { act: 'leave', guard: 'no receipt to point at', reason: 'the incident carries no http link, and a receipt is never invented' }
+
+  // ── ROGER'S LANE, ON A REAL QUESTION ────────────────────────────────────────────────────
+  // Everything this producer mints addresses `roger` or nobody (routeToWorkBoard's laneFields:
+  // a claude-owned finding lands on `next` with no blocked_owner, everything else on `blocked`
+  // with blocked_owner 'roger'). Measured 2026-09-03: 17 of the 64 open rows name roger and 47
+  // name nobody. Any OTHER owner was written by somebody else, and the answer is owed to a person
+  // this pass never spoke to.
+  const owner = item.blocked_owner == null ? '' : String(item.blocked_owner).trim().toLowerCase()
+  if (owner && owner !== 'roger') return { act: 'leave', guard: 'the question is owed to somebody else', reason: `the question on it is owed to ${owner}, whom this producer never addressed` }
+  // THE TEXT DECIDES WHO WROTE IT, NOT THE LANE. routeToWorkBoard writes exactly one thing into
+  // blocked_question: `actionOf(inc) || plainTitle(inc).title`. So the question is OURS only when
+  // it still equals one of those two, recomputed from the incident as it reads right now. A
+  // question that is neither was typed by a person, and a monitor going quiet does not answer a
+  // person. Comparing against the producer's OWN wording — rather than pattern-matching a shape —
+  // is what stops this guard from firing on its own author. Measured 2026-09-03: 4 of the 64 rows
+  // carry a question this producer did not write.
+  //
+  // IT ALSO FAILS SAFE ON DRIFT: if the incident's text moved since the row was minted, the
+  // recomputed strings no longer match and the row is LEFT ALONE. That costs a close we might have
+  // been entitled to; it can never cause one we are not.
+  const question = item.blocked_question == null ? '' : String(item.blocked_question).trim()
+  if (question) {
+    const inc = signalToIncident(signal)
+    const ours = new Set([actionOf(inc), plainTitle(inc).title].map((s) => String(s || '').trim()).filter(Boolean))
+    if (!ours.has(question)) return { act: 'leave', guard: 'a person wrote the question on it', reason: 'the question standing on it was written by a person, and a monitor going quiet does not answer it' }
+  }
+  // Same test for documentation. The only value this producer would ever write here is the
+  // incident's own link; anything else is somebody's work. Measured 2026-09-03: 5 of the 64 rows
+  // carry a documentation_ref.
+  const doc = item.documentation_ref == null ? '' : String(item.documentation_ref).trim()
+  if (doc && doc !== receipt) return { act: 'leave', guard: 'documentation this producer did not write', reason: 'it carries documentation this producer did not write, so somebody has worked it' }
+
+  return { act: 'retire', receipt, state: signal.state, resolved_at: signal.resolved_at,
+           reason: `the incident that raised it is ${signal.state} since ${String(signal.resolved_at).slice(0, 19)}` }
+}
+
+/**
+ * The pass. Reads this producer's own open rows, asks fleet_signals about each one, and closes the
+ * ones whose incident is genuinely gone. `deps` is injected for the same reason as everywhere else
+ * in this file: a test drives the whole thing without touching production.
+ *
+ * ORDERING INSIDE THE CLOSE IS LOAD-BEARING. sql/077's trigger counts the verified evidence row
+ * BEFORE it will accept the status change, so the evidence goes on first; a PATCH that runs first
+ * is refused outright and the item is left in a state nobody asked for.
+ */
+export async function retireSettledDrainerRows(deps, { dryRun = false } = {}) {
+  const stat = { checked: 0, retired: 0, left: 0, reasons: {}, failed: [], closed: [] }
+  let items, signals
+  try {
+    items = await deps.listRetirableItems()
+  } catch (e) {
+    // A read failure is REPORTED, never folded into a green "nothing to do". A job that reports
+    // success for doing nothing is worse than one that fails.
+    stat.failed.push({ slug: '(read)', phase: 'work_items', reason: String(e).slice(0, 160) })
+    return stat
+  }
+  if (!items.length) { deps.log?.('    no open rows minted by this producer'); return stat }
+  try {
+    signals = await deps.listAllSignals()
+  } catch (e) {
+    stat.failed.push({ slug: '(read)', phase: 'fleet_signals', reason: String(e).slice(0, 160) })
+    return stat
+  }
+
+  const now = new Date().toISOString()
+  for (const item of items) {
+    stat.checked++
+    const hits = candidateIncidentsFor(item.slug, signals)
+    const verdict = drainerRetirementDecision({ item, signal: hits[0] || null, ambiguous: hits.length > 1 })
+    if (verdict.act === 'leave') {
+      stat.left++
+      // TALLIED ON THE GUARD, NOT ON THE REASON. The reason carries the row's own timestamps and
+      // slugs, so tallying it turns one guard that held back three rows into three "1x" lines —
+      // a report that hides the very shape you are reading it for. The full reason stays on the
+      // verdict, where a per-row question can still be answered.
+      stat.reasons[verdict.guard] = (stat.reasons[verdict.guard] || 0) + 1
+      continue
+    }
+    if (dryRun) {
+      stat.retired++
+      stat.closed.push({ slug: item.slug, reason: verdict.reason, dryRun: true })
+      deps.log?.(`    would RETIRE ${item.slug} — ${verdict.reason}`)
+      continue
+    }
+    try {
+      await deps.addVerifiedEvidence(item.id, {
+        kind: 'gate', verified: true, link: verdict.receipt,
+        title: 'The incident that raised this is clear',
+        detail: `fleet_signals "${item.slug}" reads state=${verdict.state}, resolved_at ${verdict.resolved_at}, read live during this pass. A monitor incident returning to a terminal state is a watch that went green, which is what kind 'gate' means; the link is the incident's own and nothing here was written on anyone's word.`,
+      })
+      const after = await deps.closeItem(item.id, {
+        status: 'done', signed_off_by: RETIRED_BY, signed_off_at: now, closed_at: now,
+        documentation_ref: verdict.receipt, last_evidence_at: verdict.resolved_at,
+        // The row leaves his lane in the SAME statement that closes it. Leaving either of these
+        // standing keeps it counted against him by sql/092's owed_to_roger — a closed row that
+        // still says somebody owes an answer.
+        blocked_owner: null, blocked_question: null,
+      })
+      // A WRITE THAT COMES BACK DIFFERENT IS A FAILURE, NOT A SUCCESS. The trigger raises rather
+      // than declining silently, but a PATCH that matched nothing returns an empty array.
+      if (!after || after.status !== 'done' || after.signed_off_by !== RETIRED_BY) {
+        throw new Error(`the close did not take: the row came back status=${after ? after.status : '(no row)'} signed_off_by=${after ? after.signed_off_by : '(no row)'}`)
+      }
+      await deps.addVerifiedEvidence(item.id, {
+        kind: 'decision', verified: false,
+        title: 'Retired: the incident that raised it has cleared',
+        detail: `${verdict.reason}. Nobody was asked to confirm it, because nobody did the work: this row exists only because a machine saw something, and the same machine now says it is gone. If the underlying check goes red again the producer files the incident afresh, and routeToWorkBoard refuses to supersede onto a finished item — so the recurrence comes back LOUD on /signals rather than silently reopening this row.`,
+      })
+      stat.retired++
+      stat.closed.push({ slug: item.slug, reason: verdict.reason })
+      deps.log?.(`    RETIRED ${item.slug} — ${verdict.reason}`)
+    } catch (e) {
+      stat.failed.push({ slug: item.slug, phase: 'close', reason: String(e).slice(0, 160) })
+    }
+  }
+  return stat
+}
+
+/** ONE renderer for the tally, shared by the in-run call and the standalone --retire-settled
+ *  entry, so the two can never report the same pass in two different shapes. Every reason is
+ *  NAMED with its count: "left alone 62" is a number, and a number is not a report. */
+function logRetirementTally(rt, dry) {
+  const why = Object.entries(rt.reasons).sort((a, b) => b[1] - a[1]).map(([r, n]) => `${n}x ${r}`).join('; ')
+  log(`    checked ${rt.checked}, ${dry ? 'would retire' : 'RETIRED'} ${rt.retired}, left alone ${rt.left}, FAILED ${rt.failed.length}`)
+  if (why) log(`      left alone because: ${why}`)
+  for (const f of rt.failed) log(`    ⚠ retirement FAILED on ${f.slug} (${f.phase}): ${f.reason}`)
 }
 
 // ── Tier-B agent policy (the boundary is enforced here + in allowedTools) ─────────────────
@@ -2549,6 +2931,14 @@ async function main() {
     // Errors are NAMED, never folded into the count. A sweep that reports success for doing nothing
     // is worse than one that fails.
     for (const e of sw.errors) log(`    ⚠ closure sweep error: ${e}`)
+
+    // ── and the other direction: close the ROWS whose incident has cleared ──────────────────
+    // Same placement and the same reasoning as the sweep above: ahead of the dry-run return, so a
+    // DRY-RUN still prints what it would close. 125 of the 215 open rows can be closed by nothing
+    // that exists; this is the mechanism for the 64 of them this producer minted.
+    log('  ⏵ retiring the rows this drainer minted whose incident has cleared')
+    const rt = await retireSettledDrainerRows(workBoardDeps(secret), { dryRun: !LIVE })
+    logRetirementTally(rt, !LIVE)
   }
 
   // In DRY-RUN or FIXTURE we stop here: classification only, nothing dispatched or written.
@@ -2854,7 +3244,30 @@ function alertFailure(msg) {
   if (hc) fetch(`${hc}/fail`).catch(() => {})
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
+/**
+ * `node scripts/board-drainer.mjs --retire-settled [--dry-run]`
+ *
+ * The retirement pass on its own, so it can be PROVEN against production without arming the whole
+ * drainer (which dispatches agents, spends money and writes back to the incident board). It reads
+ * the same two tables the in-run call reads and prints the same tally.
+ *
+ * DEFAULT-SAFE, exactly like every other switch in this file: it writes nothing unless
+ * BOARD_DRAINER_LIVE=1, and `--dry-run` overrides even that. There is no argument that turns
+ * writing ON — you have to set the same environment variable the scheduled task sets.
+ */
+async function runRetireSettledOnly() {
+  const dryRun = process.argv.includes('--dry-run') || !LIVE
+  log(`Board Drainer — retirement pass only, mode=${dryRun ? 'DRY-RUN (nothing is written)' : 'LIVE'}`)
+  const rt = await retireSettledDrainerRows(workBoardDeps(readBoSecret()), { dryRun })
+  logRetirementTally(rt, dryRun)
+  // A failed READ returns an empty tally that otherwise reads as a clean board, so the exit code
+  // has to carry it: a job that reports success for doing nothing is worse than one that fails.
+  if (rt.failed.length) process.exitCode = 1
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] || '').href && process.argv.includes('--retire-settled')) {
+  runRetireSettledOnly().catch((e) => { console.error(e); process.exitCode = 1 })
+} else if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
   main().then(
     async () => {
       await writeRunHeartbeat(null)

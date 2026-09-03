@@ -1616,3 +1616,471 @@ t('it matches the twin in Cockpit exactly — one board, one grading', () => {
     assert.equal(weightFromSeverity(v), cockpit(v), 'divergence on ' + JSON.stringify(v))
   }
 })
+
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// A ROW THIS PRODUCER MINTED RETIRES ITSELF WHEN ITS INCIDENT CLEARS — and every guard that
+// stops it, plus six defect injections that physically delete a guard line and prove the row
+// is then WRONGLY closed.
+//
+// MEASURED, production xoecpzfsskalvjrtcbbl, 2026-09-03, and the whole reason this exists:
+//   215 rows open on the work board; 125 of them closeable by NOTHING that exists
+//   64 of the open rows were minted here (source='monitor', opened_by='board-drainer')
+//   60 of those are in a status a machine may even look at (next/blocked)
+//   dry run against production: retire 2, leave 58
+//   left alone: 38x superseded · 12x started_at · 4x a person's question · 3x seen again · 1x ambiguous
+//
+// Every fixture below is the SHAPE of a real row. The slug is not invented: it is the live
+// `monitor-code-sync-laptop-d3ce8904`, and one test asserts the hash still derives to it — if
+// workItemSlugFor ever changes, this pass silently matches nothing and retires nothing, and a
+// pass that does nothing looks exactly like a pass with nothing to do.
+// ══════════════════════════════════════════════════════════════════════════════════════════
+
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { pathToFileURL as toFileURL } from 'node:url'
+import { drainerRetirementDecision, candidateIncidentsFor, retireSettledDrainerRows,
+         RETIRED_BY, TERMINAL_INCIDENT_STATES } from '../scripts/board-drainer.mjs'
+
+const SLUG = 'monitor-code-sync-laptop-d3ce8904'
+
+/** The incident, in the state it is actually in on production today: resolved on 2026-09-02, its
+ *  own pointer naming the row it raised, and the generic /signals link 692 of 731 rows carry. */
+const CLEARED = {
+  id: 'sig-1', source: 'healthchecks', key: 'code-sync-laptop',
+  title: 'The laptop code sync is flapping, not fixed', severity: 'warning', state: 'resolved',
+  summary: 'code-sync-laptop is GREEN for the last 3 runs', link: 'https://cockpit.predivo.ch/signals',
+  resolved_at: '2026-09-02T12:37:23.387Z', last_seen_at: '2026-09-02T12:28:36.095Z',
+  first_seen_at: '2026-08-27T11:36:58.403Z',
+  detail: { who_must_act: 'Claude - restart the code sync task and confirm three green runs', work_item: SLUG },
+}
+
+/** The row it minted, untouched by anybody since. */
+const RAISED_ROW = {
+  id: 'item-1', slug: SLUG, title: 'Scheduled job stopped running: code-sync-laptop',
+  source: 'monitor', opened_by: 'board-drainer', status: 'next',
+  opened_at: '2026-08-27T11:36:58.403Z', started_at: null, owner_session: null,
+  blocked_owner: null, blocked_question: null, documentation_ref: null,
+}
+
+t('the slug this pass looks up is the one the mint derives — one function, or it matches nothing', () => {
+  assert.equal(workItemSlugFor({ source: CLEARED.source, key: CLEARED.key }), SLUG)
+})
+
+t('a cleared incident retires the row it raised, with the incident as the receipt', () => {
+  const v = drainerRetirementDecision({ item: RAISED_ROW, signal: CLEARED })
+  assert.equal(v.act, 'retire')
+  assert.equal(v.receipt, CLEARED.link, 'the receipt is the incident own link, never one we made up')
+  assert.equal(v.resolved_at, CLEARED.resolved_at)
+  assert.match(v.reason, /resolved since 2026-09-02T12:37:23/)
+})
+
+// ── superseded: the single most dangerous state on this board ──────────────────────────────
+t('SUPERSEDED IS NOT FINISHED — it is what this drainer writes the moment it mints the row', () => {
+  // supersedeSignal() sets state='superseded' AND stamps resolved_at in the same PATCH that hands
+  // the finding to the work board. 38 of the 60 candidate rows sit at exactly that state today. If
+  // this pass read it as terminal it would close every row it has ever minted, one tick later.
+  const v = drainerRetirementDecision({ item: RAISED_ROW, signal: { ...CLEARED, state: 'superseded' } })
+  assert.equal(v.act, 'leave')
+  assert.match(v.reason, /lives on the work board now/)
+})
+
+t('a resolved_at on a superseded row is not a loophole — the state decides, not the timestamp', () => {
+  // The trap is that superseded rows carry a FRESH resolved_at, newer than the row's opened_at,
+  // so every timestamp guard downstream would happily pass it.
+  const v = drainerRetirementDecision({ item: RAISED_ROW, signal: { ...CLEARED, state: 'superseded', resolved_at: '2026-09-03T09:00:00Z' } })
+  assert.equal(v.act, 'leave')
+})
+
+t('acknowledged is not finished either — it means attached to a live job and still on /signals', () => {
+  for (const state of ['open', 'acknowledged', 'snoozed', 'archived', '', null, undefined]) {
+    const v = drainerRetirementDecision({ item: RAISED_ROW, signal: { ...CLEARED, state } })
+    assert.equal(v.act, 'leave', `state ${JSON.stringify(state)} must not close a row`)
+  }
+})
+
+t('the terminal set is exactly two states, and neither of them is superseded', () => {
+  assert.deepEqual([...TERMINAL_INCIDENT_STATES].sort(), ['closed', 'resolved'])
+  assert.ok(!TERMINAL_INCIDENT_STATES.has('superseded'))
+  assert.ok(!TERMINAL_INCIDENT_STATES.has('acknowledged'))
+})
+
+// ── the incident has to actually SAY it is finished, and mean it about THIS row ─────────────
+t('NOT FOUND IS NOT FIXED: a row whose incident cannot be located is left alone', () => {
+  const v = drainerRetirementDecision({ item: RAISED_ROW, signal: null })
+  assert.equal(v.act, 'leave')
+  assert.match(v.reason, /not found is not fixed/)
+})
+
+t('two incidents on one slug close neither of them', () => {
+  const v = drainerRetirementDecision({ item: RAISED_ROW, signal: CLEARED, ambiguous: true })
+  assert.equal(v.act, 'leave')
+  assert.match(v.reason, /more than one incident maps onto this slug/)
+})
+
+t('an incident whose own pointer names a DIFFERENT row does not close this one', () => {
+  // Adoption and joining both repoint an incident at another task. Its clearing is evidence about
+  // that task, and finishing that task does not finish this row.
+  const v = drainerRetirementDecision({ item: RAISED_ROW, signal: { ...CLEARED, detail: { ...CLEARED.detail, work_item: 'monitor-something-else-11112222' } } })
+  assert.equal(v.act, 'leave')
+  assert.match(v.reason, /monitor-something-else-11112222/)
+})
+
+t('a finished incident with no moment attached has nothing to point at', () => {
+  for (const resolved_at of [null, '', 'yesterday', undefined]) {
+    assert.equal(drainerRetirementDecision({ item: RAISED_ROW, signal: { ...CLEARED, resolved_at } }).act, 'leave')
+  }
+})
+
+t('a resolve stamped BEFORE the row existed belongs to an earlier episode', () => {
+  const v = drainerRetirementDecision({ item: RAISED_ROW, signal: { ...CLEARED, resolved_at: '2026-08-20T00:00:00Z' } })
+  assert.equal(v.act, 'leave')
+  assert.match(v.reason, /older than the row it would close/)
+})
+
+t('SEEN AGAIN after being called finished is a recurrence, not stale bookkeeping', () => {
+  // 137 of the 618 resolved signals on production carry a last_seen_at after their resolved_at,
+  // the smallest gap 8.3 seconds and the median 5.5 minutes — a producer really touching the row
+  // again, not two columns stamped inside one transaction. 3 live rows are held back by this.
+  const v = drainerRetirementDecision({ item: RAISED_ROW, signal: { ...CLEARED, last_seen_at: '2026-09-03T15:58:05.327Z' } })
+  assert.equal(v.act, 'leave')
+  assert.match(v.reason, /saw it again/)
+  // and the ordinary case — last seen BEFORE the resolve — still retires
+  assert.equal(drainerRetirementDecision({ item: RAISED_ROW, signal: CLEARED }).act, 'retire')
+})
+
+t('an unreadable last_seen_at cannot silently pass the recurrence test as "not after"', () => {
+  // It genuinely cannot be ordered, so it is not evidence of a recurrence; the row still has to
+  // survive every OTHER guard, which it does. This test exists so that if the comparison is ever
+  // rewritten to treat an unparseable date as "later", the change is visible.
+  assert.equal(drainerRetirementDecision({ item: RAISED_ROW, signal: { ...CLEARED, last_seen_at: null } }).act, 'retire')
+})
+
+t('NEVER READ YOUR OWN CLOSE BACK AS PROOF: a circular receipt closes nothing', () => {
+  // sweepFinishedWork resolves a signal BECAUSE its work item finished, stamping
+  // detail.resolved_by='board-drainer/signal-closure' (2 live rows carry it). If that item is then
+  // re-opened, the signal stays resolved — and without this guard the next run would close the row
+  // again and quietly undo the re-open.
+  const v = drainerRetirementDecision({ item: RAISED_ROW, signal: { ...CLEARED, detail: { ...CLEARED.detail, resolved_by: 'board-drainer/signal-closure' } } })
+  assert.equal(v.act, 'leave')
+  assert.match(v.reason, /circular/)
+  // a resolve by anything else is ordinary evidence and still retires
+  assert.equal(drainerRetirementDecision({ item: RAISED_ROW, signal: { ...CLEARED, detail: { ...CLEARED.detail, resolved_by: 'signals-sweep slice 5, 2026-09-02' } } }).act, 'retire')
+})
+
+t('NEVER INVENT A RECEIPT: no live link on the incident, no close', () => {
+  for (const link of [null, '', '   ', 'cockpit.predivo.ch/signals', 'file:///C:/Business/notes.md', 'see the dashboard']) {
+    const v = drainerRetirementDecision({ item: RAISED_ROW, signal: { ...CLEARED, link } })
+    assert.equal(v.act, 'leave', `link ${JSON.stringify(link)} is not a receipt`)
+    assert.match(v.reason, /a receipt is never invented/)
+  }
+})
+
+// ── a human, or a session, has since worked it ─────────────────────────────────────────────
+t('a session that STARTED this row once keeps it, for ever — started_at can never be cleared', () => {
+  const v = drainerRetirementDecision({ item: { ...RAISED_ROW, started_at: '2026-09-01T10:00:00Z' }, signal: CLEARED })
+  assert.equal(v.act, 'leave')
+  assert.match(v.reason, /started_at is stamped once/)
+})
+
+t('a claim, and the two statuses only a session can reach, all keep the row', () => {
+  assert.equal(drainerRetirementDecision({ item: { ...RAISED_ROW, owner_session: 'session_abc' }, signal: CLEARED }).act, 'leave')
+  for (const status of ['in_progress', 'awaiting_signoff']) {
+    const v = drainerRetirementDecision({ item: { ...RAISED_ROW, status }, signal: CLEARED })
+    assert.equal(v.act, 'leave', `${status} must never be retired by a machine`)
+    assert.match(v.reason, /only a session can set/)
+  }
+})
+
+t('awaiting_signoff is refused even though the sibling pass in Cockpit allows it', () => {
+  // On this board that status means a session already finished something and put the question to
+  // Roger (sql/062 files it under `your_turn`). Answering a question he has been asked, with a
+  // monitor going quiet, is exactly what the rule about his lane forbids. 1 live row is here.
+  assert.equal(drainerRetirementDecision({ item: { ...RAISED_ROW, status: 'awaiting_signoff' }, signal: CLEARED }).act, 'leave')
+})
+
+t('NEVER REOPEN AND NEVER RE-CLOSE what somebody already judged', () => {
+  for (const status of ['done', 'abandoned']) {
+    const v = drainerRetirementDecision({ item: { ...RAISED_ROW, status }, signal: { ...CLEARED, state: 'open' } })
+    assert.equal(v.act, 'leave')
+    assert.match(v.reason, /never reverses one/)
+  }
+})
+
+// ── Roger's lane ───────────────────────────────────────────────────────────────────────────
+t('A REAL QUESTION IN ROGER LANE IS NEVER CLOSED BY A MACHINE, whatever the incident says', () => {
+  const asked = { ...RAISED_ROW, status: 'blocked', blocked_owner: 'roger',
+                  blocked_question: 'Which of the three vendor logins do you want kept?' }
+  const v = drainerRetirementDecision({ item: asked, signal: CLEARED })
+  assert.equal(v.act, 'leave')
+  assert.match(v.reason, /written by a person/)
+})
+
+t('but the producer OWN two sentences are not a person, or nothing would ever retire', () => {
+  // routeToWorkBoard writes exactly one thing into blocked_question: actionOf(inc) || plainTitle.
+  const inc = signalToIncident(CLEARED)
+  for (const question of [actionOf(inc), plainTitle(inc).title]) {
+    const v = drainerRetirementDecision({ item: { ...RAISED_ROW, status: 'blocked', blocked_owner: 'roger', blocked_question: question }, signal: CLEARED })
+    assert.equal(v.act, 'retire', `the producer own wording must not read as a person: ${question}`)
+  }
+})
+
+t('a question owed to anybody but Roger is owed to somebody this producer never spoke to', () => {
+  const v = drainerRetirementDecision({ item: { ...RAISED_ROW, status: 'blocked', blocked_owner: 'vendor', blocked_question: 'x' }, signal: CLEARED })
+  assert.equal(v.act, 'leave')
+  assert.match(v.reason, /owed to vendor/)
+})
+
+t('documentation this producer did not write means somebody has worked it', () => {
+  const v = drainerRetirementDecision({ item: { ...RAISED_ROW, documentation_ref: 'C:/Business/standards/incident-2026-09-03.md' }, signal: CLEARED })
+  assert.equal(v.act, 'leave')
+  // the incident own link back on the row is the one value this pass would ever have written
+  assert.equal(drainerRetirementDecision({ item: { ...RAISED_ROW, documentation_ref: CLEARED.link }, signal: CLEARED }).act, 'retire')
+})
+
+// ── provenance ─────────────────────────────────────────────────────────────────────────────
+t('PROVENANCE: the other 151 open rows are not this producer business', () => {
+  // Measured 2026-09-03 across the 215 open rows: 89 declaration/agent, 37 monitor/agent,
+  // 8 declaration/monitoring-signals-closer, 5 monitor/fleet-signals, 6 gate/agent...
+  for (const opened_by of ['agent', 'fleet-signals', 'monitoring-signals-closer', 'roger', 'inbox-sweep', null, '']) {
+    const v = drainerRetirementDecision({ item: { ...RAISED_ROW, opened_by }, signal: CLEARED })
+    assert.equal(v.act, 'leave', `opened_by ${JSON.stringify(opened_by)} is not ours to close`)
+  }
+  for (const source of ['declaration', 'gate', 'inbox', null]) {
+    assert.equal(drainerRetirementDecision({ item: { ...RAISED_ROW, source }, signal: CLEARED }).act, 'leave')
+  }
+})
+
+t('every refusal carries a stable guard name, so a tally can name what it counts', () => {
+  const cases = [
+    { item: { ...RAISED_ROW, opened_by: 'agent' }, signal: CLEARED },
+    { item: RAISED_ROW, signal: { ...CLEARED, state: 'superseded' } },
+    { item: RAISED_ROW, signal: null },
+    { item: { ...RAISED_ROW, started_at: '2026-09-01T10:00:00Z' }, signal: CLEARED },
+  ]
+  for (const c of cases) {
+    const v = drainerRetirementDecision(c)
+    assert.equal(v.act, 'leave')
+    assert.ok(v.guard && !/\d{4}-\d\d-\d\d/.test(v.guard), `a guard name must not embed a row own timestamp: ${v.guard}`)
+  }
+})
+
+// ── candidate lookup ───────────────────────────────────────────────────────────────────────
+t('an incident is found by derivation from source+key', () => {
+  const hits = candidateIncidentsFor(SLUG, [CLEARED, { id: 'x', source: 'other', key: 'unrelated', detail: {} }])
+  assert.equal(hits.length, 1)
+  assert.equal(hits[0].id, 'sig-1')
+})
+
+t('and by its OWN written pointer, when the hash no longer derives — the 2026-08-27 key rename', () => {
+  // Renaming a key changes the hash, so the item minted under the OLD hash is unreachable by
+  // derivation. The row survived the rename still carrying detail.work_item, which is the exact
+  // pointer this drainer wrote itself.
+  const renamed = { ...CLEARED, id: 'sig-2', key: 'healthchecks:code-sync-laptop-normalised' }
+  assert.notEqual(workItemSlugFor({ source: renamed.source, key: renamed.key }), SLUG)
+  const hits = candidateIncidentsFor(SLUG, [renamed])
+  assert.equal(hits.length, 1, 'the stored pointer must still find it')
+})
+
+t('an incident reachable BOTH ways is ONE candidate, not two — or nothing would ever retire', () => {
+  // CLEARED derives to SLUG and also points at SLUG. Counting it twice would read as ambiguous.
+  assert.equal(candidateIncidentsFor(SLUG, [CLEARED]).length, 1)
+})
+
+t('two different incidents folded onto one row make it ambiguous — 1 live row is', () => {
+  // upsert_incident dedups on the PAIR (source,key), so one fault through two channels is two rows
+  // (12 such pairs in 659 on 2026-09-02) and adoption folds both onto ONE item. That item stands
+  // for both faults, so one of them clearing does not finish it.
+  const sibling = { ...CLEARED, id: 'sig-3', source: 'backoffice-mail', detail: { work_item: SLUG } }
+  const hits = candidateIncidentsFor(SLUG, [CLEARED, sibling])
+  assert.equal(hits.length, 2)
+  assert.equal(drainerRetirementDecision({ item: RAISED_ROW, signal: hits[0], ambiguous: hits.length > 1 }).act, 'leave')
+})
+
+t('a row with no slug matches nothing rather than everything', () => {
+  assert.deepEqual(candidateIncidentsFor(null, [CLEARED]), [])
+  assert.deepEqual(candidateIncidentsFor('', [CLEARED]), [])
+})
+
+// ── the pass ───────────────────────────────────────────────────────────────────────────────
+/** Every DB call goes through this fake, so no test here makes a real request. */
+function retireDeps({ items = [], signals = [], closeReturns = undefined, failRead = null } = {}) {
+  const calls = { evidence: [], closes: [], logs: [] }
+  return {
+    calls,
+    deps: {
+      log(m) { calls.logs.push(m) },
+      async listRetirableItems() { if (failRead === 'items') throw new Error('HTTP 401'); return items },
+      async listAllSignals() { if (failRead === 'signals') throw new Error('HTTP 503'); return signals },
+      async addVerifiedEvidence(itemId, ev) { calls.evidence.push({ itemId, ...ev }) },
+      async closeItem(itemId, patch) {
+        calls.closes.push({ itemId, patch })
+        if (closeReturns !== undefined) return closeReturns
+        return { id: itemId, ...patch }
+      },
+    },
+  }
+}
+
+ta('a settled row is closed, and the evidence goes on BEFORE the status change', async () => {
+  const { deps, calls } = retireDeps({ items: [RAISED_ROW], signals: [CLEARED] })
+  const stat = await retireSettledDrainerRows(deps, {})
+  assert.equal(stat.retired, 1)
+  assert.equal(stat.left, 0)
+  assert.equal(stat.failed.length, 0)
+  // sql/077's trigger counts the verified evidence row before it will accept the close, so a PATCH
+  // that runs first is refused outright.
+  assert.equal(calls.evidence[0].kind, 'gate', 'the proof goes on first')
+  assert.equal(calls.evidence[0].verified, true)
+  assert.equal(calls.evidence[0].link, CLEARED.link)
+  assert.equal(calls.closes.length, 1)
+  assert.equal(calls.closes[0].patch.status, 'done')
+  assert.equal(calls.closes[0].patch.signed_off_by, RETIRED_BY)
+  assert.equal(calls.closes[0].patch.documentation_ref, CLEARED.link, 'sql/077 refuses an auto: close with no documentation_ref')
+  // the row leaves his lane in the same statement that closes it, or sql/092 still counts it
+  assert.equal(calls.closes[0].patch.blocked_owner, null)
+  assert.equal(calls.closes[0].patch.blocked_question, null)
+  assert.equal(calls.evidence[1].kind, 'decision', 'and the human-readable note goes on after')
+})
+
+t('the sign-off string is this pass own, never the Cockpit sibling', () => {
+  // Both passes write an `auto:%` sign-off onto the SAME table. A shared string would make the
+  // audit trail unable to say which of the two closed a row.
+  assert.ok(RETIRED_BY.startsWith('auto:'), 'sql/077 only lets an auto: sign-off through on two proofs')
+  assert.notEqual(RETIRED_BY, 'auto:the-signal-that-raised-it-cleared')
+})
+
+ta('DRY RUN writes NOTHING — no evidence, no close — and still reports what it would do', async () => {
+  const { deps, calls } = retireDeps({ items: [RAISED_ROW], signals: [CLEARED] })
+  const stat = await retireSettledDrainerRows(deps, { dryRun: true })
+  assert.equal(stat.retired, 1)
+  assert.equal(calls.evidence.length, 0, 'a dry run that writes evidence is not a dry run')
+  assert.equal(calls.closes.length, 0)
+  assert.equal(stat.closed[0].dryRun, true)
+  assert.ok(calls.logs.some((l) => /would RETIRE/.test(l)))
+})
+
+ta('A WRITE THAT COMES BACK DIFFERENT IS A FAILURE, NOT A SUCCESS', async () => {
+  // A PATCH that matched no row returns [] and the dep hands back null. Counting that as a
+  // retirement is how a job reports "retired 2" while the board still shows two open rows.
+  for (const back of [null, { id: 'item-1', status: 'next' }, { id: 'item-1', status: 'done', signed_off_by: 'roger' }]) {
+    const { deps } = retireDeps({ items: [RAISED_ROW], signals: [CLEARED], closeReturns: back })
+    const stat = await retireSettledDrainerRows(deps, {})
+    assert.equal(stat.retired, 0, `${JSON.stringify(back)} must not count as a close`)
+    assert.equal(stat.failed.length, 1)
+    assert.match(stat.failed[0].reason, /did not take/)
+  }
+})
+
+ta('a read that FAILS is reported, never folded into a green "nothing to do"', async () => {
+  for (const phase of ['items', 'signals']) {
+    const { deps } = retireDeps({ items: [RAISED_ROW], signals: [CLEARED], failRead: phase })
+    const stat = await retireSettledDrainerRows(deps, {})
+    assert.equal(stat.retired, 0)
+    assert.equal(stat.checked, 0)
+    assert.equal(stat.failed.length, 1, 'a job that reports success for doing nothing is worse than one that fails')
+  }
+})
+
+ta('the tally is keyed on the GUARD, so one guard holding three rows reads as 3x, not 1x three times', async () => {
+  const three = ['a', 'b', 'c'].map((name) => ({ ...RAISED_ROW, id: `item-${name}`, slug: `monitor-x-${name}` }))
+  const sigs = three.map((it, i) => ({
+    ...CLEARED, id: `sig-${i}`, detail: { ...CLEARED.detail, work_item: it.slug },
+    // three different recurrence timestamps — the reason text differs on every row
+    last_seen_at: `2026-09-0${i + 1}T20:00:00Z`, resolved_at: '2026-09-01T10:00:00Z',
+  }))
+  const { deps } = retireDeps({ items: three, signals: sigs })
+  const stat = await retireSettledDrainerRows(deps, {})
+  assert.equal(stat.left, 3)
+  assert.deepEqual(Object.values(stat.reasons), [3], `expected one guard counted 3x, got ${JSON.stringify(stat.reasons)}`)
+})
+
+ta('a mixed board retires only what every guard allows', async () => {
+  const worked = { ...RAISED_ROW, id: 'item-2', slug: 'monitor-worked-2', started_at: '2026-09-01T10:00:00Z' }
+  const foreign = { ...RAISED_ROW, id: 'item-3', slug: 'monitor-foreign-3', opened_by: 'agent' }
+  // Distinct keys, or all three would DERIVE onto the one slug and every row would read ambiguous
+  // — which is the failure this fixture would otherwise hide behind a passing "nothing retired".
+  const sigs = [CLEARED,
+    { ...CLEARED, id: 'sig-w', key: 'worked-key', detail: { work_item: worked.slug } },
+    { ...CLEARED, id: 'sig-f', key: 'foreign-key', detail: { work_item: foreign.slug } }]
+  const { deps, calls } = retireDeps({ items: [RAISED_ROW, worked, foreign], signals: sigs })
+  const stat = await retireSettledDrainerRows(deps, {})
+  assert.equal(stat.checked, 3)
+  assert.equal(stat.retired, 1)
+  assert.equal(stat.left, 2)
+  assert.deepEqual(calls.closes.map((c) => c.itemId), ['item-1'])
+})
+
+// ── DEFECT INJECTION ───────────────────────────────────────────────────────────────────────
+//
+// A guard is only proven by removing it. Each of these loads board-drainer.mjs with ONE guard
+// line deleted and asserts the row is then WRONGLY closed — so if somebody deletes that line for
+// real, the matching test above turns red. The loader asserts the line it deletes exists exactly
+// once, so a guard that is renamed or rewritten fails loudly here rather than silently leaving
+// the injection testing nothing.
+const drainerSource = fs.readFileSync(new URL('../scripts/board-drainer.mjs', import.meta.url), 'utf8')
+
+async function withoutGuard(needle) {
+  const lines = drainerSource.split(/\r?\n/)
+  const hits = lines.filter((l) => l.includes(needle))
+  assert.equal(hits.length, 1, `the guard line containing ${JSON.stringify(needle)} must exist exactly once (found ${hits.length}) — this injection proves nothing otherwise`)
+  const broken = lines.filter((l) => !l.includes(needle)).join('\n')
+    // The copy runs from the OS temp directory, so its relative imports have to be re-pointed at
+    // the real modules. Everything else about the module is byte-identical.
+    .replace(/from '\.\/lib\//g, `from '${new URL('../scripts/lib/', import.meta.url).href}`)
+  const file = path.join(os.tmpdir(), `board-drainer.defect.${process.pid}.${Math.random().toString(36).slice(2)}.mjs`)
+  fs.writeFileSync(file, broken)
+  try { return await import(toFileURL(file).href) } finally { fs.rmSync(file, { force: true }) }
+}
+
+ta('DEFECT INJECTION: delete the terminal-state guard and all 38 superseded rows close at once', async () => {
+  const superseded = { ...CLEARED, state: 'superseded' }
+  assert.equal(drainerRetirementDecision({ item: RAISED_ROW, signal: superseded }).act, 'leave')
+  const broken = await withoutGuard('if (!TERMINAL_INCIDENT_STATES.has(signal.state)) return')
+  assert.equal(broken.drainerRetirementDecision({ item: RAISED_ROW, signal: superseded }).act, 'retire',
+    'without that one line every row this drainer ever minted closes itself one tick after minting')
+})
+
+ta('DEFECT INJECTION: delete the started_at guard and the 12 rows a session worked are closed', async () => {
+  const worked = { ...RAISED_ROW, started_at: '2026-09-01T10:00:00Z' }
+  assert.equal(drainerRetirementDecision({ item: worked, signal: CLEARED }).act, 'leave')
+  const broken = await withoutGuard('if (item.started_at) return')
+  assert.equal(broken.drainerRetirementDecision({ item: worked, signal: CLEARED }).act, 'retire')
+})
+
+ta('DEFECT INJECTION: delete the human-question guard and a person question is closed away', async () => {
+  const asked = { ...RAISED_ROW, status: 'blocked', blocked_owner: 'roger', blocked_question: 'Which of the three vendor logins do you want kept?' }
+  assert.equal(drainerRetirementDecision({ item: asked, signal: CLEARED }).act, 'leave')
+  const broken = await withoutGuard('if (!ours.has(question)) return')
+  assert.equal(broken.drainerRetirementDecision({ item: asked, signal: CLEARED }).act, 'retire')
+})
+
+ta('DEFECT INJECTION: delete the provenance guard and 37 rows an agent opened become ours to close', async () => {
+  const foreign = { ...RAISED_ROW, opened_by: 'agent' }
+  assert.equal(drainerRetirementDecision({ item: foreign, signal: CLEARED }).act, 'leave')
+  const broken = await withoutGuard("if (item?.opened_by !== 'board-drainer') return")
+  assert.equal(broken.drainerRetirementDecision({ item: foreign, signal: CLEARED }).act, 'retire')
+})
+
+ta('DEFECT INJECTION: delete the circular-receipt guard and a re-opened row closes itself again', async () => {
+  const circular = { ...CLEARED, detail: { ...CLEARED.detail, resolved_by: 'board-drainer/signal-closure' } }
+  assert.equal(drainerRetirementDecision({ item: RAISED_ROW, signal: circular }).act, 'leave')
+  const broken = await withoutGuard('if (signal?.detail?.resolved_by === CIRCULAR_RESOLVE_AUTHOR) return')
+  assert.equal(broken.drainerRetirementDecision({ item: RAISED_ROW, signal: circular }).act, 'retire',
+    'the item finished -> signal resolved -> item finished loop is closed by exactly one line')
+})
+
+ta('DEFECT INJECTION: delete the receipt guard and a row closes carrying no receipt at all', async () => {
+  const noLink = { ...CLEARED, link: null }
+  assert.equal(drainerRetirementDecision({ item: RAISED_ROW, signal: noLink }).act, 'leave')
+  const broken = await withoutGuard('if (!/^https?:\\/\\//i.test(receipt)) return')
+  const v = broken.drainerRetirementDecision({ item: RAISED_ROW, signal: noLink })
+  assert.equal(v.act, 'retire')
+  assert.equal(v.receipt, '', 'and it would then close carrying an empty receipt, which sql/077 exists to refuse')
+})
+
+await Promise.all(pending)
+
+console.log(`
+${n} assertions passed.`)
