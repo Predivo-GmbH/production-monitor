@@ -172,6 +172,9 @@ const NON_BROWSER_UA = 'board-drainer/1.0'   // sb_secret keys are 403'd under a
 
 const LIVE = process.env.BOARD_DRAINER_LIVE === '1'
 const FIXTURE = process.env.BOARD_DRAINER_FIXTURE || null
+// `--reconcile-parked`: publish the park set and do nothing else. See the branch in main().
+const RECONCILE_ONLY = process.argv.includes('--reconcile-parked')
+let reconcileOnly = false
 
 // -- the one launcher every automation goes through (docs/CONTRACT-agent-run-2026-08-30.md) --
 // The drainer no longer spawns `claude` itself: agent-run reads the cockpit's automation
@@ -588,6 +591,165 @@ async function clearParkedOnSignal(secret, source, key) {
   } catch (e) {
     log(`  parked flag NOT cleared for ${key} (${String(e).slice(0, 120)}) — the row may still read parked on /signals until the next write.`)
     return false
+  }
+}
+
+/**
+ * RE-ASSERT THE PARK SET ON EVERY RUN — the flag is a STATE, not an event.
+ *
+ * WHY (board key production-monitor/board-drainer-stalled, verdict `parks-unpublished`, 2026-09-03).
+ * `detail.parked = true` was written in exactly ONE place: the branch in main() that first records
+ * an item stuck. Nothing ever wrote it again. That makes the published flag an EDGE — it exists on
+ * a row only if one particular PATCH, on one particular run, on one particular machine, happened to
+ * succeed. Measured on production 2026-09-02: the drainer's heartbeat said 9 findings were parked
+ * and 2 rows on the board published the flag. The other 7 were abandoned only inside
+ * `C:\Business\_board-drainer\state.json`, on whichever machine ran the task — no query, no page
+ * and no person could name them. Three separate ways to arrive at that:
+ *
+ *   * the write failed (a 4xx, a dropped socket) and the item was parked anyway — parking is
+ *     recorded LAST on purpose, so a failed escalation is retried, but a failed EVIDENCE write is
+ *     not distinguishable from a successful one by anything that runs later;
+ *   * the item was parked before the flag existed at all (every park older than Plan B B3 part 1);
+ *   * something else rewrote `detail` — it MERGES (migration 136), but a producer that re-files the
+ *     same key with its own detail still wins any key it names.
+ *
+ * So the drainer now RECONCILES instead of stamping: every run, it reads the active board, compares
+ * it against its own `state.stuck`, and makes the board agree — publishing the flag on every item it
+ * currently considers parked and CLEARING it on every item it does not. It is idempotent (a row that
+ * already agrees is never written), it is cheap (one read, plus one PATCH per disagreement, and the
+ * steady state is zero PATCHes), and it is self-healing: a park whose write failed is republished on
+ * the next tick instead of being invisible for ever.
+ *
+ * MATCHING. A stuck marker recorded since 2026-09-02 carries the signal's `source`, and then the
+ * match is exact. A legacy marker has only the key; if more than one active row shares that key the
+ * reconcile REFUSES it by name rather than guessing which row to write — the same rule
+ * clearParkedOnSignal follows, for the same reason.
+ *
+ * WHAT IT CANNOT SEE, and why that is right: a key in `state.stuck` with no row on the active board
+ * is not republished — there is nothing on the board to publish onto. Those are cleared by the
+ * stale-marker prune in main(), which calls clearParkedOnSignal() on the row wherever it now sits.
+ *
+ * @param {{readActive:Function, patchDetail:Function, log?:Function}} deps
+ * @param {{state:object, dryRun?:boolean}} opts
+ * @returns {Promise<{desired:number, published:number, asserted:string[], cleared:string[],
+ *                    unmatched:string[], ambiguous:string[], errors:string[]}>}
+ */
+export async function reconcileParkedFlags(deps, { state, dryRun = false } = {}) {
+  const say = deps.log || (() => {})
+  const stuck = (state && state.stuck) || {}
+  const out = { desired: 0, published: 0, asserted: [], cleared: [], unmatched: [], ambiguous: [], errors: [] }
+  const rows = await deps.readActive()
+
+  // Which live row does each parked marker belong to? Built once, both directions.
+  const byKey = new Map()
+  for (const r of rows) {
+    if (!byKey.has(r.key)) byKey.set(r.key, [])
+    byKey.get(r.key).push(r)
+  }
+  const wanted = new Map()   // row identity -> the marker that says it is parked
+  const idOf = (r) => `${r.source}/${r.key}`
+  for (const [key, mark] of Object.entries(stuck)) {
+    const candidates = byKey.get(key) || []
+    if (candidates.length === 0) { out.unmatched.push(key); continue }
+    let row = null
+    if (mark && mark.source) row = candidates.find((c) => c.source === mark.source) || null
+    else if (candidates.length === 1) row = candidates[0]
+    if (!row) {
+      // Either a legacy marker whose key is shared by several rows, or a source that no longer
+      // matches any of them. Both mean "we do not know which row this is about", and a wrong write
+      // would mark a live finding as abandoned.
+      out.ambiguous.push(key)
+      continue
+    }
+    wanted.set(idOf(row), { at: mark.at ?? null, attempts: mark.attempts ?? null })
+  }
+  out.desired = wanted.size
+
+  for (const row of rows) {
+    const id = idOf(row)
+    const detail = (row.detail && typeof row.detail === 'object') ? row.detail : {}
+    const mark = wanted.get(id) || null
+    if (detail.parked === true) out.published += 1
+    // The full triple is compared, not just the boolean: a row that says parked=true with the wrong
+    // timestamp or the wrong attempt count is publishing a fact we do not hold, and the cockpit
+    // renders both (useFleetSignals: isParked / parkedAt / parkedAttempts).
+    const target = parkedFields(mark ? { parked: true, at: mark.at, attempts: mark.attempts } : null)
+    // AN ABSENT FLAG ALREADY MEANS NOT-PARKED, and it must not be rewritten to say so. The cockpit
+    // renders a strict `detail.parked === true` (useFleetSignals), so a row that never carried the
+    // key reads exactly like `parked: false`. Treating the two as different would PATCH every row
+    // on the board on the first run after this shipped - a hundred writes that change nothing, and
+    // a churn of noise that makes the real corrections impossible to spot.
+    const agrees = mark
+      ? detail.parked === true
+        && (detail.parked_at ?? null) === target.parked_at
+        && (detail.parked_attempts ?? null) === target.parked_attempts
+      : detail.parked !== true
+        && (detail.parked_at ?? null) === null
+        && (detail.parked_attempts ?? null) === null
+    if (agrees) continue
+    const bucket = mark ? out.asserted : out.cleared
+    if (dryRun) {
+      say(`    would ${mark ? 'assert' : 'clear'} detail.parked on ${id} (the board says ${JSON.stringify(detail.parked ?? null)}, the drainer says ${JSON.stringify(target.parked)})`)
+      bucket.push(id)
+      continue
+    }
+    try {
+      await deps.patchDetail(row, { ...detail, ...target })
+      bucket.push(id)
+      say(`    ${id}: detail.parked ${mark ? `RE-ASSERTED (parked since ${target.parked_at || 'an unrecorded time'}, ${target.parked_attempts ?? '?'} attempts)` : 'CLEARED (the drainer no longer considers it parked)'}`)
+    } catch (e) {
+      out.errors.push(`${id}: ${String(e).slice(0, 160)}`)
+    }
+  }
+  return out
+}
+
+/** The live transport for reconcileParkedFlags. Reads the same active band the drainer works
+ *  (`open`/`acknowledged`), NOT the writable-source subset: a parked flag has to be corrected on
+ *  every row that carries one, including sources monitoring_incidents would reject. */
+export function parkedReconcileDeps(secret, logFn = log) {
+  const H = { apikey: secret, Authorization: `Bearer ${secret}`, 'User-Agent': NON_BROWSER_UA }
+  return {
+    log: logFn,
+    readActive: async () => {
+      const res = await fetch(`${BO_BASE}/rest/v1/fleet_signals?select=source,key,detail&state=in.(open,acknowledged)&limit=2000`, { headers: H })
+      if (!res.ok) throw new Error(`board read for the parked reconcile HTTP ${res.status}`)
+      return res.json()
+    },
+    patchDetail: async (row, detail) => {
+      const filter = `key=eq.${encodeURIComponent(row.key)}&source=eq.${encodeURIComponent(row.source)}`
+      const res = await fetch(`${BO_BASE}/rest/v1/fleet_signals?${filter}`, {
+        method: 'PATCH',
+        headers: { ...H, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+        body: JSON.stringify({ detail }),
+      })
+      if (!res.ok) throw new Error(`patch HTTP ${res.status}`)
+    },
+  }
+}
+
+/**
+ * Run the reconcile and SAY WHAT IT DID, every run, including the boring one. A pass that only
+ * speaks up when it changed something cannot be told apart from a pass that did not run — which is
+ * the failure this file keeps re-learning.
+ *
+ * A failure here is announced and swallowed: publishing bookkeeping must never take the run down.
+ */
+async function runParkedReconcile(secret, state, { dryRun }) {
+  if (FIXTURE || !secret) return null
+  try {
+    const r = await reconcileParkedFlags(parkedReconcileDeps(secret), { state, dryRun })
+    log(`  ⏱ parked-flag reconcile${dryRun ? ' (DRY-RUN, nothing written)' : ''}: ${r.desired} item(s) the drainer considers parked, ${r.published} row(s) were publishing detail.parked=true`
+      + ` — ${dryRun ? 'would re-assert' : 're-asserted'} ${r.asserted.length}, ${dryRun ? 'would clear' : 'cleared'} ${r.cleared.length}.`)
+    if (r.asserted.length) log(`    re-asserted: ${r.asserted.join(', ')}`)
+    if (r.cleared.length) log(`    cleared: ${r.cleared.join(', ')}`)
+    if (r.unmatched.length) log(`    ${r.unmatched.length} parked marker(s) have no row on the active board, so there is nothing to publish onto (the stale-marker prune clears those): ${r.unmatched.join(', ')}`)
+    if (r.ambiguous.length) log(`    ⚠ ${r.ambiguous.length} parked marker(s) could NOT be matched to exactly one row and were left alone rather than guessed at: ${r.ambiguous.join(', ')}`)
+    for (const e of r.errors) log(`    ⚠ parked-flag reconcile error: ${e}`)
+    return r
+  } catch (e) {
+    log(`  ⚠ the parked-flag reconcile could not run (${String(e).slice(0, 160)}) — the published flags may disagree with the drainer's own state until the next run.`)
+    return null
   }
 }
 
@@ -2352,6 +2514,25 @@ async function main() {
     log(`  BOARD_DRAINER_RESET_STUCK=${reset} — cleared ${keys.length} parked item(s): ${keys.join(', ') || '(none)'}`)
   }
 
+  // ── `--reconcile-parked`: the park set, published, and NOTHING else ─────────────────────────
+  // Two uses. It REPAIRS a board whose flags drifted from the drainer's own state without waiting
+  // for the next scheduled run, and it PROVES the publication contract end to end from any machine
+  // (point BOARD_DRAINER_HOME at a scratch state file, delete the flag on a row, run this, read the
+  // row back). It stops before classification, so no agent runs and nothing is dispatched.
+  //
+  // It deliberately writes NO heartbeat (see the .then handler at the bottom): a heartbeat from a
+  // run that never looked at the board would publish considered=0 over the real one, and
+  // check-drainer-progress.mjs would read a rehearsal as the live fixer — the exact failure its
+  // `dry` flag was added for on 2026-09-01.
+  if (RECONCILE_ONLY) {
+    reconcileOnly = true
+    const reconcileSecret = readBoSecret()
+    log(`RECONCILE-ONLY: ${Object.keys(state.stuck).length} parked marker(s) in ${STATE}${LIVE ? '' : ' — DRY-RUN, nothing will be written (set BOARD_DRAINER_LIVE=1 to write)'}`)
+    await runParkedReconcile(reconcileSecret, state, { dryRun: !LIVE })
+    log('Board Drainer done (reconcile-only).')
+    return
+  }
+
   // 1. read the work-list
   let secret = null, incidents = [], priorityKeys = []
   // Did EVERY work-list source load this run? The prune below must never run on a partial
@@ -2446,7 +2627,13 @@ async function main() {
 
   log(`board: ${incidents.length} open/acknowledged signal(s) on fleet_signals`)
   runStats.considered = incidents.length
-  if (incidents.length === 0) { log('nothing to drain — board is clean.'); return }
+  if (incidents.length === 0) {
+    // STILL RECONCILE. A clean board is exactly when a stale `parked: true` is most misleading:
+    // the page would name an abandoned finding that the drainer no longer holds any record of.
+    await runParkedReconcile(secret, state, { dryRun: !LIVE })
+    log('nothing to drain — board is clean.')
+    return
+  }
 
   // 2. classify all (every open incident is re-verified), then work up to the per-run cap
   const routed = incidents.map((inc) => ({ inc, cls: classify(inc) }))
@@ -2477,11 +2664,13 @@ async function main() {
   if (parked.length) {
     log(`  PARKED at the attempt ceiling (${MAX_ATTEMPTS} failed tries), not dispatched and not re-escalated: ${parked.length}`)
     for (const { inc } of parked) log(`    ⏸ ${inc.source}/${inc.key} :: ${inc.title}`)
-    // The old version of this line said "Each is published as detail.parked=true on its signal
-    // row". Measured 2026-09-02 that was false for 7 of 9: the flag is written ONCE, in the branch
-    // that first records an item stuck, and nothing re-asserts it — so a park made before the flag
-    // existed, or one whose write failed, is invisible for ever. Say what actually happens.
-    log(`    Each was published as detail.parked=true at the moment it was parked (not re-asserted since), one is retried every ${PARKED_RETRY_INTERVAL_MS / 3600_000}h, and up to ${MAX_PARKED_HANDOVER_PER_RUN} are handed to the work board per run, oldest-parked first. To jump that queue: press "Hand to Claude" on /signals, or run with BOARD_DRAINER_RESET_STUCK=<key> (or =all).`)
+    // This line has now been wrong twice, in opposite directions, so it says exactly what the code
+    // does. It first claimed "each is published as detail.parked=true on its signal row" while the
+    // flag was written ONCE at the moment of parking and never again — false for 7 of 9 rows on
+    // 2026-09-02. It then said so honestly. Since 2026-09-03 the run ENDS with a reconcile that
+    // re-derives the published set from state.stuck, so the original claim is true again — and it is
+    // true because something asserts it every tick, not because one write once succeeded.
+    log(`    Each is re-published as detail.parked=true at the end of EVERY run (the reconcile below), one is retried every ${PARKED_RETRY_INTERVAL_MS / 3600_000}h, and up to ${MAX_PARKED_HANDOVER_PER_RUN} are handed to the work board per run, oldest-parked first. To jump that queue: press "Hand to Claude" on /signals, or run with BOARD_DRAINER_RESET_STUCK=<key> (or =all).`)
   }
   // Clearing path 4 of 4, and the reason the board can now drain on its own. Named loudly with
   // WHY it was chosen, because "the machine picked one" is not an explanation anybody can audit.
@@ -2519,6 +2708,9 @@ async function main() {
       const { title, objections } = plainTitle(inc)
       log(`  DRY-RUN would mint ${workItemSlugFor(inc)} :: ${title}${objections.length ? `  ⚠ title objections: ${objections.join('; ')}` : ''}`)
     }
+    // A dry run REPORTS the disagreement between the drainer's park set and the published flags
+    // and writes nothing. That report is the cheapest way to see the defect from any machine.
+    await runParkedReconcile(secret, state, { dryRun: true })
     saveState(state)
     return
   }
@@ -2788,6 +2980,14 @@ async function main() {
       log(`  ${inc.key}: ERRORED mid-work (${String(e).slice(0, 160)}) — attempt recorded, continuing with the next item.`)
     }
   }
+
+  // ── LAST, and unconditionally: make the BOARD agree with the drainer's own park set ─────────
+  // Every branch above that parks, un-parks or hands over an item writes its own flag inline. This
+  // pass exists because those writes are EDGES: one PATCH, one run, one machine, and a park whose
+  // write failed — or one made before the flag existed — is otherwise invisible for ever. Running
+  // it here, after every state mutation of the run, means the published set is re-derived from
+  // `state.stuck` every single tick.
+  await runParkedReconcile(secret, state, { dryRun: false })
   log('Board Drainer done.')
 }
 
@@ -2813,7 +3013,9 @@ function alertFailure(msg) {
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
   main().then(
     async () => {
-      await writeRunHeartbeat(null)
+      // A reconcile-only run publishes no heartbeat: it never looked at the board as work, and a
+      // considered=0 heartbeat would overwrite the live fixer's own meter.
+      if (!reconcileOnly) await writeRunHeartbeat(null)
       // Contract section 7: on a deliberate off the caller pings NOTHING - not success, not /fail.
       const hc = process.env.BOARD_DRAINER_HC; if (hc && !switchedOff) fetch(hc).catch(() => {})
     },
@@ -2822,7 +3024,7 @@ if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
       // A run that died still publishes what it managed to do. An alarm that only ever hears
       // from healthy runs is blind to precisely the runs worth hearing about.
       runStats.error = e?.message || String(e)
-      await writeRunHeartbeat(null)
+      if (!reconcileOnly) await writeRunHeartbeat(null)
       alertFailure(e?.stack || e?.message || String(e))
       process.exitCode = 1
     },

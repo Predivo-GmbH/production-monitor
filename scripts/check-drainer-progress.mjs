@@ -401,7 +401,7 @@ export function judgeDrainer({
         verdict: 'parks-unpublished',
         severity: gap >= parkFloor ? 'critical' : 'warning',
         title: 'The fleet auto-fixer cannot say WHICH findings it abandoned',
-        summary: `The drainer's own count says ${parked} finding(s) are parked, and only ${board.parkedPublished.length} row(s) on the board publish detail.parked=true. The other ${gap} exist as abandoned only inside the drainer's local state file on one machine: no query, no page and no person can name them. The flag is written once, in the branch that first records an item stuck, and nothing ever re-asserts it — so a park whose write failed, or one made before the flag existed, is invisible for ever.`,
+        summary: `The drainer's own count says ${parked} finding(s) are parked, and only ${board.parkedPublished.length} row(s) on the board publish detail.parked=true. The other ${gap} exist as abandoned only inside the drainer's local state file on one machine: no query, no page and no person can name them. Since 2026-09-03 the drainer re-derives the whole published set from its own state file at the end of every run, so a gap that survives a tick is NOT the old write-once defect: either the reconcile could not write (it names each failure in the run log), or the parked marker names a key that is no longer on the active board.`,
       }
     }
   }

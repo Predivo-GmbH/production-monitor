@@ -5,7 +5,7 @@
  * Run: node test/board-drainer.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
-import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, stuckRootCause, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, workableFinding, parkedFields, gateFor, stripCode, actionOf, plainTitle, titleObjections, workItemSlugFor, handoffPrompt, routeToWorkBoard, prose, DEPLOY_DENY_TOOLS, agentToolFlags, signalObjects, signalPhrases, matchItem, findJoinTarget, joinMarker, expectedBusinessApplies, handedOverClearsCounter, parkedHandoverQueue, mintOpenedAt } from '../scripts/board-drainer.mjs'
+import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, stuckRootCause, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, workableFinding, parkedFields, gateFor, stripCode, actionOf, plainTitle, titleObjections, workItemSlugFor, handoffPrompt, routeToWorkBoard, prose, DEPLOY_DENY_TOOLS, agentToolFlags, signalObjects, signalPhrases, matchItem, findJoinTarget, joinMarker, expectedBusinessApplies, handedOverClearsCounter, parkedHandoverQueue, mintOpenedAt, reconcileParkedFlags } from '../scripts/board-drainer.mjs'
 
 let n = 0
 const t = (name, fn) => { fn(); n++; console.log(`  ok - ${name}`) }
@@ -1574,6 +1574,149 @@ ta('REGRESSION: a signal with no first sighting still mints, with no opened_at k
   await routeToWorkBoard(inc, classify(inc), b.deps)
   const [item] = [...b.items.values()]
   assert.ok(!('opened_at' in item), 'sending an explicit null would defeat the column default')
+})
+
+// ── the park set is RE-ASSERTED every run, never stamped once ────────────────────────────────
+//
+// FAULT INJECTION, not a happy path. The defect these cover (board verdict `parks-unpublished`,
+// 2026-09-03) is precisely that the happy path worked: the flag WAS written, once, in the branch
+// that first parks an item — and any row where that single write did not land, or landed before the
+// flag existed, stayed abandoned-but-unnameable for ever. So every case below starts from a board
+// that DISAGREES with the drainer's own state file and asserts that one run makes it agree.
+function fakeSignals(rows) {
+  const board = rows.map((r) => ({ ...r, detail: { ...(r.detail || {}) } }))
+  const patches = []
+  const deps = {
+    readActive: async () => board,
+    patchDetail: async (row, detail) => {
+      patches.push({ id: `${row.source}/${row.key}`, detail })
+      const live = board.find((b) => b.source === row.source && b.key === row.key)
+      live.detail = detail
+    },
+  }
+  return { board, patches, deps }
+}
+const PARKED_AT = '2026-08-25T09:36:57.941Z'
+
+ta('FAULT-INJECTED: a parked item whose published flag was DELETED gets it back on the next run', async () => {
+  // The exact live shape on 2026-09-02: state.stuck holds it, the row publishes nothing at all.
+  const f = fakeSignals([{ source: 'commit-review', key: 'a-thing-we-gave-up-on', detail: { note: 'kept' } }])
+  const state = { stuck: { 'a-thing-we-gave-up-on': { at: PARKED_AT, attempts: 3, source: 'commit-review' } } }
+  const r = await reconcileParkedFlags(f.deps, { state })
+  assert.strictEqual(r.desired, 1)
+  assert.strictEqual(r.published, 0, 'the board published nothing before the run - that is the defect')
+  assert.deepStrictEqual(r.asserted, ['commit-review/a-thing-we-gave-up-on'])
+  assert.strictEqual(f.board[0].detail.parked, true, 'the flag came back')
+  assert.strictEqual(f.board[0].detail.parked_at, PARKED_AT, 'with the ORIGINAL park time, not now')
+  assert.strictEqual(f.board[0].detail.parked_attempts, 3)
+  assert.strictEqual(f.board[0].detail.note, 'kept', 'the rest of detail is preserved - PATCH replaces the whole jsonb')
+})
+
+ta('FAULT-INJECTED: a CORRUPTED flag (parked=false on a parked item) is corrected', async () => {
+  const f = fakeSignals([{ source: 'commit-review', key: 'k', detail: { parked: false, parked_at: null, parked_attempts: null } }])
+  const state = { stuck: { k: { at: PARKED_AT, attempts: 3, source: 'commit-review' } } }
+  const r = await reconcileParkedFlags(f.deps, { state })
+  assert.deepStrictEqual(r.asserted, ['commit-review/k'])
+  assert.strictEqual(f.board[0].detail.parked, true)
+})
+
+ta('FAULT-INJECTED: a flag with the WRONG timestamp is corrected, not left because the boolean matches', async () => {
+  const f = fakeSignals([{ source: 'commit-review', key: 'k', detail: { parked: true, parked_at: '2020-01-01T00:00:00.000Z', parked_attempts: 1 } }])
+  const state = { stuck: { k: { at: PARKED_AT, attempts: 3, source: 'commit-review' } } }
+  const r = await reconcileParkedFlags(f.deps, { state })
+  assert.deepStrictEqual(r.asserted, ['commit-review/k'], 'the whole triple is the contract, not just parked===true')
+  assert.strictEqual(f.board[0].detail.parked_at, PARKED_AT)
+  assert.strictEqual(f.board[0].detail.parked_attempts, 3)
+})
+
+ta('a row the drainer no longer considers parked has the flag CLEARED', async () => {
+  // The other direction, and it matters just as much: detail MERGES (migration 136), so a stale
+  // parked:true survives a resolve and the item would be born parked the next time it goes down.
+  const f = fakeSignals([{ source: 'healthchecks', key: 'k', detail: { parked: true, parked_at: PARKED_AT, parked_attempts: 3 } }])
+  const r = await reconcileParkedFlags(f.deps, { state: { stuck: {} } })
+  assert.strictEqual(r.published, 1)
+  assert.deepStrictEqual(r.cleared, ['healthchecks/k'])
+  assert.strictEqual(f.board[0].detail.parked, false)
+  assert.strictEqual(f.board[0].detail.parked_at, null)
+})
+
+ta('IDEMPOTENT: a board that already agrees is not written at all', async () => {
+  const f = fakeSignals([
+    { source: 'commit-review', key: 'parked-one', detail: { parked: true, parked_at: PARKED_AT, parked_attempts: 3 } },
+    { source: 'healthchecks', key: 'fine-one', detail: { parked: false, parked_at: null, parked_attempts: null } },
+  ])
+  const state = { stuck: { 'parked-one': { at: PARKED_AT, attempts: 3, source: 'commit-review' } } }
+  const r = await reconcileParkedFlags(f.deps, { state })
+  assert.strictEqual(f.patches.length, 0, 'the steady state costs zero writes')
+  assert.strictEqual(r.asserted.length + r.cleared.length, 0)
+})
+
+ta('a DRY-RUN reports the disagreement and writes nothing', async () => {
+  const f = fakeSignals([{ source: 'commit-review', key: 'k', detail: {} }])
+  const state = { stuck: { k: { at: PARKED_AT, attempts: 3, source: 'commit-review' } } }
+  const r = await reconcileParkedFlags(f.deps, { state, dryRun: true })
+  assert.deepStrictEqual(r.asserted, ['commit-review/k'], 'it still NAMES what is wrong')
+  assert.strictEqual(f.patches.length, 0, 'and touches nothing')
+  assert.strictEqual(f.board[0].detail.parked, undefined)
+})
+
+ta('a legacy marker (no source) whose key matches ONE row is published', async () => {
+  const f = fakeSignals([{ source: 'production-monitor', key: 'legacy-key', detail: {} }])
+  const r = await reconcileParkedFlags(f.deps, { state: { stuck: { 'legacy-key': { at: PARKED_AT, attempts: 3 } } } })
+  assert.deepStrictEqual(r.asserted, ['production-monitor/legacy-key'])
+})
+
+ta('a legacy marker whose key matches TWO rows is REFUSED by name, never guessed at', async () => {
+  const f = fakeSignals([
+    { source: 'healthchecks', key: 'shared-key', detail: {} },
+    { source: 'sentry', key: 'shared-key', detail: {} },
+  ])
+  const r = await reconcileParkedFlags(f.deps, { state: { stuck: { 'shared-key': { at: PARKED_AT, attempts: 3 } } } })
+  assert.deepStrictEqual(r.ambiguous, ['shared-key'], 'marking a live finding as abandoned is worse than saying "I do not know which"')
+  assert.strictEqual(f.patches.length, 0)
+})
+
+ta('a parked marker with no row on the active board is reported, not silently dropped', async () => {
+  const f = fakeSignals([{ source: 'healthchecks', key: 'something-else', detail: {} }])
+  const r = await reconcileParkedFlags(f.deps, { state: { stuck: { 'gone-from-the-board': { at: PARKED_AT, attempts: 3, source: 'cron' } } } })
+  assert.deepStrictEqual(r.unmatched, ['gone-from-the-board'])
+  assert.strictEqual(f.patches.length, 0, 'there is no row to publish onto; the stale-marker prune clears it')
+})
+
+ta('ONE FAILING WRITE COSTS ONE ROW: the other parked item is still published', async () => {
+  // The whole point of a reconcile is that a failed write is retried next tick rather than losing
+  // the fact for ever - so a failure here is NAMED and the pass carries on.
+  const f = fakeSignals([
+    { source: 'commit-review', key: 'bad', detail: {} },
+    { source: 'commit-review', key: 'good', detail: {} },
+  ])
+  const base = f.deps.patchDetail
+  f.deps.patchDetail = async (row, detail) => { if (row.key === 'bad') throw new Error('HTTP 409'); return base(row, detail) }
+  const state = { stuck: {
+    bad: { at: PARKED_AT, attempts: 3, source: 'commit-review' },
+    good: { at: PARKED_AT, attempts: 3, source: 'commit-review' },
+  } }
+  const r = await reconcileParkedFlags(f.deps, { state })
+  assert.strictEqual(r.errors.length, 1, 'the failure is reported, never swallowed into the count')
+  assert.deepStrictEqual(r.asserted, ['commit-review/good'])
+  assert.strictEqual(f.board[1].detail.parked, true)
+})
+
+ta('THE VERDICT THIS CLOSES: after one reconcile, published >= the drainer parked count', async () => {
+  // check-drainer-progress.judgeDrainer() fires `parks-unpublished` when
+  // heartbeat.detail.parked > (rows publishing detail.parked===true). Reproduce the live 2026-09-02
+  // gap - 9 parked, 2 published - and assert one reconcile pass closes it to zero.
+  const keys = Array.from({ length: 9 }, (_, i) => `parked-${i}`)
+  const f = fakeSignals(keys.map((k, i) => ({
+    source: 'commit-review', key: k,
+    detail: i < 2 ? { parked: true, parked_at: PARKED_AT, parked_attempts: 3 } : {},
+  })))
+  const state = { stuck: Object.fromEntries(keys.map((k) => [k, { at: PARKED_AT, attempts: 3, source: 'commit-review' }])) }
+  const before = f.board.filter((r) => r.detail.parked === true).length
+  assert.strictEqual(before, 2, 'the board before: 9 parked, 2 nameable')
+  await reconcileParkedFlags(f.deps, { state })
+  const after = f.board.filter((r) => r.detail.parked === true).length
+  assert.strictEqual(after, 9, 'every abandoned finding can now be named from the board alone')
 })
 
 await Promise.all(pending)
