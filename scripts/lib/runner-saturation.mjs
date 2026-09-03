@@ -7,66 +7,67 @@
 //
 // He was mistaken about the cause - measured over 239 jobs while both machines were serving, the
 // laptop's median queue wait was identical (3.0s) and the same job took 0.99x as long. But he was
-// RIGHT that nothing was watching. Every existing check asks whether a runner is PRESENT. None
-// asked whether work is WAITING. A fleet can be fully online and still too small.
+// RIGHT that nothing was watching. Every other check here asks whether a runner is PRESENT. None
+// asked whether the work is MOVING. A fleet can be fully online and still too small.
 //
-// WHAT THIS WATCHES IS THE HARM, NOT THE COMPONENT: a job that has been handed to us and is
-// sitting in a queue. Not core counts, not load averages, not "is the machine up" - a real job
-// that cannot start. That is the same rule the runner-loss check follows, for the same reason:
-// a proxy goes green for the wrong thing, the harm does not.
+// WHAT THIS WATCHES IS THE HARM, NOT THE COMPONENT: a job that has been handed to us and cannot
+// start. Not core counts, not load averages, not "is the machine up".
+//
+// IT ASKS PER REPOSITORY, AND THAT IS THE WHOLE POINT. The first version of this file compared
+// queued jobs against the FLEET's busy runners and, on its first live run, called a real Valrano
+// backlog "not a capacity problem" because 22 runners were idle - in other repositories. A GitHub
+// runner is registered to ONE repository and can never take another's work, so a fleet total is
+// the wrong denominator. This is the same defect the machine audit was written to fix, one layer
+// down: A COUNT THAT AGGREGATES CANNOT SEE THE PART OF IT THAT IS FULL.
 //
 // Two states share the symptom "jobs are queued" and are opposites, so they are reported apart:
-//   SATURATED    - jobs waiting AND our runners are nearly all busy. We are out of capacity.
-//                  The answer is a bigger or an extra CI machine, never Roger's work PC.
-//   STARVED      - jobs waiting while our runners sit IDLE. That is not capacity, that is a
-//                  mismatch: the jobs are asking for a label nothing here offers, and adding
-//                  hardware would fix nothing.
-
-/** Fraction of runners currently executing a job, 0 when there are none. */
-export function busyFraction({ busy, total }) {
-  return total > 0 ? busy / total : 0
-}
+//   SATURATED - this repository's own runners are ALL busy while its jobs wait. Real backlog.
+//               The answer is more runners or a bigger CI machine, never Roger's work PC.
+//   IDLE      - jobs waiting while this repository's runners sit doing nothing. Not capacity:
+//               a label mismatch, or a job asking for a runner this repository does not have.
+//               More hardware would fix nothing.
 
 /**
  * @param {{perRepo: Array<{repo: string, runners: Array<{status: string, busy: boolean}>}>,
- *          queued: Record<string, number>,
- *          saturatedAt?: number}} opts
- * @returns {{busy: number, online: number, queuedTotal: number, alerts: string[]}}
+ *          queuedOurs: Record<string, number>}} opts
+ *   `queuedOurs` = jobs QUEUED in that repo that ask for OUR runner label. Jobs waiting for a
+ *   GitHub-hosted runner are somebody else's queue and must never appear here.
+ * @returns {{busy: number, online: number, queuedTotal: number, perRepo: object, alerts: string[]}}
  */
-export function auditRunnerSaturation({ perRepo, queued = {}, saturatedAt = 0.9 }) {
-  let online = 0
-  let busy = 0
-  for (const { runners } of perRepo) {
-    for (const r of runners || []) {
-      if (r.status !== 'online') continue
-      online++
-      if (r.busy) busy++
-    }
-  }
-  const waiting = Object.entries(queued).filter(([, n]) => n > 0)
-  const queuedTotal = waiting.reduce((a, [, n]) => a + n, 0)
-  const frac = busyFraction({ busy, total: online })
+export function auditRunnerSaturation({ perRepo, queuedOurs = {} }) {
   const alerts = []
+  const detail = {}
+  let busy = 0
+  let online = 0
 
-  if (queuedTotal > 0) {
-    const where = waiting.map(([repo, n]) => `${repo} (${n})`).join(', ')
-    if (frac >= saturatedAt) {
+  for (const { repo, runners } of perRepo) {
+    const list = (runners || []).filter((r) => r.status === 'online')
+    const repoBusy = list.filter((r) => r.busy).length
+    const idle = list.length - repoBusy
+    const waiting = queuedOurs[repo] || 0
+    online += list.length
+    busy += repoBusy
+    detail[repo] = { online: list.length, busy: repoBusy, waiting }
+    if (waiting <= 0) continue
+
+    if (list.length > 0 && idle === 0) {
       alerts.push(
-        `CI IS SATURATED: ${queuedTotal} job(s) are waiting for a runner while ${busy} of ${online} ` +
-        `runners are already busy - ${where}. Our CI machine is at capacity, so deploys and gates ` +
-        `are queueing behind each other. The fix is more capacity on the CI host, or a second ` +
-        `dedicated machine. It is NOT Roger's work PC: he retired that on 2026-08-25 and again on ` +
-        `2026-09-03.`,
+        `CI IS SATURATED: ${repo} has ${waiting} job(s) waiting and all ${list.length} of its own ` +
+        `runners are busy. Runners belong to ONE repository, so idle runners elsewhere cannot take ` +
+        `this work - the fleet total is not the answer here. Deploys and gates in ${repo} are ` +
+        `queueing behind each other. The fix is more runners for ${repo} or a bigger CI machine. ` +
+        `It is NOT Roger's work PC: he retired that on 2026-08-25 and again on 2026-09-03.`,
       )
     } else {
       alerts.push(
-        `JOBS QUEUED WHILE RUNNERS ARE IDLE: ${queuedTotal} job(s) are waiting - ${where} - but only ` +
-        `${busy} of ${online} runners are busy. This is not a capacity problem and more hardware ` +
-        `would not fix it: those jobs are asking for a runner label nothing here offers, or their ` +
-        `repository has no runner registered.`,
+        `JOBS QUEUED WHILE ${repo.toUpperCase()}'S OWN RUNNERS ARE IDLE: ${waiting} job(s) waiting ` +
+        `with ${idle} of ${list.length} runners doing nothing. This is not capacity and more ` +
+        `hardware would fix nothing: those jobs are asking for a runner label this repository does ` +
+        `not offer, or it has no runner registered at all.`,
       )
     }
   }
 
-  return { busy, online, queuedTotal, alerts }
+  const queuedTotal = Object.values(queuedOurs).reduce((a, n) => a + (n > 0 ? n : 0), 0)
+  return { busy, online, queuedTotal, perRepo: detail, alerts }
 }

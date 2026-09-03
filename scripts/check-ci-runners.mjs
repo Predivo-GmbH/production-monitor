@@ -148,9 +148,14 @@ let migrated = 0
 // Kept so the per-MACHINE audit below can ask a question this loop structurally cannot: the loop
 // asks "does this repository have an online runner", and two machines share that one number.
 const perRepo = []
-// How many jobs are WAITING for a runner, per repository. Every other question in this file is
-// about presence; this one is about whether the work is moving. A fleet can be fully online and
-// still too small, and until 2026-09-03 nothing here would have said so.
+// How many jobs are WAITING FOR ONE OF OUR RUNNERS, per repository. Every other question in this
+// file is about presence; this one is about whether the work is moving. A fleet can be fully
+// online and still too small, and until 2026-09-03 nothing here would have said so.
+//
+// Counted per REPOSITORY and per JOB, deliberately. A run is "queued" if ANY of its jobs is, and
+// a job may be waiting for a GitHub-hosted runner, which is not our queue at all. So the run list
+// is only used to find candidates; what is counted is jobs with status "queued" whose labels ask
+// for OUR label.
 const queuedByRepo = {}
 
 for (const repo of repos) {
@@ -171,11 +176,22 @@ for (const repo of repos) {
   const list = runners.runners
   perRepo.push({ repo, runners: list })
 
-  // Soft: a repository whose queue we cannot read must not fail the fleet check. It is already
-  // counted by the runner-list read above, and a missing queue number is reported as unknown
-  // rather than silently as zero - zero is the answer that means "everything is fine".
-  const queuedRuns = await gh(`repos/${OWNER}/${repo}/actions/runs?status=queued&per_page=1`, {}, { soft: true })
-  if (typeof queuedRuns?.total_count === 'number') queuedByRepo[repo] = queuedRuns.total_count
+  // Soft: a repository whose queue we cannot read must not fail the fleet check. A queue we could
+  // not read is left UNRECORDED rather than written down as zero - zero is the answer that means
+  // "everything is fine", and that is the one answer we must never invent.
+  const queuedRuns = await gh(`repos/${OWNER}/${repo}/actions/runs?status=queued&per_page=10`, {}, { soft: true })
+  if (Array.isArray(queuedRuns?.workflow_runs)) {
+    let ours = 0
+    let readAll = true
+    // Queued runs are rare, so this costs nothing on a healthy fleet and only does work when
+    // something is actually waiting - which is exactly when we want the detail.
+    for (const run of queuedRuns.workflow_runs) {
+      const jobs = await gh(`repos/${OWNER}/${repo}/actions/runs/${run.id}/jobs?per_page=50`, {}, { soft: true })
+      if (!Array.isArray(jobs?.jobs)) { readAll = false; continue }
+      ours += jobs.jobs.filter((j) => j.status === 'queued' && (j.labels || []).includes(LABEL)).length
+    }
+    if (readAll || ours > 0) queuedByRepo[repo] = ours
+  }
 
   // The label is read for EVERY repository, BEFORE the "nothing registered" skip, because the two
   // cases that skip look identical from the runner list alone and are opposites:
@@ -302,10 +318,10 @@ for (const [machine, coveredRepos] of Object.entries(machineAudit.machines)) {
 // IS THE WORK MOVING? Presence is not throughput. Roger asked on 2026-09-03 whether the one
 // remaining CI machine can keep up, and no check could answer him - so this one watches the harm
 // directly: a job that has been handed to us and cannot start.
-const saturation = auditRunnerSaturation({ perRepo, queued: queuedByRepo })
+const saturation = auditRunnerSaturation({ perRepo, queuedOurs: queuedByRepo })
 alerts.push(...saturation.alerts)
 console.log(`runners busy       : ${saturation.busy} of ${saturation.online} online`)
-console.log(`jobs waiting       : ${saturation.queuedTotal}`)
+console.log(`jobs waiting       : ${saturation.queuedTotal} (asking for "${LABEL}")`)
 
 console.log(`repos with runners : ${migrated}`)
 console.log(`variable flips     : ${flipped.length ? flipped.join(', ') : 'none'}`)
