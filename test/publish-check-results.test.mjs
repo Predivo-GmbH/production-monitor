@@ -22,7 +22,7 @@ import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   TEST_DIR_TO_SLUG, NON_PRODUCT_DIRS, CLASSIFIER_RULES, FIELDS, LOGIN_METHOD_STRENGTH,
-  buildRows, collectChecks, classify, slugForFile, outcomeOf, messageOf,
+  buildRows, collectChecks, classify, slugForFile, outcomeOf, messageOf, neverReachedTheProduct,
   loadResults, runUrlFrom, parseArgs, describeRow,
   observationOf, attemptMessages, unprovenReasonOf,
   NOT_TESTED, OK, FAILED, UNPROVEN, SOURCE, MAX_MESSAGE,
@@ -56,6 +56,64 @@ const dirSuite = (dir, specs) => {
 }
 const report = (...suites) => ({ config: {}, suites, errors: [], stats: {} })
 const rowFor = (rows, slug) => rows.find((r) => r.slug === slug)
+/** The verbatim message every failure in run 33781865310 carried. */
+const GOTO_TIMEOUT = 'TimeoutError: page.goto: Timeout 30000ms exceeded.'
+
+// ── A TEST THAT DIED AT THE FRONT DOOR NEVER TESTED ITS SUBJECT ─────────────────────────────
+
+t('an E2E OTP test that times out in page.goto does NOT report mail as failed', () => {
+  // THE REAL INCIDENT, 2026-09-03, run 33781865310. Every one of BackOffice's failures carried
+  // this identical message. The test is named "E2E OTP: ..." so CLASSIFIER_RULES routes it to
+  // mail_delivery; the old code copied its fail across without reading WHY it failed, and the
+  // dashboard rendered mail_delivery='failed' as "login codes and invoices are not arriving for
+  // BackOffice — customers cannot get in". Meanwhile backoffice.predivo.ch answered HTTP 200 in
+  // 0.049s from another machine. Nothing about mail had been tested at all.
+  const rows = buildRows(report(dirSuite('backoffice', [
+    failed('auth page loads with form', GOTO_TIMEOUT),
+    failed('E2E OTP: request code → email delivery → enter code → dashboard', GOTO_TIMEOUT),
+    failed('CRM page loads', GOTO_TIMEOUT),
+  ])))
+  const r = rowFor(rows, 'backoffice')
+  assert.equal(r.mail_delivery, 'not-tested',
+    'a test that never loaded a page cannot report on mail delivery')
+  assert.equal(r.login, 'not-tested',
+    'nor on whether anyone can sign in')
+  assert.equal(r.login_method, 'none',
+    'and it proves no login method, since it never reached one')
+  // The SITE fact is the one thing such a failure really does establish, and it must survive:
+  // silencing everything would turn an outage into a green run.
+  assert.equal(r.site, 'failed', 'the page genuinely did not load, and that must still be said')
+  // The run stays visibly red. Abstaining on a verdict is not the same as hiding the failure.
+  assert.equal(r.checks_total, 3)
+  assert.equal(r.checks_passed, 0)
+  assert.equal(r.failures.length, 3, 'every failure is still listed for a human to read')
+})
+
+t('a REAL mail failure is still reported as failed', () => {
+  // The other half of the contract, and the one that makes the test above safe: if the OTP test
+  // fails for a reason that shows it actually ran, mail_delivery must still go red. Abstaining
+  // on everything would be its own defect — a monitor that can never say "mail is broken".
+  const rows = buildRows(report(dirSuite('backoffice', [
+    passed('auth page loads with form'),
+    failed('E2E OTP: request code → email delivery → enter code → dashboard',
+      'Error: the code never arrived: waited 120000ms for a message in the mailbox'),
+  ])))
+  const r = rowFor(rows, 'backoffice')
+  assert.equal(r.mail_delivery, 'failed',
+    'a genuine mail failure must still red the mail field')
+  assert.equal(r.site, 'ok')
+})
+
+t('the detector reads the reason, not the test name', () => {
+  assert.equal(neverReachedTheProduct(GOTO_TIMEOUT), true)
+  assert.equal(neverReachedTheProduct('page.goto: net::ERR_CONNECTION_REFUSED at https://x'), true)
+  // A timeout LATER in a test is not a front-door failure: waiting for a mailbox is exactly the
+  // shape of a real mail outage, and must not be swallowed.
+  assert.equal(neverReachedTheProduct('TimeoutError: locator.click: Timeout 30000ms exceeded.'), false)
+  assert.equal(neverReachedTheProduct('waited 120000ms for a message in the mailbox'), false)
+  assert.equal(neverReachedTheProduct(''), false)
+  assert.equal(neverReachedTheProduct(null), false)
+})
 
 // ── THE ONE THAT MATTERS: an unrun check is never a pass ─────────────────────────────────────
 

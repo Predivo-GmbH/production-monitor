@@ -223,6 +223,29 @@ export function stripAnsi(str) {
 }
 
 /**
+ * Did this failure happen BEFORE the test reached the thing it is named after?
+ *
+ * A Playwright test is routed to a system by its NAME, and its pass/fail is then copied onto
+ * that system. So a test called "E2E OTP: request code -> email delivery -> enter code" that
+ * dies in page.goto reported mail_delivery='failed' - and the dashboard rendered that as
+ * "login codes and invoices are not arriving - customers cannot get in". Measured 2026-09-03,
+ * run 33781865310: all 11 BackOffice failures, all 4 arivioo failures and all 7 Distribution-OS
+ * failures carried this identical message, while those three sites answered HTTP 200 in under
+ * 0.06s from another machine minutes later. Nothing about mail was tested, and the page told
+ * Roger his customers were locked out.
+ *
+ * This is the file's own three-valued contract (see the header) applied to the case it missed:
+ * 'skipped' was treated as "did not run", but a test that fails at the front door did not run
+ * either. It abstains instead of asserting.
+ */
+export function neverReachedTheProduct(message) {
+  const m = stripAnsi(String(message ?? ''))
+  // page.goto is the FIRST navigation. A timeout or a transport-level error there means no
+  // page was ever loaded, so every claim the test name makes is untested.
+  return new RegExp(String.raw`page\.goto:\s*(Timeout|net::)`, 'i').test(m)
+}
+
+/**
  * tests/<dir>/x.spec.ts -> <dir>. Playwright writes `file` relative to testDir ('arivioo/...'),
  * but a config change could make it relative to the repo root, so both are handled rather than
  * assumed. Returns null for anything that is not a product directory — including every entry in
@@ -410,7 +433,15 @@ export function buildRows(results, { runUrl = null, source = SOURCE } = {}) {
     if (check.outcome === 'passed') row.checks_passed += 1
     else row.failures.push({ name: check.title, message: check.message || 'Unknown error' })
 
+    // A failure that never reached the product proves nothing about login, mail, identity or
+    // the backend - it only proves the page did not load, which is a SITE fact. So it abstains
+    // on every other field and leaves it 'not-tested', exactly as a skipped test does. The
+    // failure is still counted and still listed in failures[], so the run stays visibly red;
+    // what it must not do is invent a verdict about a subject it never touched.
+    const unreached = check.outcome === 'failed' && neverReachedTheProduct(check.message)
+
     for (const rule of classify(check.title)) {
+      if (unreached && rule.field !== 'site') continue
       // 'failed' is terminal for a field: any matching test failing means the field failed,
       // regardless of how many siblings passed.
       if (row[rule.field] !== FAILED) row[rule.field] = check.outcome === 'failed' ? FAILED : OK
