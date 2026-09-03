@@ -9,7 +9,7 @@
 import assert from 'node:assert'
 import { readFileSync } from 'node:fs'
 import {
-  intervalMinutes, cronsIn, verdictFor, coverageLine, OVERDUE_FACTOR, judgeObserved,
+  intervalMinutes, cronsIn, verdictFor, coverageLine, OVERDUE_FACTOR, GITHUB_MIN_CADENCE_MIN, judgeObserved,
 } from '../scripts/check-workflow-cadence.mjs'
 
 let n = 0
@@ -104,6 +104,47 @@ t('an unreadable cron fails the workflow instead of passing it', () => {
 t('with two crons the TIGHTER one decides, so a daily+hourly file is judged hourly', () => {
   const v = verdictFor({ name: 'both.yml', crons: ['0 8 * * *', '37 * * * *'], state: 'active', lastRunAt: agoMin(60 * 5), now: NOW })
   assert.equal(v.ok, false)
+})
+
+// ── a sub-hourly cron is judged against what GitHub delivers, not its nominal rate ────────────
+
+t('intervalMinutes still reports the TRUE nominal for a sub-hourly cron - the floor is not here', () => {
+  // The floor belongs in verdictFor, not in the parse: a '*/10' cron really is every 10 minutes,
+  // and callers that display the schedule must not be lied to.
+  assert.equal(intervalMinutes('*/10 * * * *'), 10)
+  assert.equal(intervalMinutes('*/30 * * * *'), 30)
+})
+
+t('a */10 cron 40 minutes late is FINE, because GitHub never delivers sub-hourly at nominal', () => {
+  // Regression for 2026-09-02 critical: check-workflow-cadence judged ci-runner-watchdog DEAD
+  // ('expected every 10min, past 3x') on a 40-55min gap that GitHub's own scheduler produces,
+  // exited 1, failed the whole monitor job, and held the fleet's top-level dead-man red 6.9h.
+  // 40min is past the naive 3x10=30min window but well inside GitHub's measured ~hourly floor.
+  const v = verdictFor({ name: 'ci-runner-watchdog.yml', crons: ['*/10 * * * *'], state: 'active', lastRunAt: agoMin(40), now: NOW })
+  assert.equal(v.ok, true)
+  assert.match(v.why, /does not honour sub-hourly/)
+})
+
+t('a */30 cron is floored the same way - the fix is not special-cased to one file', () => {
+  const v = verdictFor({ name: 'flaky-retry.yml', crons: ['*/30 * * * *'], state: 'active', lastRunAt: agoMin(60), now: NOW })
+  assert.equal(v.ok, true)
+})
+
+t('a genuinely stopped */10 cron is STILL DEAD - the floor widens the window, it does not remove it', () => {
+  // The whole point of this file is to catch a schedule that stopped. Flooring to ~hourly must
+  // not blind it: a workflow GitHub quit scheduling ages without bound and still trips 3x the floor.
+  const limitMin = GITHUB_MIN_CADENCE_MIN * OVERDUE_FACTOR
+  const v = verdictFor({ name: 'ci-runner-watchdog.yml', crons: ['*/10 * * * *'], state: 'active', lastRunAt: agoMin(limitMin + 30), now: NOW })
+  assert.equal(v.ok, false)
+  assert.match(v.why, /past 3x/)
+})
+
+t('the hourly path is unchanged - flooring only touches crons faster than hourly', () => {
+  const justInside = verdictFor({ name: 'x.yml', crons: ['37 * * * *'], state: 'active', lastRunAt: agoMin(60 * OVERDUE_FACTOR - 5), now: NOW })
+  const justOutside = verdictFor({ name: 'x.yml', crons: ['37 * * * *'], state: 'active', lastRunAt: agoMin(60 * OVERDUE_FACTOR + 5), now: NOW })
+  assert.equal(justInside.ok, true)
+  assert.equal(justOutside.ok, false)
+  assert.doesNotMatch(justInside.why, /does not honour sub-hourly/)  // no floor note when nominal >= hourly
 })
 
 // ── coverage, because a count of what it read is not a count of what exists ───────────────────

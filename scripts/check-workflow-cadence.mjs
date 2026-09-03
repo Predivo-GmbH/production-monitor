@@ -18,7 +18,11 @@
  * and compared against the newest scheduled run GitHub reports for it. Overdue means older than
  * 3x the interval, the same "only a persistently dead job fires" rule the pg_cron heartbeat
  * uses, so a single missed tick is never an alarm - and GitHub does drop scheduled ticks under
- * load (see the measurement block at the top of monitor.yml).
+ * load (see the measurement block at the top of monitor.yml). That same measurement is why the
+ * overdue window is floored at ~hourly (GITHUB_MIN_CADENCE_MIN): GitHub does not deliver a
+ * sub-hourly cron at its nominal rate, so an every-10-minutes cron is judged against what GitHub
+ * actually gives, not against the 10 minutes it asks for - otherwise the guard reddens the whole
+ * monitor on a scheduler artefact.
  *
  * WHAT IT REFUSES TO DO. A cron shape it cannot parse, a workflow GitHub will not answer for,
  * and a workflow with no scheduled run at all are each reported as DEAD and fail the check.
@@ -37,6 +41,13 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
 const WORKFLOW_DIR = process.env.WORKFLOW_DIR || path.join(HERE, '..', '.github', 'workflows')
 const REPO = process.env.GITHUB_REPOSITORY || 'Predivo-GmbH/production-monitor'
 export const OVERDUE_FACTOR = 3
+// GitHub does NOT honour sub-hourly crons at their nominal frequency. This repo's own measured
+// block (monitor.yml, 2026-08-29) records scheduled workflows delivered ~hourly, mean 210 / max
+// 268 min, and the '*/10' watchdog is observed firing 40-55 min apart, not every 10. Judging a
+// '*/10' cron against 3x10=30min is therefore a GUARANTEED false red, and because this check
+// exits 1 it fails the whole `monitor` job and holds the fleet's top-level dead-man red for a
+// pure scheduler artefact. So we never expect a GitHub cron more often than this effective floor.
+export const GITHUB_MIN_CADENCE_MIN = 60
 
 /**
  * How often does this cron fire, in minutes? Only the shapes this fleet actually writes are
@@ -92,13 +103,19 @@ export function verdictFor({ name, crons, state, lastRunAt, now }) {
   }
   const interval = Math.min(...mins)
   if (!lastRunAt) return { name, ok: false, why: 'GitHub reports no scheduled run at all for this workflow' }
+  // Floor the overdue window at GitHub's measured effective cadence: a cron that asks for faster
+  // than hourly does not get it, so overdue must be measured against what GitHub actually delivers,
+  // not the nominal frequency. A genuinely stopped workflow still fails - its gap grows without
+  // bound and passes this floor - it just takes ~3h to be called dead instead of 30min.
+  const effective = Math.max(interval, GITHUB_MIN_CADENCE_MIN)
   const ageMin = (now - new Date(lastRunAt).getTime()) / 60000
-  const limit = interval * OVERDUE_FACTOR
-  const every = interval >= 60 ? `${Math.round(interval / 60)}h` : `${interval}min`
+  const limit = effective * OVERDUE_FACTOR
+  const every = effective >= 60 ? `${Math.round(effective / 60)}h` : `${effective}min`
+  const floored = effective !== interval ? ' (GitHub does not honour sub-hourly crons, judged ~hourly)' : ''
   if (ageMin > limit) {
-    return { name, ok: false, why: `last scheduled run ${Math.round(ageMin / 60)}h ago, expected every ${every} (past ${OVERDUE_FACTOR}x)` }
+    return { name, ok: false, why: `last scheduled run ${Math.round(ageMin / 60)}h ago, expected every ${every}${floored} (past ${OVERDUE_FACTOR}x)` }
   }
-  return { name, ok: true, why: `last scheduled run ${Math.round(ageMin)} min ago, expected every ${every}` }
+  return { name, ok: true, why: `last scheduled run ${Math.round(ageMin)} min ago, expected every ${every}${floored}` }
 }
 
 /** Say what was covered. A count of what it happened to read is not a count of what exists. */
