@@ -29,3 +29,18 @@ jobs:
         uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The action above scans the COMMIT RANGE of the event, and that is not enough.
+      # Proven 2026-08-20 on ReplyFlow: a merge commit introduced a service_role JWT and
+      # this workflow reported "No leaks detected". A working-tree scan sees the file as
+      # it now stands regardless of how it got there (same form deploy.yml uses).
+      # --config is passed ONLY when the repo actually has a .gitleaks.toml: gitleaks
+      # exits non-zero on a config path that does not exist, which would fail the step
+      # for the wrong reason and look exactly like a leak.
+      - name: gitleaks (working tree)
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz | tar -xz -C /tmp gitleaks
+          chmod +x /tmp/gitleaks
+          CFG=""
+          if [ -f .gitleaks.toml ]; then CFG="--config .gitleaks.toml"; fi
+          /tmp/gitleaks dir . --no-banner --redact --exit-code 1 $CFG
