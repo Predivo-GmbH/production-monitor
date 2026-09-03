@@ -788,12 +788,75 @@ async function realDeployedAt(ref, slug) {
  * before it will accept the close — and because a close whose reason was never written down is the
  * same shallow close this whole gate exists to refuse.
  */
+/**
+ * A CHECK THAT IS ITSELF A RESOLVING ARTIFACT IS ITS OWN RECEIPT.
+ *
+ * ══ THE MEASUREMENT ═════════════════════════════════════════════════════════════════════════
+ *
+ * Live board 2026-09-03: **19 finish-tests PASS right now** and every one of them is refused by
+ * this function for one reason — the row carries no `documentation_ref`. Nineteen rows, finished
+ * and provable, held open by a missing field. Of 207 open rows only 23 carry a receipt at all.
+ *
+ * ══ WHY THIS IS NOT INVENTING A RECEIPT ═════════════════════════════════════════════════════
+ *
+ * `work_close` refuses prose because prose is not a receipt. But for two of the seven check kinds
+ * the check IS a document, and one that was just PROVEN to resolve seconds earlier by this very
+ * run:
+ *
+ *   test_exits_zero  the test file was located AND EXECUTED AND EXITED 0. A test is the written
+ *                    record of what "finished" required for that row — it is more precise than the
+ *                    prose note somebody would otherwise have typed.
+ *   url_answers      the URL was FETCHED and answered the expected status.
+ *
+ * So the reference is not derived, guessed or constructed. It is the exact artifact this run just
+ * used to decide the row was finished, and `work_close` will independently re-verify it.
+ *
+ * ══ AND WHY THE OTHER FIVE KINDS GET NOTHING ════════════════════════════════════════════════
+ *
+ * `query_returns_no_rows` is 41 of the 78 open checks and CANNOT self-document: a SQL string is
+ * not a file and not a URL, and writing the query text into `documentation_ref` would be exactly
+ * the prose-as-receipt this gate exists to refuse. Same for `deploy_newer_than`, `metric_below`,
+ * `sentry_resolved` and `human`. Those rows still need a real document, and saying so is the
+ * honest answer — on 2026-09-03 a session wrote 205 finish-tests from proposals and 112 were
+ * fiction, and every one of them looked like coverage.
+ *
+ * Returns the reference, or null when the check cannot honestly stand as its own receipt.
+ */
+export function selfDocumentingRef(doneWhen) {
+  const dw = doneWhen && typeof doneWhen === 'object' ? doneWhen : {}
+  const kind = String(dw.kind || '').trim()
+  if (kind === 'test_exits_zero') {
+    const path = String(dw.path || '').trim()
+    return path || null
+  }
+  if (kind === 'url_answers') {
+    const url = String(dw.url || '').trim()
+    // PARSED, NOT PREFIX-MATCHED. The first version of this line tested only that the string
+    // STARTED with http(s), and the very first preview run caught what that lets through: a live
+    // row whose url reads "https://rlcsuqwqzoqjykdiqjye.supabase.co/rest/v1/ presenting the leaked
+    // legacy service_role JWT" — a URL with prose glued on. That is one of the five ways the 112
+    // fictional finish-tests of 2026-09-03 failed ("8 were not URLs, several of them prose with a
+    // URL glued to the front"), and writing it into documentation_ref would have put the same
+    // fiction into the receipt column. A reference must be a thing that resolves, not a sentence
+    // that begins with one.
+    if (/\s/.test(url)) return null
+    try {
+      const u = new URL(url)
+      return (u.protocol === 'http:' || u.protocol === 'https:') ? url : null
+    } catch { return null }
+  }
+  return null
+}
+
 export async function offerToBoard(item, f, { workEvidence, workClose, now = () => new Date().toISOString() }) {
-  const documentation_ref = f.documentation_ref || item.documentation_ref
+  // The row's own reference wins; then the finish-test's declared one; then, ONLY for a check that
+  // is itself a resolving artifact, the artifact this run just executed or fetched. See
+  // selfDocumentingRef: never for a query, a deploy comparison, a metric or a human act.
+  const documentation_ref = f.documentation_ref || item.documentation_ref || selfDocumentingRef(item.done_when)
   if (!documentation_ref) {
     return {
       outcome: 'refused', item: item.slug,
-      why: 'the item has no documentation_ref, and work_close refuses to close undocumented work. Give the row a documentation_ref, or put one on its done_when.',
+      why: `the item has no documentation_ref and its finish-test cannot stand as one (kind ${item.done_when && item.done_when.kind ? `"${item.done_when.kind}"` : 'unknown'} is not a file or a URL). work_close refuses to close undocumented work. Give the row a documentation_ref, or put one on its done_when.`,
     }
   }
   try {
@@ -884,9 +947,14 @@ async function main() {
 
   if (dry) {
     for (const r of passes) {
-      const doc = r.f.documentation_ref || r.item.documentation_ref
+      // THE SAME RESOLUTION offerToBoard uses, not a second copy of it. This line used to compute
+      // the reference differently from the code that actually closes, so --dry printed "NO
+      // documentation_ref, work_close would refuse it" about rows the real path would now close.
+      // A preview that disagrees with the behaviour is worse than no preview: it is the shape of
+      // every "reports success for doing nothing" defect in this repo, pointed the other way.
+      const doc = r.f.documentation_ref || r.item.documentation_ref || selfDocumentingRef(r.item.done_when)
       console.log(`  --dry: would offer ${r.item.slug} to the board` +
-        `${doc ? '' : ' — but it has NO documentation_ref, so work_close would refuse it'}` +
+        `${doc ? ` (receipt: ${doc})` : ' — but it has NO documentation_ref and its finish-test cannot stand as one, so work_close would refuse it'}` +
         `${r.f.production_ref ? ` (production proof: ${r.f.production_ref})` : ' (no production proof, so it would be handed to Roger for sign-off)'}`)
     }
   } else {

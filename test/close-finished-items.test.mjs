@@ -56,7 +56,7 @@ import {
   ACTIONABLE_STATUSES, UNTOUCHABLE_STATUSES, KINDS, SKIP,
   parseDoneWhen, evaluateDoneWhen, sweep, selectItems, verdict, receiptFor, offerToBoard,
   sqlIsReadOnly, testPathIsRunnable, sentryStatusIsSettled, isDryRun, closureCap,
-  loadBoardCredentials, boardProjectRef, SENTRY_ISSUE_PATHS, isOwedToRoger, silentRowsInHisLane,
+  loadBoardCredentials, boardProjectRef, SENTRY_ISSUE_PATHS, isOwedToRoger, silentRowsInHisLane, selfDocumentingRef,
 } from '../scripts/close-finished-items.mjs'
 import { PASS, FAIL, UNKNOWN, reportedPass, VERDICT_MARKER } from '../scripts/lib/check-verdict.mjs'
 
@@ -823,3 +823,66 @@ t('DEFECT: selectItems must HOLD the owed row, not merely refuse it at the close
 await Promise.all(pending)
 
 console.log(`\n${n} tests passed.`)
+
+
+// ══ A CHECK THAT IS ITSELF A RESOLVING ARTIFACT IS ITS OWN RECEIPT ═══════════════════════════
+// Measured on the live board 2026-09-03: 19 finish-tests PASS and every one is refused here for
+// a missing documentation_ref. Only 23 of 207 open rows carry one at all. But for two of the
+// seven kinds the check IS a document, and one this run has just proven resolves.
+
+t('a test that was executed and exited 0 is its own receipt', () => {
+  assert.equal(selfDocumentingRef({ kind: 'test_exits_zero', path: 'test/a.test.mjs' }), 'test/a.test.mjs',
+    'a test is the written record of what finished required — more precise than the prose note somebody would have typed')
+})
+
+t('a URL that answered is its own receipt', () => {
+  assert.equal(selfDocumentingRef({ kind: 'url_answers', url: 'https://cockpit.predivo.ch/work' }),
+    'https://cockpit.predivo.ch/work')
+})
+
+t('REFUSED: a SQL query is not a receipt — it is 41 of the 78 open checks and none can self-document', () => {
+  assert.equal(selfDocumentingRef({ kind: 'query_returns_no_rows', sql: 'select 1 where false' }), null,
+    'writing query text into documentation_ref is exactly the prose-as-receipt this gate refuses')
+})
+
+t('REFUSED: the other kinds cannot stand as their own receipt either', () => {
+  for (const dw of [
+    { kind: 'deploy_newer_than', project_ref: 'abc', function_slug: 'f', iso: '2026-09-03' },
+    { kind: 'metric_below', metric: 'x', max: 1 },
+    { kind: 'sentry_resolved', issue_id: '123' },
+    { kind: 'human', act: 'log in and rotate the key' },
+  ]) {
+    assert.equal(selfDocumentingRef(dw), null, `${dw.kind} must not self-document`)
+  }
+})
+
+t('REFUSED: a URL with PROSE GLUED ON — found on the live board by the first preview run', () => {
+  // A real row's url reads "https://rlcsuqwqzoqjykdiqjye.supabase.co/rest/v1/ presenting the
+  // leaked legacy service_role JWT". A prefix match accepts it; parsing rejects it. This is one
+  // of the five ways the 112 fictional finish-tests failed, and it would have put the same
+  // fiction into the receipt column.
+  assert.equal(selfDocumentingRef({
+    kind: 'url_answers',
+    url: 'https://rlcsuqwqzoqjykdiqjye.supabase.co/rest/v1/ presenting the leaked legacy service_role JWT',
+  }), null)
+  assert.equal(selfDocumentingRef({ kind: 'url_answers', url: 'https://x.example/a b' }), null)
+  assert.equal(selfDocumentingRef({ kind: 'url_answers', url: 'https://x.example/ok' }), 'https://x.example/ok',
+    'a clean URL still works')
+})
+
+t('a url_answers whose url is not a real URL gets nothing', () => {
+  assert.equal(selfDocumentingRef({ kind: 'url_answers', url: 'the dashboard loads fine' }), null,
+    '8 of the 112 fictional finish-tests deleted on 2026-09-03 were prose where a URL belonged')
+  assert.equal(selfDocumentingRef({ kind: 'url_answers', url: 'ftp://x.example/y' }), null)
+})
+
+t('a test_exits_zero with no path gets nothing', () => {
+  assert.equal(selfDocumentingRef({ kind: 'test_exits_zero', path: '   ' }), null)
+  assert.equal(selfDocumentingRef({ kind: 'test_exits_zero' }), null)
+})
+
+t('an unknown kind, and hostile input, never produce a reference', () => {
+  for (const dw of [null, undefined, 'prose', 42, [], {}, { kind: 'vibes' }, { kind: '' }]) {
+    assert.equal(selfDocumentingRef(dw), null, `${JSON.stringify(dw)} must not produce a reference`)
+  }
+})
