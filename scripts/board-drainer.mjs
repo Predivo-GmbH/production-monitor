@@ -2197,7 +2197,22 @@ export function drainerRetirementDecision({ item, signal = null, ambiguous = fal
   // so it stays "the honest record that somebody began the row". Measured 2026-09-03: 16 of the 64
   // open drainer rows carry started_at and NONE carries an owner_session. Without this line those
   // 16 rows are indistinguishable from rows nobody has ever touched.
-  if (item.started_at) return { act: 'leave', guard: 'a session started this row once', reason: 'a session started this row once (started_at is stamped once and can never be cleared)' }
+  //
+  // BUT IT IS A RECORD OF THE PAST, NOT A STATEMENT ABOUT THE PRESENT, and using it as one made
+  // eight rows permanently unretirable. Measured 2026-09-03: of the 17 open drainer rows carrying
+  // `started_at`, EIGHT are back in `next` with no owner_session -- three of them critical, one
+  // being the ci-runner-watchdog row whose four signals are ALL resolved, the newest 20 minutes
+  // before this was written. A session began each of them, stopped, and the fleet's own machinery
+  // put the row back in the queue. Because `started_at` can never be cleared, "somebody once
+  // started this" was silently promoted to "nobody may ever finish it", for ever.
+  //
+  // `next` IS THE BOARD SAYING NOBODY IS ON IT. It is the lane a row lands in when the
+  // stopped-session sweep releases a claim that produced no result, and the lane a session parks
+  // into deliberately; either way it means available. So the durable mark still holds a row that
+  // is `blocked` -- where somebody may be mid-conversation about it -- and stands down for a row
+  // the board has explicitly returned to the queue. owner_session is still checked above, so a
+  // live claim blocks regardless of lane.
+  if (item.started_at && status !== 'next') return { act: 'leave', guard: 'a session started this row once', reason: 'a session started this row once (started_at is stamped once and can never be cleared)' }
 
   // ── THE RAISING SYSTEM MUST ACTUALLY SAY SO ─────────────────────────────────────────────
   // NOT FOUND IS NOT FIXED. "I cannot find the incident behind this" reads exactly like "the

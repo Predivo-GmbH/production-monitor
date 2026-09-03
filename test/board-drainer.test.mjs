@@ -1778,10 +1778,37 @@ t('NEVER INVENT A RECEIPT: no live link on the incident, no close', () => {
 })
 
 // ── a human, or a session, has since worked it ─────────────────────────────────────────────
-t('a session that STARTED this row once keeps it, for ever — started_at can never be cleared', () => {
-  const v = drainerRetirementDecision({ item: { ...RAISED_ROW, started_at: '2026-09-01T10:00:00Z' }, signal: CLEARED })
+// started_at IS A RECORD OF THE PAST, NOT A STATEMENT ABOUT THE PRESENT. Reading it as one made
+// eight rows permanently unretirable: measured 2026-09-03, of 17 open drainer rows carrying
+// started_at, EIGHT were back in `next` with no owner_session -- three critical, one of them the
+// ci-runner-watchdog row whose four signals were ALL resolved, the newest 20 minutes earlier. A
+// session began each, stopped, and the fleet's own sweep returned the row to the queue. Because
+// started_at can never be cleared, "somebody once started this" had been silently promoted to
+// "nobody may ever finish it", permanently.
+t('a row the board put BACK IN THE QUEUE may retire, even though a session once started it', () => {
+  const v = drainerRetirementDecision({
+    item: { ...RAISED_ROW, status: 'next', owner_session: null, started_at: '2026-09-01T10:00:00Z' },
+    signal: CLEARED,
+  })
+  assert.equal(v.act, 'retire', '`next` with no owner IS the board saying nobody is on it')
+})
+
+t('...but a BLOCKED row a session started is still kept — somebody may be mid-conversation', () => {
+  const v = drainerRetirementDecision({
+    item: { ...RAISED_ROW, status: 'blocked', owner_session: null, started_at: '2026-09-01T10:00:00Z' },
+    signal: CLEARED,
+  })
   assert.equal(v.act, 'leave')
   assert.match(v.reason, /started_at is stamped once/)
+})
+
+t('...and a LIVE CLAIM still blocks whatever lane the row is in', () => {
+  const v = drainerRetirementDecision({
+    item: { ...RAISED_ROW, status: 'next', owner_session: 'sess-1', started_at: '2026-09-01T10:00:00Z' },
+    signal: CLEARED,
+  })
+  assert.equal(v.act, 'leave')
+  assert.match(v.reason, /holds a claim/)
 })
 
 t('a claim, and the two statuses only a session can reach, all keep the row', () => {
@@ -1857,7 +1884,8 @@ t('every refusal carries a stable guard name, so a tally can name what it counts
     { item: { ...RAISED_ROW, opened_by: 'agent' }, signal: CLEARED },
     { item: RAISED_ROW, signal: { ...CLEARED, state: 'superseded' } },
     { item: RAISED_ROW, signal: null },
-    { item: { ...RAISED_ROW, started_at: '2026-09-01T10:00:00Z' }, signal: CLEARED },
+    // blocked, so the durable start-mark still holds it — the case that still refuses
+    { item: { ...RAISED_ROW, status: 'blocked', started_at: '2026-09-01T10:00:00Z' }, signal: CLEARED },
   ]
   for (const c of cases) {
     const v = drainerRetirementDecision(c)
@@ -1997,7 +2025,10 @@ ta('the tally is keyed on the GUARD, so one guard holding three rows reads as 3x
 })
 
 ta('a mixed board retires only what every guard allows', async () => {
-  const worked = { ...RAISED_ROW, id: 'item-2', slug: 'monitor-worked-2', started_at: '2026-09-01T10:00:00Z' }
+  // 'blocked', because since 2026-09-03 a row the board returned to 'next' is retireable even if
+  // a session once started it — the durable start-mark only holds a row somebody may still be
+  // mid-conversation about. This fixture exists to prove a worked row IS held, so it must be one.
+  const worked = { ...RAISED_ROW, id: 'item-2', slug: 'monitor-worked-2', status: 'blocked', started_at: '2026-09-01T10:00:00Z' }
   const foreign = { ...RAISED_ROW, id: 'item-3', slug: 'monitor-foreign-3', opened_by: 'agent' }
   // Distinct keys, or all three would DERIVE onto the one slug and every row would read ambiguous
   // — which is the failure this fixture would otherwise hide behind a passing "nothing retired".
@@ -2042,10 +2073,13 @@ ta('DEFECT INJECTION: delete the terminal-state guard and all 38 superseded rows
     'without that one line every row this drainer ever minted closes itself one tick after minting')
 })
 
-ta('DEFECT INJECTION: delete the started_at guard and the 12 rows a session worked are closed', async () => {
-  const worked = { ...RAISED_ROW, started_at: '2026-09-01T10:00:00Z' }
+ta('DEFECT INJECTION: delete the started_at guard and a BLOCKED row a session worked is closed', async () => {
+  // Scoped to `blocked` since 2026-09-03: a row the board returned to `next` is available by
+  // definition, so the durable start-mark no longer holds it there. It still holds a blocked row,
+  // where somebody may be mid-conversation, and that is the case this injection protects.
+  const worked = { ...RAISED_ROW, status: 'blocked', started_at: '2026-09-01T10:00:00Z' }
   assert.equal(drainerRetirementDecision({ item: worked, signal: CLEARED }).act, 'leave')
-  const broken = await withoutGuard('if (item.started_at) return')
+  const broken = await withoutGuard("if (item.started_at && status !== 'next') return")
   assert.equal(broken.drainerRetirementDecision({ item: worked, signal: CLEARED }).act, 'retire')
 })
 
