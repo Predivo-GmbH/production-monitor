@@ -3,6 +3,8 @@ import { test, expect } from '@playwright/test';
 import { scheduleFreshness, FRESH_FLOOR_HOURS, OVERDUE_FACTOR } from '../../scripts/lib/gauntlet-staleness.mjs';
 // @ts-expect-error — see above.
 import { extractCronSchedules, cronPeriodHours } from '../../scripts/lib/cron-cadence.mjs';
+// @ts-expect-error — see above.
+import { pickJudgeableRun, describeSkipped } from '../../scripts/lib/gauntlet-verdict.mjs';
 
 /**
  * Nightly-gauntlet health.
@@ -71,19 +73,42 @@ for (const repo of TIERED_REPOS) {
     test.skip(!ghToken, 'DASHBOARD_PAT not set');
 
     const res = await request.get(
-      `https://api.github.com/repos/${repo}/actions/workflows/deploy.yml/runs?event=schedule&per_page=1`,
+      `https://api.github.com/repos/${repo}/actions/workflows/deploy.yml/runs?event=schedule&per_page=10`,
       { headers: { Authorization: `Bearer ${ghToken}`, Accept: 'application/vnd.github.v3+json' } },
     );
     test.skip(res.status() !== 200, `GitHub API returned ${res.status()} for ${repo} — skipping to avoid a false alarm`);
 
     const body = await res.json();
     const runs = body.workflow_runs ?? [];
-    test.skip(runs.length === 0, `${repo}: no scheduled gauntlet run yet (nightly schedule not fired)`);
 
-    const latest = runs[0];
-    test.skip(latest.status !== 'completed', `${repo}: latest scheduled gauntlet still ${latest.status}`);
+    // A CANCELLED RUN IS NOT A PASS (2026-09-03). Until this block existed the check judged
+    // runs[0] and asked only "did it fail?" — so a cancelled nightly answered "no" and was
+    // reported healthy, in this file's own words "latest scheduled gauntlet is 'cancelled' —
+    // healthy". Worse, being a NEW run its recent timestamp also made the freshness gate below
+    // answer FRESH, reopening through a different door the hole 863c731 had closed hours
+    // earlier the same morning. Measured on the live fleet over ~240 scheduled runs: ReplyFlow
+    // runs 33049024073 (2026-08-27) and 31080989158 (2026-08-06) each ran gate-e2e for roughly
+    // twenty minutes and were then cancelled — gauntlets that genuinely did not finish.
+    // A cancel is NOT turned into a failure here (it has benign causes and paging on one would
+    // be the false alarm this repo forbids); it is simply not allowed to stand in for a verdict.
+    // The rule lives in scripts/lib/gauntlet-verdict.mjs, unit-tested in
+    // test/gauntlet-verdict.test.mjs against the original behaviour. The window widened from 1
+    // run to 10 — the same single API call — so an inconclusive run can be stepped over.
+    const pick = pickJudgeableRun(runs);
+    test.skip(pick.verdict === 'NO_RUNS', `${repo}: no scheduled gauntlet run yet (nightly schedule not fired)`);
+    test.skip(pick.verdict === 'PENDING', `${repo}: ${pick.reason} — not judged this hour.`);
+    test.skip(pick.verdict === 'UNPROVEN', `${repo}: ${pick.reason}. One blip is not an alarm.`);
+    expect(
+      pick.verdict,
+      `${repo} NIGHTLY GAUNTLET IS NEVER COMPLETING — ${pick.reason}. Nothing has gone red because a cancelled run is not a failed run, but nothing has been tested against live staging either. Check whether the gauntlet is hitting a job timeout, losing its runner, or being cancelled by a concurrency group.`,
+    ).not.toBe('NONE_CONCLUSIVE');
 
-    // Only a definitive failure is a candidate; a green/cancelled latest run is healthy.
+    // From here `latest` is the newest run that ACTUALLY CONCLUDED, so every question below —
+    // did it fail, is it still fresh, has it been superseded — is asked of a run that ran.
+    const latest = pick.judged;
+    const skippedNote = describeSkipped(pick.skipped);
+
+    // Only a definitive failure is a candidate; a green latest run is healthy.
     const isFail = ['failure', 'timed_out'].includes(latest.conclusion);
 
     // IS THAT GREEN RUN STILL SAYING ANYTHING? (2026-09-03.) Until this block existed, the line
@@ -152,7 +177,7 @@ for (const repo of TIERED_REPOS) {
       );
       expect(
         f.verdict,
-        `${repo} NIGHTLY GAUNTLET HAS STOPPED RUNNING — ${f.reason}. Its last scheduled run PASSED, which is why nothing has gone red: this check reports on the newest scheduled run, and there has not been a new one. Nothing has tested ${repo} against live staging since ${new Date(startedMs).toISOString()}. Check whether deploy.yml's schedule was removed, the workflow was disabled, or GitHub disabled it for repository inactivity (${latest.html_url}).`,
+        `${repo} NIGHTLY GAUNTLET HAS STOPPED RUNNING — ${f.reason}. Its last scheduled run PASSED, which is why nothing has gone red: this check reports on the newest scheduled run, and there has not been a new one. Nothing has tested ${repo} against live staging since ${new Date(startedMs).toISOString()}. Check whether deploy.yml's schedule was removed, the workflow was disabled, or GitHub disabled it for repository inactivity (${latest.html_url}).${skippedNote}`,
       ).toBe('FRESH');
     }
 
@@ -229,7 +254,7 @@ for (const repo of TIERED_REPOS) {
 
     expect(
       isFail && persistent,
-      `${repo} NIGHTLY GAUNTLET PERSISTENTLY FAILING — ${whatFailed}. The auto-retry did not recover it (attempt ${attempt}, ${ageHours.toFixed(1)}h, ${latest.html_url}). Read that job before promoting ${repo} to production; whether it blocks the promotion depends on which gate it is.`,
+      `${repo} NIGHTLY GAUNTLET PERSISTENTLY FAILING — ${whatFailed}. The auto-retry did not recover it (attempt ${attempt}, ${ageHours.toFixed(1)}h, ${latest.html_url}). Read that job before promoting ${repo} to production; whether it blocks the promotion depends on which gate it is.${skippedNote}`,
     ).toBe(false);
   });
 }
