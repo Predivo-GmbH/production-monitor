@@ -47,7 +47,19 @@ $runner   = 'C:\Business\Internal Projects\production-monitor\scripts\close-fini
 
 if (-not (Test-Path $runner)) { throw "Runner not found: $runner" }
 
-$action = New-ScheduledTaskAction -Execute $node -Argument ('"{0}"' -f $runner)
+# CLOSER_CONFIRM=1 IS NOT OPTIONAL HERE, AND LEAVING IT OUT IS THE WHOLE JOKE. isDryRun() returns
+# TRUE unless CLOSER_CONFIRM is set -- the closer is dry BY DEFAULT, deliberately, because "a first
+# real run must not move a hundred rows unwatched". This script was written without it and would
+# have registered an hourly task that runs, exits 0, prints "DRY RUN, nothing was closed" where
+# nobody reads it, and closes NOTHING for ever. That is precisely the "a job that reports success
+# for doing nothing" class this repo exists to catch, and it was caught by running the closer by
+# hand and noticing it said DRY RUN when no flag had been passed.
+#
+# The quoting matters: `set "VAR=1" &&` not `set VAR=1 &&`, or the trailing space is captured into
+# the value and the ==='1' check silently fails -- the same trap already documented in
+# setup-board-drainer-task.ps1.
+$cmd = ('/c set "CLOSER_CONFIRM=1" && "{0}" "{1}"' -f $node, $runner)
+$action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument $cmd
 
 $start   = (Get-Date).AddMinutes(3)
 $trigger = New-ScheduledTaskTrigger -Once -At $start
