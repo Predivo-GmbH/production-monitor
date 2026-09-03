@@ -83,11 +83,56 @@ t('4900 of 5000 spent four minutes into the window -> draining/critical, no proj
   assert.equal(j.severity, 'critical')
 })
 
-t('the floor is 5% of the limit: 5% left alarms, 6% left does not', () => {
+t('the 5% floor still alarms critical the instant the pool is nearly empty', () => {
   const at = judgeQuota({ limit: 5000, remaining: 250, used: 4750, reset: resetIn(56 * 60) }, NOW)
-  const above = judgeQuota({ limit: 5000, remaining: 300, used: 4700, reset: resetIn(56 * 60) }, NOW)
   assert.equal(at.verdict, 'draining')
-  assert.equal(above.verdict, 'healthy')
+  assert.equal(at.severity, 'critical')
+})
+
+// ── THE EARLY-WINDOW HEAVY-BURN HOLE (2026-09-03 audit, proven by injection before this fix) ──
+//
+// Between the 5% floor (remaining <= 250 -> critical) and the projection gate (fracElapsed >= 0.1)
+// lay a hole: a burst that spent 80-94% of the whole pool in the first few minutes sat above the
+// floor and before the projection, so it read `healthy` — and main() then files a `resolved`
+// signal that CLEARS the previous hour's real alarm. This block IS the assertion that used to
+// codify the hole: it previously asserted `remaining: 300 four min in -> healthy`. That was the bug.
+// Each case below was watched to go the OTHER way (verdict `healthy`) against the pre-fix code.
+
+t('6% left, four minutes into the window -> low/warning, no longer the false green it used to be', () => {
+  // The exact case this test asserted `healthy` before the fix. 300 left with 56 min still to run
+  // is a burn rate the hour cannot survive; the previous version cleared alarms on it.
+  const j = judgeQuota({ limit: 5000, remaining: 300, used: 4700, reset: resetIn(56 * 60) }, NOW)
+  assert.equal(j.verdict, 'low')
+  assert.equal(j.severity, 'warning', 'warning is "alarming" in main(), so it files OPEN and never resolves a prior alarm')
+})
+
+t('80% of the pool gone three minutes in -> warning (the injected scenario that read healthy before)', () => {
+  // Measured against the pre-fix judgeQuota: used=4000/5000 at fracElapsed 0.05 returned `healthy`.
+  const j = judgeQuota({ limit: 5000, remaining: 1000, used: 4000, reset: resetIn(57 * 60) }, NOW)
+  assert.equal(j.verdict, 'low')
+  assert.equal(j.severity, 'warning')
+})
+
+t('the early-burn branch keeps the projection floor: a small post-reset burst still never cries wolf', () => {
+  // 900 spent three minutes in leaves the pool 82% full — not a runaway, and used < 1500. Must stay
+  // healthy, exactly as before, so the fix does not turn a normal burst into noise.
+  const j = judgeQuota({ limit: 5000, remaining: 4100, used: 900, reset: resetIn(57 * 60) }, NOW)
+  assert.equal(j.verdict, 'healthy')
+})
+
+t('just under 80% spent early is still healthy — the branch fires only when most of the pool is gone', () => {
+  // remaining 1001 (> limit*0.2) three minutes in: the boundary sits at 20% left, and this is above it.
+  const j = judgeQuota({ limit: 5000, remaining: 1001, used: 3999, reset: resetIn(57 * 60) }, NOW)
+  assert.equal(j.verdict, 'healthy')
+})
+
+t('the early-burn branch cannot override the critical projection branch past six minutes', () => {
+  // Same heavy depletion but ten minutes in (fracElapsed 0.17 >= 0.1): the projection owns this and
+  // must still return CRITICAL, not be downgraded to the new warning. remaining 1000 < 1500,
+  // projectedUse = 4000/0.167 ~ 24000 >> 5000.
+  const j = judgeQuota({ limit: 5000, remaining: 1000, used: 4000, reset: resetIn(50 * 60) }, NOW)
+  assert.equal(j.verdict, 'draining')
+  assert.equal(j.severity, 'critical')
 })
 
 console.log(`\n${n} passed`)

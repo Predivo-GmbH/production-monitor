@@ -83,6 +83,32 @@ t('a cancelled run is not a failure - somebody stopped it on purpose', () => {
   assert.equal(currentFailures([run({ conclusion: 'cancelled' })]).length, 0)
 })
 
+// ── a hung deploy that GitHub kills ends `timed_out`, NOT `failure` (2026-09-03 audit) ──
+t('a timed_out deploy is red - the hung deploy that used to read healthy', () => {
+  // Proven by injection before the fix: currentFailures matched only `failure`/`startup_failure`,
+  // so a run GitHub marks `completed / timed_out` (a hung job it had to kill) fell straight through
+  // as healthy. Revert the filter to drop `timed_out` and this goes red.
+  const red = currentFailures([run({ conclusion: 'timed_out', created_at: '2026-09-03T00:10:00Z' })])
+  assert.equal(red.length, 1)
+  assert.equal(red[0].conclusion, 'timed_out')
+})
+
+t('a timed_out run is filed as a real red, never mistaken for a staging-gate rejection', () => {
+  // It has no `conclusion:'failure'` job, so classifyFailure returns `unknown` (not gate-rejection),
+  // and isAlarm(unknown) is true — so it reaches the board rather than being silently forgiven.
+  const c = classifyFailure(run({ conclusion: 'timed_out' }), { total_count: 1, jobs: [{ name: 'deploy', conclusion: 'timed_out', steps: [] }] })
+  assert.notEqual(c.kind, 'gate-rejection')
+  assert.equal(isAlarm(c), true)
+})
+
+t('a green run after a timed_out one still clears it - recovery is not special-cased away', () => {
+  const red = currentFailures([
+    run({ id: 21, conclusion: 'success', created_at: '2026-09-03T01:00:00Z' }),
+    run({ id: 20, conclusion: 'timed_out', created_at: '2026-09-03T00:10:00Z' }),
+  ])
+  assert.equal(red.length, 0)
+})
+
 t('a non-deploy workflow going red is not this producer\'s business', () => {
   assert.equal(currentFailures([run({ path: '.github/workflows/test.yml' })]).length, 0)
 })

@@ -101,6 +101,28 @@ export function judgeQuota(core, now = Date.now()) {
       summary: `${used} of ${limit} calls are spent with ${Math.round(secsToReset / 60)} min still to run in the window and only ${remaining} left. It will start refusing deploys before it resets. The usual cause is our own \`gh run watch\` polling across concurrent sessions - wait and \`gh run view <id>\` once instead of watching.` }
   }
 
+  // THE EARLY-WINDOW HEAVY-BURN HOLE (2026-09-03 audit, proven by injection). The 5% floor above
+  // catches "almost gone" and the projection branches below catch a sustained pace — but between
+  // them sat a hole the size of a truck. The projection is gated on `canProject` (below), which
+  // refuses to speak in the first six minutes of the window. So a burst that spends 80-94% of the
+  // whole hourly pool in the first few minutes — remaining 251-1000, fracElapsed < 0.1 — reached
+  // NONE of the branches: not exhausted (remaining > 0), not the 5% floor (remaining > 250), not
+  // the projection (fracElapsed < 0.1). It was reported `healthy`, and then main() filed a
+  // `resolved` signal that CLEARED the previous hour's real alarm. Measured: used=4000/5000 at
+  // fracElapsed 0.05 returned verdict `healthy`.
+  //
+  // Spending most of an hour's pool while most of the hour is still to run is a burn RATE, not a
+  // projection — it is a fact knowable right now, and it must not read as healthy. This branch is
+  // gated to `fracElapsed < 0.1` (exactly the window the projection refuses), so it can never
+  // override or downgrade the critical projection branches that own everything past six minutes.
+  // It reuses the projection's own `used >= 1500` real-amount floor so a small post-reset burst
+  // (200 calls in 30s) still never cries wolf.
+  if (fracElapsed < 0.1 && used >= 1500 && remaining <= Math.round(limit * 0.2) && secsToReset > 120) {
+    return { ...base, verdict: 'low', severity: 'warning',
+      title: 'GitHub API allowance is being burned far faster than the hour can refill it',
+      summary: `${used} of ${limit} calls are already spent only minutes into the window, with ${Math.round(secsToReset / 60)} min still to run and ${remaining} left — a burn rate the hour cannot sustain, and close to the point where our own deploys start being refused. The usual cause is \`gh run watch\` polling across concurrent sessions.` }
+  }
+
   // Only project once the window has run far enough and enough has been spent for it to mean
   // something — otherwise a normal post-reset burst projects to nonsense.
   const canProject = fracElapsed >= 0.1 && used >= 1500

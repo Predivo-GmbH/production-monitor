@@ -152,16 +152,28 @@ t('the title says what a customer meets, and names the product', () => {
 // "there is no backend here" as "the backend is down" is a 03:00 phone call about five products
 // that are working perfectly.
 
-await at('probeAuth does not call anything for a product with no Supabase project', async () => {
-  // THE DEFECT, at its source rather than at the predicate: without the `if (!ref)` guard this
-  // fetches `https://.supabase.co/auth/v1/health` -- a real request, to a real hostname, that
-  // fails -- and returns ok:false. Five of the twelve would be filed as unreachable on the first
-  // run and CRITICAL on the second. Proven by injecting exactly that: with the guard removed this
-  // assertion goes red, and so do the two below it.
+await at('probeAuth for a product with no Supabase project probes nothing and reports could-not-tell, never a pass', async () => {
+  // TWO defects are guarded here, at the source rather than at the predicate.
+  //
+  // (1) Without the `if (!ref)` guard this fetches `https://.supabase.co/auth/v1/health` -- a real
+  //     request, to a real hostname, that fails -- and returns ok:false. Five of the twelve would
+  //     be filed unreachable on the first run and CRITICAL on the second. With the guard removed
+  //     the `!== false` assertion below goes red.
+  //
+  // (2) F29, closed 2026-09-03. This branch used to return `ok: true`. In this file `true` means
+  //     PROVEN healthy -- a customer can log in -- and `null` means could-not-tell, the value
+  //     `classifyAuth` returns when the gateway answered but the service was never reached. Nothing
+  //     is checked here, so `true` was a false green: BoatBuddy, Distribution-OS and arivioo each
+  //     have a LIVE Supabase backend and a blank `supabase_ref` row, and this branch called their
+  //     unmonitored login healthy. Revert the source line to `ok: true` and the `=== null`
+  //     assertion below goes red. It is behaviourally neutral today (the coverage denominator and
+  //     the `p.supabase_ref` guards in main() already exclude blank refs); this locks the value so
+  //     a future reader that trusts `ok === true` cannot be handed an unchecked product as a proven one.
   for (const missing of [null, undefined, '']) {
     const r = await probeAuth(missing)
-    assert.equal(r.ok, true, `probeAuth(${JSON.stringify(missing)}) must not report a failure`)
-    assert.match(r.detail, /nothing to check/)
+    assert.notEqual(r.ok, false, `probeAuth(${JSON.stringify(missing)}) must never report a failure`)
+    assert.strictEqual(r.ok, null, `an unchecked backend is could-not-tell (null), not proven-healthy (true)`)
+    assert.match(r.detail, /nothing was checked|proves nothing/)
   }
 })
 

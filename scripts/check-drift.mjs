@@ -95,6 +95,18 @@ for (const { name, patEnv, prod, staging } of PRODUCTS) {
       query(prod, pat, SCHEMA_SQL),
       query(staging, pat, SCHEMA_SQL),
     ])
+    // AN EMPTY READ IS NOT PARITY (2026-09-03 audit, proven by injection). If either side returns
+    // zero rows — a permission-scoped PAT, a query against the wrong schema, a Management-API quirk
+    // that answers 200 with `[]` instead of erroring — then two empty sets are trivially
+    // "identical" and every leg below reports total health over a database nobody actually read.
+    // A LIVE SUPABASE PROJECT ALWAYS HAS PUBLIC COLUMNS, so zero columns is a failed read, never an
+    // empty schema. Fail loud and skip this product's remaining legs, whose "identical (0)" would
+    // be the same lie one line down. (The schema read is the sentinel: if the connection or PAT is
+    // broken for this product, the constraint and cron reads are empty too.)
+    if (pCols.length === 0 || sCols.length === 0) {
+      fail(`${name} schema: read ${pCols.length} column(s) from PROD and ${sCols.length} from STAGING — a live project always has public columns, so this is a FAILED READ (scoped PAT / wrong schema / empty API response), not parity. Not trusting constraints or cron parity either.`)
+      continue
+    }
     const colDiff = diffSets(pCols.map((r) => r.entry), sCols.map((r) => r.entry))
     if (colDiff.prodOnly.length || colDiff.stagingOnly.length) {
       fail(`${name} schema: ${colDiff.prodOnly.length} column(s) only in PROD, ${colDiff.stagingOnly.length} only in STAGING`)

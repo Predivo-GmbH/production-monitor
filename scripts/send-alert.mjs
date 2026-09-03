@@ -1,4 +1,5 @@
 import { createMailTransport } from './lib/smtp.mjs'
+import { sendOrEscalate } from './lib/alert-fallback.mjs'
 import { extractFailures, canaryRows, deriveFailures, isNoDetailFallback, failedStepRows } from './lib/parse-failures.mjs'
 import { previousDedupView, shouldSuppressAlert } from './lib/alert-dedup.mjs'
 import { readFileSync, existsSync } from 'fs'
@@ -274,22 +275,42 @@ const html = `
   </div>
 `
 
-const transporter = await createMailTransport({
-  host: SMTP_HOST,
-  port: SMTP_PORT,
-  user: SMTP_USER,
-  pass: SMTP_PASS,
-})
+const subject = allFixed
+  ? `[AUTO-FIXED] ${autoFixCount} issue(s) resolved automatically`
+  : hasAutoFixes
+    ? `[PARTIAL FIX] ${failures.length} issue(s) need attention, ${autoFixCount} auto-fixed`
+    : `[ALERT] ${failures.length} failure(s) — ${projectSummary}`
 
-await transporter.sendMail({
-  from: `Production Monitor <${SMTP_USER}>`,
-  to: ALERT_EMAIL,
-  subject: allFixed
-    ? `[AUTO-FIXED] ${autoFixCount} issue(s) resolved automatically`
-    : hasAutoFixes
-      ? `[PARTIAL FIX] ${failures.length} issue(s) need attention, ${autoFixCount} auto-fixed`
-      : `[ALERT] ${failures.length} failure(s) — ${projectSummary}`,
-  html,
-})
+// Building the transport is INSIDE the guarded call on purpose. createMailTransport resolves and
+// pins the MX host's A record, so a DNS or connect failure throws HERE, before sendMail is ever
+// reached — and that is just as much an undeliverable alert as a 535 is. Guarding only the send
+// would leave the earlier half of the same journey dying silently.
+await sendOrEscalate(
+  async () => {
+    const transporter = await createMailTransport({
+      host: SMTP_HOST,
+      port: SMTP_PORT,
+      user: SMTP_USER,
+      pass: SMTP_PASS,
+    })
+    return transporter.sendMail({
+      from: `Production Monitor <${SMTP_USER}>`,
+      to: ALERT_EMAIL,
+      subject,
+      html,
+    })
+  },
+  {
+    subject,
+    failures,
+    runUrl: GITHUB_RUN_URL,
+    smtpHost: SMTP_HOST,
+    smtpUser: SMTP_USER,
+    // The password is never wanted in a log or on the board, and an SMTP server can echo what it
+    // was handed straight back in the rejection string.
+    secrets: [SMTP_PASS],
+  },
+  { secret: process.env.BOARD_SUPABASE_SECRET || process.env.BACKOFFICE_SERVICE_ROLE_KEY },
+)
 
 console.log(`Alert sent to ${ALERT_EMAIL} with ${failures.length} failure(s): ${projectSummary}`)

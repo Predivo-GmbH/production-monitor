@@ -176,8 +176,15 @@ export function currentFailures(runs) {
     const prev = newestByLane.get(laneKey)
     if (!prev || new Date(r.created_at) > new Date(prev.created_at)) newestByLane.set(laneKey, r)
   }
+  // `timed_out` added 2026-09-03 (audit, proven by injection): a deploy job that hangs until
+  // GitHub kills it ends the whole run `completed / timed_out`, a distinct run-level conclusion
+  // from `failure`. It is the deploy NOT finishing — production untouched or half-shipped — and it
+  // was falling straight through this exact-match filter as healthy. `cancelled` stays out on
+  // purpose (somebody stopped it); `startup_failure` is the unreadable-file shape classifyFailure
+  // owns; a `timed_out` run has no `conclusion:'failure'` job, so it classifies as `unknown` and is
+  // filed as a real red rather than mistaken for a staging-gate rejection.
   const reds = [...newestByLane.values()].filter(
-    (r) => r.conclusion === 'failure' || r.conclusion === 'startup_failure',
+    (r) => r.conclusion === 'failure' || r.conclusion === 'startup_failure' || r.conclusion === 'timed_out',
   )
 
   // A BROKEN FILE IS CLEARED BY ANY LATER SUCCESS OF THAT FILE, IN EITHER LANE.

@@ -179,7 +179,16 @@ export function classifyAuth(status, { keyed }) {
 
 /** Is the product's own auth backend up? Down means nobody can sign in or load their data. */
 export async function probeAuth(ref, key = null) {
-  if (!ref) return { ok: true, detail: 'no Supabase project — nothing to check' }
+  // NO REGISTERED BACKEND IS "COULD NOT TELL", NOT "HEALTHY" (2026-09-03, closing F29 of the audit).
+  // This used to return `ok: true`. `true` in this file means PROVEN healthy — a customer can log
+  // in — and nothing was checked here, so that was a false green. It was masked because
+  // `reasonsUnreachable` only acts on `ok === false` and the coverage denominator excludes blank
+  // refs, but it is the exact F5 trap: BoatBuddy, Distribution-OS and arivioo each have a LIVE
+  // Supabase backend and a blank `supabase_ref` row, so this branch was reporting their login as
+  // healthy while nothing watched it. `null` is the value `classifyAuth` already uses for
+  // could-not-tell, so a future reader that trusts `ok === true` as "login is up" can never be
+  // handed an unchecked product dressed as a proven one.
+  if (!ref) return { ok: null, detail: 'no Supabase project in the registry — nothing was checked, so this proves nothing' }
   const headers = { 'User-Agent': NON_BROWSER_UA }
   if (key) { headers.apikey = key; headers.Authorization = `Bearer ${key}` }
   try {

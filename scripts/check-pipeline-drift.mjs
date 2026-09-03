@@ -69,6 +69,19 @@ for (const p of FLEET) {
   let yml
   try { yml = loadYaml(p) } catch (e) { fail(`${p.name}: cannot load deploy.yml — ${String(e).slice(0, 160)}`); continue }
 
+  // A FILE THAT IS EMPTY OR TRUNCATED IS NOT A CONFORMING FILE (2026-09-03 audit, proven by
+  // injection). Every check below is a NEGATIVE pattern match — it only fails when a BAD pattern is
+  // FOUND — so a 0-byte or truncated deploy.yml (a bad checkout, a `gh api` content truncation, an
+  // accidental empty commit) matched no bad pattern and passed every universal check as fully
+  // conformant. The §4a content-PRESENCE checks that would have caught it run only for `staged`
+  // products, so the 7 static/push-to-prod products had no content assertion at all. Assert the
+  // file is a real workflow first: every genuine deploy.yml in the fleet carries a `jobs:` block and
+  // at least one `runs-on:`; an empty or truncated one carries neither.
+  if (!/^\s*jobs\s*:/m.test(yml) || !/runs-on\s*:/.test(yml)) {
+    fail(`${p.name}: deploy.yml is empty or truncated — no "jobs:"/"runs-on:" block, so it is not a conforming pipeline at all (read ${yml.trim().length} non-blank byte(s), not a passing file)`)
+    continue
+  }
+
   // ── §4a — only staging-gated repos (static push-to-prod repos have no separate prod dispatch) ──
   if (p.staged) {
     // §4a-1 — the prod deploy job must not re-run staging via a needs on the E2E gate.
