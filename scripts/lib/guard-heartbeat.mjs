@@ -92,7 +92,7 @@ const count = (v) => (Array.isArray(v) ? v.length : 0)
  * one is shouting. Everything guard-specific is data here; the reasoning below is shared.
  *
  *   file        the report the guard leaves behind
- *   stamp       the field carrying when it ran
+ *   stamp       the field carrying when it ran, or a function reading it (Playwright nests it)
  *   broken      -> a reason string if the guard declared itself blind, else null
  *   certified   -> true if the run actually observed the population it exists to observe
  *   uncertified the sentence to print when `certified` is false
@@ -140,6 +140,43 @@ export const GUARDS = {
     uncertified: 'the sweep examined no runs at all, so it read nothing that can cost money',
     describe: (r) => `swept ${r.runs_examined} run(s) over ${r.window_days} day(s) `
       + `(${r.billed_minutes} billed minute(s), ${count(r.findings)} finding(s))`,
+  },
+
+  // Report: Playwright's own JSON reporter, { config, suites, errors, stats } with
+  // stats: { startTime, duration, expected, unexpected, flaky, skipped } (playwright.config.ts:40).
+  // No new artefact was invented for this: the hourly monitor has always written one.
+  //
+  // WHY monitor.yml IS HERE AT ALL. Its heartbeat was `if: success()`, so the ping was not
+  // mis-aimed - it was SKIPPED. Read against the 180-minute tolerance the workflow documents, that
+  // made a three-hour PRODUCT outage indistinguishable from a three-hour MONITOR outage, and it is
+  // the first that happens. Measured on the real run history, 2026-09-03: five consecutive
+  // scheduled failures on 09-02 (06:55Z-10:42Z) and four more on 09-03, and in the three most
+  // recent of them the failing steps were "Run production monitor" AND "Send alert on failure" -
+  // the monitor found something, could not mail it, and skipped its heartbeat too. Every channel
+  // silent at once. That is the case the escape hatch above exists for, and it was unreachable
+  // here because the step never ran.
+  //
+  // The old comment argued a monitor red for three hours is its own incident. It is - but a
+  // PRODUCT down for three hours already has its own alert, its own board rows and its own red
+  // runs, and borrowing the dead-man to say it a fourth time costs the one alarm that means
+  // "nobody is watching". A monitor that stops running still trips the same tolerance, because a
+  // job that never starts writes no report and pings nothing at all.
+  'monitor-hourly': {
+    file: 'test-results/results.json',
+    stamp: (r) => r.stats?.startTime,
+    // Top-level `errors` is where Playwright puts a global setup/config failure - the sweep never
+    // got as far as a test, which is precisely "could not run", not "found something".
+    broken: (r) => (count(r.errors) ? r.errors.map((e) => e.message || String(e)).join(' | ').slice(0, 300) : null),
+    // ABSENCE IS NOT SUCCESS. A run where every test SKIPPED observed nothing, and this is not
+    // hypothetical: the results.json on disk from 2026-09-02T12:45Z reads
+    // expected 0 / unexpected 0 / flaky 0 / skipped 13. A green step over a fleet nothing looked
+    // at is the exact shape this repo exists to catch, and the DASHBOARD_PAT floor test in
+    // tests/ci-health/nightly-gauntlet.spec.ts was added for the same reason.
+    certified: (r) => ((r.stats?.expected || 0) + (r.stats?.unexpected || 0) + (r.stats?.flaky || 0)) > 0,
+    uncertified: 'every check in the sweep SKIPPED, so nothing about any product was actually observed - '
+      + '"no failures" here means "no observations", which is not an all-clear',
+    describe: (r) => `ran ${(r.stats?.expected || 0) + (r.stats?.unexpected || 0) + (r.stats?.flaky || 0)} check(s) `
+      + `(${r.stats?.unexpected || 0} failing, ${r.stats?.flaky || 0} flaky, ${r.stats?.skipped || 0} skipped)`,
   },
 }
 
@@ -201,9 +238,10 @@ export function decideHeartbeat({
     return { ping: FAIL, reason: `the guard reported it could not certify what it watches: ${brokenReason}` }
   }
 
-  const stamp = Date.parse(report[spec.stamp] || '')
+  const stamp = Date.parse((typeof spec.stamp === 'function' ? spec.stamp(report) : report[spec.stamp]) || '')
   if (!Number.isFinite(stamp)) {
-    return { ping: FAIL, reason: `${spec.file} carries no usable ${spec.stamp}, so it cannot be tied to this run` }
+    const named = typeof spec.stamp === 'function' ? 'timestamp' : spec.stamp
+    return { ping: FAIL, reason: `${spec.file} carries no usable ${named}, so it cannot be tied to this run` }
   }
   const age = now - stamp
   if (age > MAX_REPORT_AGE_MS) {

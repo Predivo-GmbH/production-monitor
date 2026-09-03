@@ -44,6 +44,14 @@ const budgetReport = (extra = {}) => JSON.stringify({
   billed_minutes: 88, api_calls: 900, harness_failures: [], findings: [], ...extra,
 })
 
+// Playwright's own JSON reporter, which the hourly monitor has always written
+// (playwright.config.ts:40). Shape verified against a real artefact on disk, not assumed.
+const monitorReport = (stats = {}, extra = {}) => JSON.stringify({
+  config: {}, suites: [], errors: [],
+  stats: { startTime: stampedNow(), duration: 267.5, expected: 190, unexpected: 0, flaky: 0, skipped: 14, ...stats },
+  ...extra,
+})
+
 // ── 1. the incident, for each guard ───────────────────────────────────────────────────────────
 
 t('THE INCIDENT (watchdog): a run that found something and exited 1 still pings UP', () => {
@@ -77,6 +85,68 @@ t('THE INCIDENT (budget): going over budget is the finding this guard exists to 
   })
   assert.equal(r.ping, UP)
   assert.match(r.reason, /swept 640 run\(s\)/)
+})
+
+t('THE INCIDENT (monitor): a product being down is the monitor working, not the monitor dying', () => {
+  // The costliest instance, and the one whose heartbeat was SKIPPED rather than mis-aimed. Five
+  // consecutive scheduled failures on 2026-09-02 (06:55Z-10:42Z) and four more on 09-03 each
+  // skipped the ping, so a three-hour PRODUCT outage was indistinguishable from a three-hour
+  // MONITOR outage against the workflow's own 180-minute tolerance.
+  const r = decideHeartbeat({
+    reportRaw: monitorReport({ unexpected: 3 }),
+    guard: 'monitor-hourly',
+    jobStatus: 'failure',
+    now: NOW,
+  })
+  assert.equal(r.ping, UP, 'the sweep ran and found products down; that is a finding, not silence')
+  assert.match(r.reason, /3 failing/)
+})
+
+t('monitor: a sweep where EVERY check skipped pings /fail - absence is not success', () => {
+  // Not hypothetical: a results.json on disk from 2026-09-02T12:45Z reads
+  // expected 0 / unexpected 0 / flaky 0 / skipped 13.
+  const r = decideHeartbeat({
+    reportRaw: monitorReport({ expected: 0, unexpected: 0, flaky: 0, skipped: 13 }),
+    guard: 'monitor-hourly',
+    jobStatus: 'success',
+    now: NOW,
+  })
+  assert.equal(r.ping, FAIL, 'a green sweep over a fleet nothing looked at must not report health')
+  assert.match(r.reason, /no observations/)
+})
+
+t('monitor: a Playwright global failure pings /fail - it never got as far as a test', () => {
+  const r = decideHeartbeat({
+    reportRaw: monitorReport({}, { errors: [{ message: 'browserType.launch: Executable does not exist' }] }),
+    guard: 'monitor-hourly',
+    jobStatus: 'failure',
+    now: NOW,
+  })
+  assert.equal(r.ping, FAIL)
+  assert.match(r.reason, /could not certify/)
+})
+
+t('monitor: found something AND could not mail it pings /fail - every channel silent at once', () => {
+  // Measured 2026-09-03 on runs 33720969205, 33719012111 and 33712864833: the failing steps were
+  // "Run production monitor" AND "Send alert on failure", and the Heartbeat step read `skipped`.
+  const r = decideHeartbeat({
+    reportRaw: monitorReport({ unexpected: 3 }),
+    guard: 'monitor-hourly',
+    alertOutcome: 'failure',
+    jobStatus: 'failure',
+    now: NOW,
+  })
+  assert.equal(r.ping, FAIL, 'healthchecks.io is then the only channel left and must not say healthy')
+})
+
+t('monitor: the report timestamp is read from stats.startTime, where Playwright nests it', () => {
+  const stale = JSON.stringify({
+    config: {}, suites: [], errors: [],
+    stats: { startTime: new Date(NOW - 3 * 60 * 60 * 1000).toISOString(), expected: 190, unexpected: 0, flaky: 0, skipped: 0 },
+  })
+  assert.equal(decideHeartbeat({ reportRaw: stale, guard: 'monitor-hourly', now: NOW }).ping, FAIL,
+    'a nested stamp that is not read would make every run look stale, or none')
+  assert.equal(decideHeartbeat({ reportRaw: monitorReport(), guard: 'monitor-hourly', now: NOW }).ping, UP)
 })
 
 t('a clean run pings UP for every guard', () => {
@@ -231,6 +301,7 @@ const WIRED = [
   { file: 'ci-runner-watchdog.yml', guard: 'ci-runner-watchdog', secret: 'HC_PING_CI_WATCHDOG', alertStep: true },
   { file: 'mailer-config-check.yml', guard: 'mailer-config-guard', secret: 'HC_PING_MAILER_GUARD', alertStep: true },
   { file: 'ci-budget-check.yml', guard: 'ci-cost-guard', secret: 'HC_PING_CI_BUDGET', alertStep: false },
+  { file: 'monitor.yml', guard: 'monitor-hourly', secret: 'HC_PING_MONITOR_HOURLY', alertStep: true },
 ]
 
 for (const w of WIRED) {
@@ -269,26 +340,54 @@ for (const w of WIRED) {
   }
 }
 
-t('monitor.yml is deliberately left alone - its if: success() heartbeat is a decision, not this bug', () => {
+t('monitor.yml no longer skips its ping on a red run - REVERSES an earlier decision here', () => {
+  // This suite previously asserted the OPPOSITE: that monitor.yml's `if: success()` heartbeat was
+  // "a decision, not this bug", taking the workflow's own comment at face value. The run history
+  // refuted it. Measured 2026-09-03 over the last 30 scheduled runs: five consecutive failures on
+  // 09-02 (06:55Z-10:42Z), four more on 09-03, and in the three most recent the failing steps were
+  // "Run production monitor" AND "Send alert on failure" while the Heartbeat step read `skipped`.
+  // The monitor found something, could not mail it, and said nothing on the one channel that does
+  // not share infrastructure with ours. `if: success()` made the escape hatch unreachable in
+  // exactly the case it was written for.
+  //
+  // What the old comment wanted is still true and still works: a monitor that STOPS RUNNING trips
+  // the same 180-minute tolerance, because a job that never starts writes no report and pings
+  // nothing at all. What it loses is only the false alarm about the monitor during a product
+  // outage, which already has three louder channels of its own.
   const wf = read('monitor.yml')
-  assert.ok(!/node scripts\/guard-heartbeat\.mjs/.test(wf),
-    'monitor.yml documents why three consecutive red hourly runs SHOULD trip its check; do not "fix" it')
+  assert.match(wf, /node scripts\/guard-heartbeat\.mjs/)
+  assert.ok(!/- name: Heartbeat[^\n]*\n\s*if:\s*success\(\)/.test(wf),
+    'if: success() skips the ping on exactly the runs that matter most')
 })
 
-t('every workflow that curls a healthchecks ping URL is either wired here or monitor.yml', () => {
-  // The regression catch: a fourth guard added with the old shell branch must fail this suite.
+t('RATCHET: every workflow that pings healthchecks routes through the shared heartbeat', () => {
+  // The regression catch: a FIFTH guard added with the old shell branch must fail this suite on
+  // the day it is written. Two things changed here on 2026-09-03. The monitor.yml exemption is
+  // gone - it was the hole the largest instance of this defect was sitting in - and the check is
+  // now made against each file's CONTENTS rather than against membership of the WIRED list above,
+  // because a list is a second place to remember and this repo keeps finding what falls out of one.
   const dir = new URL('../.github/workflows/', import.meta.url)
+  const pinging = []
   const offenders = []
   for (const f of readdirSync(dir)) {
     if (!f.endsWith('.yml')) continue
     const wf = readFileSync(new URL(f, dir), 'utf-8')
     if (!/HC_PING_/.test(wf)) continue
-    const wired = WIRED.some((w) => w.file === f)
-    if (wired || f === 'monitor.yml') continue
-    offenders.push(f)
+    pinging.push(f)
+    const routed = /node scripts\/guard-heartbeat\.mjs/.test(wf)
+    const branches = /\$\{\{\s*job\.status\s*\}\}"?\s*=\s*"success"/.test(wf)
+    const skips = /- name: Heartbeat[^\n]*\n\s*if:\s*success\(\)/.test(wf)
+    if (!routed || branches || skips) offenders.push(f)
   }
   assert.deepEqual(offenders, [],
-    `these workflows ping healthchecks but are not covered by the shared heartbeat: ${offenders.join(', ')}`)
+    `these workflows ping healthchecks but do not route through scripts/guard-heartbeat.mjs, or still `
+    + `branch or skip on job status: ${offenders.join(', ')}`)
+  assert.ok(pinging.length >= 4,
+    `expected at least the four known pinging workflows, found ${pinging.length} - if a ping was REMOVED, `
+    + 'that is a dead-man switch that stopped existing and this is the right place to notice')
+  for (const w of WIRED) {
+    assert.ok(pinging.includes(w.file), `${w.file} is wired above but no longer pings healthchecks at all`)
+  }
 })
 
 console.log(`\n${n} assertions passed`)

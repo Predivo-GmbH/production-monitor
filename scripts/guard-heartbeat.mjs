@@ -4,9 +4,13 @@
  * WATCHES, AND DID ITS FINDING GET OUT? See scripts/lib/guard-heartbeat.mjs for why neither of
  * those is `job.status`.
  *
- * Used by ci-runner-watchdog.yml, mailer-config-check.yml and ci-budget-check.yml. NOT by
- * monitor.yml, whose `if: success()` heartbeat is a deliberate, documented choice (three
- * consecutive red hourly runs should trip that check) rather than this bug.
+ * Used by ci-runner-watchdog.yml, mailer-config-check.yml, ci-budget-check.yml and monitor.yml.
+ *
+ * monitor.yml joined on 2026-09-03. Its heartbeat was `if: success()`, so the ping was not
+ * mis-aimed, it was SKIPPED - a different disguise for the same defect, and the costliest one,
+ * because the workflow's own 180-minute tolerance then turned every three-hour PRODUCT outage
+ * into a false "the monitor stopped running". See the `monitor-hourly` spec for the run history
+ * that settled it.
  *
  * The ping URL arrives in the environment rather than on the command line: this repository is
  * PUBLIC, a ping URL held green by a stranger is a dead-man that cannot die, and argv is visible

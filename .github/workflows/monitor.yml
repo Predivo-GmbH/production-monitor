@@ -135,6 +135,7 @@ jobs:
           IMAP_PASS: ${{ secrets.IMAP_PASS }}
 
       - name: Run production monitor
+        id: sweep
         # Backstop for the config's globalTimeout, in case the Playwright runner itself wedges.
         # A STEP timeout fails the job (conclusion=failure -> alert fires); the job-level
         # timeout-minutes above yields conclusion=cancelled, which silences every alert path.
@@ -733,6 +734,7 @@ jobs:
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
       - name: Send alert on failure
+        id: alert
         if: failure()
         run: node scripts/send-alert.mjs
         env:
@@ -785,9 +787,45 @@ jobs:
       # RED runs also trip it — that is wanted: a monitor red for three hours is its own
       # incident, and the 2026-08-26 run of twelve consecutive failures over eleven hours
       # produced no heartbeat complaint at all under the old setting.
+      #
+      # A PRODUCT BEING DOWN IS THE MONITOR WORKING, NOT THE MONITOR DYING (changed 2026-09-03).
+      #
+      # This step was `if: success()`, so the ping was SKIPPED on every red run. Read against the
+      # 180-minute tolerance reasoned about just above, that made a three-hour PRODUCT outage
+      # indistinguishable from a three-hour MONITOR outage - and it is the first that happens.
+      # Same defect class as ci-runner-watchdog, mailer-config-guard and ci-cost-guard, all fixed
+      # earlier the same day; this was the fourth and largest instance.
+      #
+      # What settled it was the run history, not this argument. Five consecutive scheduled
+      # failures on 2026-09-02 (06:55Z-10:42Z) and four more on 09-03, and in the three most
+      # recent the failing steps were "Run production monitor" AND "Send alert on failure": the
+      # monitor found something, could not mail it, and skipped its heartbeat too. Every channel
+      # silent at once, which is the exact condition healthchecks.io exists to break, and
+      # `if: success()` made it unreachable.
+      #
+      # WHAT DECIDES IT NOW - scripts/lib/guard-heartbeat.mjs, spec `monitor-hourly`, reading the
+      # Playwright report this job has always written:
+      #   the alert step FAILED        -> /fail. Found something, told nobody. Healthchecks mails
+      #                                   from its own infrastructure and is the only channel left.
+      #   no / stale / unparsable report -> /fail. Checkout, npm ci or the browser install died, or
+      #                                   the job-level timeout cancelled it; nothing was examined.
+      #   every check SKIPPED          -> /fail. "No failures" meaning "no observations" is not an
+      #                                   all-clear. Measured: a real results.json on disk reads
+      #                                   0 passed / 0 failed / 13 skipped.
+      #   the sweep ran and found a product down -> UP. That is a finding. It travels by email, by
+      #                                   the red run and by the board; it is not silence.
+      #
+      # The old note wanted three consecutive red runs to trip the check. A monitor that stops
+      # running still trips it on the same tolerance, because a job that never starts writes no
+      # report and pings nothing at all.
       - name: Heartbeat (healthchecks.io dead-man's-switch)
-        if: success()
-        run: curl -fsS -m 10 --retry 3 "${{ secrets.HC_PING_MONITOR_HOURLY }}" || true
+        if: always()
+        env:
+          HEARTBEAT_GUARD: monitor-hourly
+          HC_PING_URL: ${{ secrets.HC_PING_MONITOR_HOURLY }}
+          ALERT_STEP_OUTCOME: ${{ steps.alert.outcome }}
+          GITHUB_JOB_STATUS: ${{ job.status }}
+        run: node scripts/guard-heartbeat.mjs
 
       # Factory Cockpit: upsert the `monitoring` machine_state row (factory_state tile).
       # Best-effort: the script always exits 0; staleness/alert is the failure signal.
