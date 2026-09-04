@@ -78,12 +78,29 @@
  *   * It never mints a second signal for an issue that already has one. Before filing, it adopts
  *     whatever key the board is already using for that issue (shortId, numeric id or `sentry:<id>`),
  *     so the six historic key conventions converge instead of doubling.
- *   * It cannot ring a phone, and nothing here is trying to. Every signal is filed
- *     `needs_human: false` (an application error is code, so it is machine-owned and belongs in the
- *     "Watching" band, never in "Needs you", which means it needs ROGER). `severity` is Sentry's
- *     own level. `signal_page_policy` has no `sentry` row, and upsert_signal requires
- *     needs_human AND critical before anything is even eligible. A chronic error is a board item,
- *     never a phone call.
+ *   * ONE class of error CAN ring a phone, and only one: a refused credential. Everything else is
+ *     still filed `needs_human: false` at Sentry's own level (an application error is code, so it
+ *     is machine-owned and belongs in the "Watching" band, never in "Needs you", which means it
+ *     needs ROGER). A chronic application error remains a board item, never a phone call.
+ *
+ *     WHY THE EXCEPTION EXISTS (Roger's decision, 2026-09-04, option C of three). On 2026-09-02
+ *     ReplyFlow and SignalScore answered `Unregistered API key` to every call BackOffice made. This
+ *     producer SAW it and filed two signals — and both were graded into silence, because
+ *     `severityFor()` is a straight copy of Sentry's level (so `error` becomes `warning`) and
+ *     `needs_human` was hardcoded false. Zero of the 38 signals this source had ever filed had
+ *     paged. The outage ran 22h40m and a human found it on a dashboard.
+ *
+ *     A refused credential is the one error class where "a machine owns it" is FALSE: no machine on
+ *     this fleet can mint a replacement key, and the fault never self-heals. So `isCredentialRefusal`
+ *     raises exactly that class to `critical` + `needs_human: true`, which is what upsert_signal
+ *     requires. Replayed over all 38 signals ever filed, this rings 5 times in four months and is
+ *     right all five; the alternative Roger rejected — "anything still broken after a day" — rings
+ *     7 and is wrong at least twice. Measurements and the two rejected options:
+ *     docs/DECISION-when-a-crash-report-is-allowed-to-ring-your-phone-2026-09-03.md
+ *
+ *     `signal_page_policy` DOES carry a `sentry` row with `may_page = true` (read live 2026-09-03;
+ *     an earlier version of this header said it did not, and that was wrong). So the severity /
+ *     needs_human pair was the only thing muting this source, and changing it here is sufficient.
  *
  * Contract:  node scripts/check-sentry-issues.mjs [--dry]
  *   env: SENTRY_API_TOKEN   read token for org `predivo-gmbh`. Falls back to the BackOffice
@@ -177,6 +194,41 @@ export function keyFor(issue, boardRows) {
   return String(issue.shortId || issue.id)
 }
 
+/**
+ * The wordings that mean "a credential was refused", which is the ONE class allowed to page.
+ *
+ * Deliberately about the REJECTION, never about the secret. `expiring tokens` in
+ * "Failed to query expiring tokens" is a table of customer tokens being read and is not a refusal,
+ * so bare `token` is not matched — only a token that was rejected. `JWT issued at future` is here
+ * because it is a real refusal that the narrower option (A) missed twice: a clock-skewed JWT is
+ * refused exactly like a revoked one, and no machine can fix it either.
+ */
+export const CREDENTIAL_REFUSAL = new RegExp([
+  'unregistered api key', 'invalid api key', 'no api key', 'api key not found', 'bad api key',
+  'jwt expired', 'jwt issued at future', 'invalid jwt', 'jwsError', 'invalid signature',
+  'signature verification', 'invalid token', 'expired token', 'token expired', 'token refused',
+  'invalid credential', 'unauthorized', 'unauthorised', 'permission denied', 'forbidden',
+  'http 401', 'http 403', '\\b401\\b', '\\b403\\b',
+].join('|'), 'i')
+
+/**
+ * Titles a person wrote to say "this is NOT a live production fault". Never paged, whatever they
+ * say. Both wordings are real and both would otherwise have produced a false page: one row begins
+ * "Cleared in Sentry" (already fixed) and one begins "[not live]" (a staging-only money defect a
+ * person filed by hand).
+ */
+const NOT_LIVE_PREFIX = /^\s*(\[not live\]|cleared in sentry)/i
+
+/**
+ * Is this error a refused credential? Judged on the title and the culprit, never on the level —
+ * the level is what got this wrong in the first place.
+ */
+export function isCredentialRefusal(issue) {
+  const text = `${issue?.title ?? ''} ${issue?.culprit ?? ''}`
+  if (NOT_LIVE_PREFIX.test(String(issue?.title ?? ''))) return false
+  return CREDENTIAL_REFUSAL.test(text)
+}
+
 /** Sentry's own level, mapped onto the board's three words. Nothing is invented. */
 export function severityFor(issue) {
   const level = String(issue.level ?? 'error').toLowerCase()
@@ -194,18 +246,24 @@ export function signalFor(issue, key) {
   const users = Number(issue.userCount ?? 0)
   const seen = times === 1 ? 'Seen once' : `Seen ${times} times`
   const who = users > 0 ? ` ${users} user${users === 1 ? '' : 's'} affected.` : ''
+  // The ONE exception to "an application error is code, so a machine owns it": a refused
+  // credential cannot be fixed by any machine here and never self-heals, so it is the only class
+  // that belongs in "Needs you". Roger's decision, 2026-09-04 — see the header.
+  const refused = isCredentialRefusal(issue)
   return {
     source: SOURCE,
     key: key ?? String(issue.shortId || issue.id),
     kind: 'incident',
-    severity: severityFor(issue),
+    severity: refused ? 'critical' : severityFor(issue),
     state: 'open',
-    // An application error is CODE, so a machine owns it. "Needs you" on this board means it
-    // needs Roger, and putting an error there would change what the band means.
-    needs_human: false,
+    // upsert_signal is eligible to page only on needs_human AND critical, so these two move
+    // together or not at all. Everything that is not a refused credential keeps the old contract.
+    needs_human: refused,
     product: issue.project || null,
     title: `${issue.project || 'app'} is throwing an error: ${issue.title || '(untitled)'}`.slice(0, 200),
     summary: [
+      // Say WHY the phone rang, first, in the words a person woken by it needs.
+      refused ? 'A key or login was REFUSED, so no machine here can fix this. ' : '',
       `${seen} since ${dateOnly(issue.firstSeen)}, most recently ${dateOnly(issue.lastSeen)}`,
       envs ? ` in ${envs}` : '',
       `.${who}`,

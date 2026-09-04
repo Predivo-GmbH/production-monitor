@@ -1,6 +1,23 @@
 # When a crash report is allowed to ring Roger's phone
 
-**Status: DECISION OPEN — Roger picks. Nothing has been changed.**
+**Status: DECIDED 2026-09-04. Roger picked C. Shipped in `check-sentry-issues.mjs`
+(`isCredentialRefusal`), 36 tests green.**
+
+> **CORRECTION, made before shipping and after replaying the shipped code against all 38 signals:
+> C rings 7 times, not the 5 estimated below.** The estimate assumed the widened wording would add
+> two `JWT issued at future` rows to A's three. The history holds **four** of them — ReplyFlow on
+> 2026-08-21, 08-26 and 08-29, ChannelMover on 09-01 — so C = 3 + 4 = 7 over about four and a half
+> months, roughly 1.6 a month.
+>
+> **That is the same count as option B, and it is still the better set.** All seven of C's are
+> genuine credential rejections that stopped a job: two are the 2026-09-02 outage, one is a lapsed
+> Smartlead plan, four are clock-skewed JWTs that the edge runtime refused. **None of them is a
+> page about something already fixed or about a fault that is not live** — which is precisely what
+> two of B's seven were. The four clock-skew rows are the softest of the seven: they are real
+> refusals, but they do heal by themselves once the clock settles. If they prove annoying, the
+> honest tightening is to drop `jwt issued at future` from the pattern, which returns C to exactly
+> A's three.
+
 Measured 2026-09-03 between 20:40Z and 21:00Z against BackOffice production (`xoecpzfsskalvjrtcbbl`),
 38 signals, the entire history of the `sentry` source.
 
