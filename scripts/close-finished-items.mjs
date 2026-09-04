@@ -103,7 +103,7 @@
  */
 import { existsSync, readFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
-import { dirname, delimiter, isAbsolute, join, resolve } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { homedir } from 'node:os'
 
@@ -318,10 +318,31 @@ export function closureCap(env = process.env) {
  * is the same shape as a new exit code that only half-answers its contract.
  */
 export function testRoots(env = process.env) {
-  const extra = String(env.CLOSER_TEST_ROOTS || '').split(delimiter).map((s) => s.trim()).filter(Boolean)
   const out = [...DEFAULT_TEST_ROOTS]
-  for (const r of extra) if (!out.includes(r)) out.push(r)
+  for (const r of splitRootList(env.CLOSER_TEST_ROOTS)) if (!out.includes(r)) out.push(r)
   return out
+}
+
+/**
+ * Split a root LIST without shredding a Windows drive-letter path.
+ *
+ * `path.delimiter` is decided by the platform RUNNING the code, not by the platform the paths
+ * describe. Every root here is a Windows path (`C:/Business/Internal Projects`), the closer runs
+ * on Windows where the delimiter is `;` -- but the unit suite runs on a Linux CI runner where it
+ * is `:`. So `split(delimiter)` turned `C:/Business/Internal Projects` into `C` +
+ * `/Business/Internal Projects`, and `C` is a one-segment root that `resolve()` happily turns
+ * into a real directory under the runner's cwd. A roots list that INVENTS a root is the same
+ * class of bug as one that drops one: both change which files this job is willing to execute.
+ *
+ * So: always honour `;`, and only treat `:` as a separator when it is not a drive-letter colon.
+ */
+function splitRootList(raw) {
+  const parts = []
+  for (const chunk of String(raw || '').split(';')) {
+    if (/^\s*[A-Za-z]:[\\/]/.test(chunk)) parts.push(chunk)
+    else parts.push(...chunk.split(':'))
+  }
+  return parts.map((s) => s.trim()).filter(Boolean)
 }
 
 /**

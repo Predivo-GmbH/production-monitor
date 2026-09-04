@@ -1034,6 +1034,23 @@ t('an empty or missing result set writes nothing and never throws', async () => 
   assert.deepEqual(testRoots({ CLOSER_TEST_ROOTS: '' }), base)
   assert.deepEqual(testRoots({ CLOSER_TEST_ROOTS: ['', '   ', ''].join(delimiter) }), base)
 
+  // A WINDOWS DRIVE-LETTER ROOT SURVIVES ON EVERY PLATFORM, and this assertion is the whole
+  // reason the suite was red for 8 consecutive commits on 2026-09-04 (12:29Z-14:49Z).
+  //
+  // The roots are Windows paths; the closer runs on Windows; the suite runs on a Linux runner.
+  // Splitting on `path.delimiter` reads that delimiter off the machine RUNNING the code, so on
+  // Linux `C:/Business/Internal Projects` was cut into `C` + `/Business/Internal Projects` — the
+  // list both LOST the real root and INVENTED `C`, which resolve() turns into a live directory
+  // under the runner's cwd. A roots list decides which files this job will execute, so inventing
+  // one is the same severity as dropping one. The split is now delimiter-independent.
+  for (const drive of ['C:/Business/Internal Projects', 'D:/x/y', 'E:\\x\\y']) {
+    const got = testRoots({ CLOSER_TEST_ROOTS: drive })
+    assert.ok(got.includes(drive), `${drive} must survive whole — a drive-letter colon is not a separator`)
+    assert.ok(!got.includes(drive[0]), `${drive} must never leave a bare "${drive[0]}" root behind`)
+  }
+  // ...and a POSIX list still splits on ':', so the fix did not trade one platform for the other.
+  assert.deepEqual(testRoots({ CLOSER_TEST_ROOTS: '/x/a:/y/b' }), [...base, '/x/a', '/y/b'])
+
   // Hostile input is survived rather than thrown on — this runs unattended, hourly.
   for (const v of [null, undefined, 0, 42, {}, []]) {
     assert.doesNotThrow(() => testRoots({ CLOSER_TEST_ROOTS: v }))
