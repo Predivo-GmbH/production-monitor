@@ -1024,6 +1024,27 @@ async function main() {
   const asJson = process.argv.includes('--json')
   const max = closureCap()
 
+  // WHAT THIS MACHINE CAN SEE, SAID ONCE AND OUT LOUD, BEFORE ANY VERDICT.
+  // On 2026-09-04 this job ran on the laptop and wrote 42 unknown / 14 fail / 2 pass, while the
+  // same code hand-run on the work PC produced far fewer unknowns. The cause was keys, and the
+  // laptop said so one item at a time - "no management token on this disk opens X" - each of which
+  // reached the board as an ordinary UNKNOWN. Measured 2026-09-05: the work PC's 17 tokens open 22
+  // projects, the laptop's 16 open 3. The machine that runs this every hour is blind to 19 of 22
+  // products, and nothing about the output made that visible.
+  // "I could not look" and "this is unknown" are different facts and only one of them is about the
+  // product. Printing this is cheap; the run continues either way, because a machine that can see
+  // three products should still judge those three.
+  if (!asJson) {
+    try {
+      const { machineSight, sightBanner } = await import('./lib/machine-sight.mjs')
+      const sight = await machineSight()
+      for (const line of sightBanner(sight).lines) console.log(line)
+    } catch (e) {
+      console.log(`SIGHT: could not measure what this machine can see (${String(e?.message ?? e).slice(0, 90)}).`)
+      console.log('       Treat that as UNKNOWN, never as full sight.')
+    }
+  }
+
   const creds = loadBoardCredentials()
   if (!creds.ok) {
     const v = verdict({ boardRead: false, reason: creds.reason })
