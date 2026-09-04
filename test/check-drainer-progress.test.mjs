@@ -436,6 +436,44 @@ t('the pre-parked_keys count fallback still fires the honest direction (no keys 
   assert.match(j.summary, /only 1 row/)
 })
 
+t('THE HANDOVER SUCCESS PATH (2026-09-04): a park handed to the work board is not reported as unpublished', () => {
+  // 9ac84aa published parked_keys from the full parked set, then reduced only the COUNT after
+  // handover. A parked item handed to the work board clears its detail.parked flag (clearParkedOnSignal),
+  // so its key drops out of parkedPublished — but stayed in parked_keys. missing then named it as an
+  // unpublished park, firing parks-unpublished on the drainer's OWN success path, every run that parked
+  // something and handed it over. The fix (reduceParkedForHandover) drops the key from parked_keys too,
+  // so the heartbeat the FIXED drainer publishes carries only the still-parked keys.
+  // Drainer parked 3 (a/1,a/2,a/3), handed a/3 to a person; a/3's flag is cleared, a/1 & a/2 still parked.
+  const board = summariseBoard([row('commit-review', 'a')], {
+    parkedRows: [
+      { source: 'commit-review', key: 'a1', detail: { parked: true } },
+      { source: 'commit-review', key: 'a2', detail: { parked: true } },
+    ],
+  })
+  assert.deepEqual(board.parkedPublished, ['commit-review/a1', 'commit-review/a2'])
+  const j = judgeDrainer({
+    heartbeat: { last_seen_at: ago(10), detail: {
+      considered: 40, parked: 2, parked_keys: ['commit-review/a1', 'commit-review/a2'],
+      dispatchable: 0, dispatched: 0, last_dispatch_at: ago(30),
+    } },
+    board, now: NOW,
+  })
+  assert.equal(j.verdict, 'ok', 'the handed-over key was removed from parked_keys with its count — no phantom gap')
+  assert.notEqual(j.verdict, 'parks-unpublished')
+
+  // Contrast — the pre-fix heartbeat shape (parked_keys still lists the departed a3) is exactly the
+  // false alarm the fix prevents: a3 published no flag (it was handed over) so it reads as unpublished.
+  const buggy = judgeDrainer({
+    heartbeat: { last_seen_at: ago(10), detail: {
+      considered: 40, parked: 2, parked_keys: ['commit-review/a1', 'commit-review/a2', 'commit-review/a3'],
+      dispatchable: 0, dispatched: 0, last_dispatch_at: ago(30),
+    } },
+    board, now: NOW,
+  })
+  assert.equal(buggy.verdict, 'parks-unpublished', 'the unreduced parked_keys is what produced the self-inflicted false red')
+  assert.match(buggy.summary, /commit-review\/a3/, 'and it named the very key it had just handed over successfully')
+})
+
 t('the page agreeing with the drainer is not an alarm', () => {
   const j = judgeDrainer({
     heartbeat: { last_seen_at: ago(10), detail: { considered: 40, parked: 2, dispatchable: 0, dispatched: 0, last_dispatch_at: ago(30) } },

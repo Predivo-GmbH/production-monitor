@@ -1473,6 +1473,18 @@ export function parkedHandoverQueue({ parked, state, handoff = HANDOFF_ENABLED, 
   return [...parked].sort((a, b) => parkedAtOf(a.inc.key) - parkedAtOf(b.inc.key)).slice(0, max)
 }
 
+export function reduceParkedForHandover(parkedKeys, handedOverKeys) {
+  // The heartbeat publishes runStats.parked_keys (which findings are parked) AND runStats.parked
+  // (how many). A parked item handed to the work board this run clears its published detail.parked
+  // flag (clearParkedOnSignal), so it is NO LONGER a park anyone can name — and it must leave BOTH
+  // fields together. Reducing only the count (its history before 2026-09-04) left the departed key
+  // in parked_keys while its flag was gone from the board, so the parks-unpublished check named it
+  // as an unpublished park on the drainer's OWN success path. Deriving both from one filter makes
+  // that drift impossible: the count is always exactly the length of the keys that remain parked.
+  const removed = new Set(handedOverKeys || [])
+  return (parkedKeys || []).filter((k) => !removed.has(k))
+}
+
 export function handedOverClearsCounter(r) {
   // A signal that was HANDED OVER — superseded onto a freshly-minted item, freshly marked as
   // attached to a live job, or already attached to it on an earlier run — is off the drainer's
@@ -2914,8 +2926,10 @@ async function main() {
   runStats.dispatchable = eligible
   runStats.parked = parked.length
   // Publish WHICH keys are parked, not just how many. `parked` here already excludes the one the
-  // 24h retry revived (see selectWorkQueue), so this set matches runStats.parked and is the exact
-  // population the parks-unpublished check names as un-nameable when a flag write fails to land.
+  // 24h retry revived (see selectWorkQueue). This is the FULL parked set at classify time; any item
+  // handed to the work board later this run is removed from BOTH parked_keys and runStats.parked
+  // together (see reduceParkedForHandover below), so the published set always matches runStats.parked
+  // and names exactly the population the parks-unpublished check calls un-nameable on a failed flag write.
   runStats.parked_keys = parked.map((e) => `${e.inc.source}/${e.inc.key}`)
   runStats.parked_retry = parkedRetry ? `${parkedRetry.inc.source}/${parkedRetry.inc.key}` : null
   runStats.escalated = toEscalate.length
@@ -3144,7 +3158,11 @@ async function main() {
   // Published in the heartbeat so the alarm can tell "nothing is parked because the board is
   // clean" from "nothing is parked because everything was handed to a person this hour".
   runStats.parked_handed_over = handedOverParked.length
-  runStats.parked = Math.max(0, parked.length - handedOverParked.length)
+  // Reduce parked_keys and parked TOGETHER, from one filter: a handed-over item cleared its
+  // published detail.parked flag above, so leaving its key in parked_keys makes parks-unpublished
+  // name it as an unpublished park on the drainer's own success path (fixed 2026-09-04).
+  runStats.parked_keys = reduceParkedForHandover(runStats.parked_keys, handedOverParked)
+  runStats.parked = runStats.parked_keys.length
 
   // 3b. LIVE: dispatch + write back. Only genuinely workable items reach here — the `note`
   // and stuck-escalation branches that used to live inline now run in 3a, OUTSIDE the

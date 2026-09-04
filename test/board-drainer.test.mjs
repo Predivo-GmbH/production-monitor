@@ -5,7 +5,7 @@
  * Run: node test/board-drainer.test.mjs   (exit 0 = all pass)
  */
 import assert from 'node:assert'
-import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, stuckRootCause, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, workableFinding, parkedFields, gateFor, stripCode, actionOf, plainTitle, titleObjections, workItemSlugFor, handoffPrompt, routeToWorkBoard, prose, DEPLOY_DENY_TOOLS, agentToolFlags, signalObjects, signalPhrases, matchItem, findJoinTarget, joinMarker, expectedBusinessApplies, handedOverClearsCounter, parkedHandoverQueue, mintOpenedAt, weightFromSeverity} from '../scripts/board-drainer.mjs'
+import { classify, verdictToUpsert, meetsThreshold, scoutReportToIncident, stuckWhoMustAct, stuckRootCause, isScoutDerived, selectWorkQueue, timeoutCostsAnAttempt, AGENT_TIMED_OUT, boardQueryUrl, signalToIncident, writableToIncidentBoard, workableFinding, parkedFields, gateFor, stripCode, actionOf, plainTitle, titleObjections, workItemSlugFor, handoffPrompt, routeToWorkBoard, prose, DEPLOY_DENY_TOOLS, agentToolFlags, signalObjects, signalPhrases, matchItem, findJoinTarget, joinMarker, expectedBusinessApplies, handedOverClearsCounter, parkedHandoverQueue, mintOpenedAt, weightFromSeverity, reduceParkedForHandover} from '../scripts/board-drainer.mjs'
 
 let n = 0
 const t = (name, fn) => { fn(); n++; console.log(`  ok - ${name}`) }
@@ -1420,6 +1420,25 @@ ta('a JOINED signal drops its auto-fix attempt counter — both the first attach
   assert.equal(handedOverClearsCounter({ created: true, superseded: true }), true, 'a superseded create clears')
   assert.equal(handedOverClearsCounter({ joined: true, marked: false }), false, 'a failed join write leaves the counter armed')
   assert.equal(handedOverClearsCounter(null), false, 'a missing result never clears')
+})
+
+t('reduceParkedForHandover removes handed-over keys so parked_keys and the count never drift (2026-09-04)', () => {
+  // 9ac84aa published parked_keys from the FULL parked set at classify time, then reduced only the
+  // COUNT after handover (parked = parked.length - handedOver.length) — leaving the handed-over key
+  // in parked_keys while its detail.parked flag was cleared on the board. parks-unpublished then
+  // named that key as an unpublished park on the drainer's OWN success path. The fix derives both
+  // fields from this one filter, so the departed key leaves both together.
+  const parkedKeys = ['commit-review/a', 'commit-review/b', 'commit-review/c']
+  const stillParked = reduceParkedForHandover(parkedKeys, ['commit-review/c'])
+  assert.deepEqual(stillParked, ['commit-review/a', 'commit-review/b'], 'the handed-over key is gone')
+  assert.equal(stillParked.length, 2, 'and the count equals the surviving keys — no drift possible')
+  // Nothing handed over: the set is unchanged.
+  assert.deepEqual(reduceParkedForHandover(parkedKeys, []), parkedKeys)
+  // Everything handed over: empty, not a phantom park.
+  assert.deepEqual(reduceParkedForHandover(parkedKeys, parkedKeys), [])
+  // Null/undefined inputs never throw.
+  assert.deepEqual(reduceParkedForHandover(undefined, undefined), [])
+  assert.deepEqual(reduceParkedForHandover(['x/1'], undefined), ['x/1'])
 })
 
 t('signalToIncident carries the item a finding is already attached to', () => {
