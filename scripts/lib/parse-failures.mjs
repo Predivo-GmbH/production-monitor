@@ -206,14 +206,32 @@ export function isUnreachableRun(failures, opts = {}) {
 
 /** Top-level tests/ folders whose specs prove NOTHING about product reachability, so a pass in one
  *  must never count as breadth evidence for isUnreachableRun's gate. self/ is the monitor's own
- *  self-tests (SMTP transport). But there are three MORE (2026-09-04, board incident add8152:
+ *  self-tests (SMTP transport). Three more were added (2026-09-04, board incident add8152:
  *  breadth-gate-counts-network-free-spec-as-product-reached): keepalive/ passes with ZERO I/O
  *  (supabase-keepalive asserts projects.length>=14 on an env-built array; keepalive-workflow-presence
- *  reads the GitHub API), api-health/ hits third-party hosts (api.brandfetch.io, www.google.com) that
- *  answer even when every monitored product is unreachable, and ci-health/ hits only the GitHub API.
- *  Each of those passes in a total product blackout, so counting them relabels the blackout back into
- *  "N failure(s) across N project(s)" — exactly what commit 37b7982 was written to remove. */
-const NON_PRODUCT_SUITE_PREFIXES = ['self/', 'api-health/', 'ci-health/', 'keepalive/']
+ *  reads the GitHub API) and ci-health/ hits only the GitHub API. Each of those passes in a total
+ *  product blackout, so counting them relabels the blackout back into "N failure(s) across N
+ *  project(s)" — exactly what commit 37b7982 was written to remove.
+ *
+ *  api-health/ is NOT excluded wholesale (2026-09-04, board incident
+ *  1d83704:api-health-exclusion-drops-live-reachability-probe). That folder holds TWO files with
+ *  opposite meaning. external-apis.spec.ts probes third-party hosts (api.brandfetch.io,
+ *  www.google.com) that answer even when every monitored product is unreachable — no breadth proof,
+ *  so it is excluded by its own file prefix below. But auth-backends.spec.ts makes a real KEYED
+ *  HTTPS request to each product's OWN Supabase /auth/v1/health and asserts 200 — genuine proof the
+ *  runner had a network and reached our product infrastructure. In the shared-web-host outage this
+ *  gate was written for (web host dies, Supabase stays up) every product spec fails at page.goto
+ *  while those 14 keyed probes are the ONLY breadth evidence there is; a wholesale api-health/
+ *  exclusion discarded them and dropped the product names from the alert. Only its network-free
+ *  floor spec needs excluding, which the spec-title set below does. */
+const NON_PRODUCT_SUITE_PREFIXES = ['self/', 'ci-health/', 'keepalive/', 'api-health/external-apis.spec.ts']
+
+/** Individual spec TITLES excluded at spec granularity, because they pass with ZERO network I/O even
+ *  inside a file that otherwise DOES prove reachability. auth-backends.spec.ts:65 ("auth: at least 14
+ *  projects are actually being checked") only counts an env-built array of targets and would pass in
+ *  a total blackout; the per-target keyed auth probes below it in the same file are the real breadth
+ *  evidence and are kept. Skipped by suiteHasPassingSpec. */
+const NON_PRODUCT_SPEC_TITLES = new Set(['auth: at least 14 projects are actually being checked'])
 
 /** Did the run get a PASSING result from at least one REAL product? Suites under the infrastructure
  *  folders above are excluded on purpose: they can pass while the runner cannot reach any product,
@@ -229,9 +247,11 @@ export function reachedAnyProduct(results) {
   return false
 }
 
-/** True if any spec anywhere under this suite (recursing into nested describes) has a passed result. */
+/** True if any spec anywhere under this suite (recursing into nested describes) has a passed result,
+ *  skipping the network-free spec titles that prove nothing about reachability. */
 function suiteHasPassingSpec(suite) {
   for (const spec of suite?.specs ?? []) {
+    if (typeof spec?.title === 'string' && NON_PRODUCT_SPEC_TITLES.has(spec.title)) continue
     for (const test of spec?.tests ?? []) {
       if ((test?.results ?? []).some((r) => r?.status === 'passed')) return true
     }

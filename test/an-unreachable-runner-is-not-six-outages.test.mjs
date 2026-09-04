@@ -193,5 +193,43 @@ check('reachedAnyProduct stays TRUE when a real product passes alongside the inf
   assert.equal(reachedAnyProduct(results), true)
 })
 
+check('api-health/auth-backends per-target probes ARE breadth evidence (board 1d83704)', () => {
+  // The 2026-09-04 over-correction: a wholesale api-health/ exclusion discarded auth-backends.spec.ts,
+  // whose per-target test makes a real KEYED request to each product's OWN Supabase /auth/v1/health and
+  // asserts 200. In the shared-web-host outage this gate was written for, the web host dies while
+  // Supabase stays up: EVERY product spec fails at page.goto, and those 14 keyed probes are the only
+  // proof the runner had a network and reached our product infrastructure. They must count, so the
+  // alert keeps naming the product(s) that actually failed instead of "could not reach any product".
+  const results = { suites: [
+    productSuite('backoffice', 'BackOffice', [failedGoto]),
+    productSuite('arivioo', 'Arivioo', [failedGoto]),
+    { title: 'api-health/auth-backends.spec.ts', suites: [{ title: 'Auth backends', specs: [
+      { title: 'auth: at least 14 projects are actually being checked', tests: [passedTest] }, // network-free floor
+      { title: 'auth backend answers, so a customer can log in: BACKOFFICE', tests: [passedTest] }, // real keyed probe
+      { title: 'auth backend answers, so a customer can log in: REPLYFLOW', tests: [passedTest] },
+    ] }] },
+  ] }
+  assert.equal(reachedAnyProduct(results), true,
+    'a passing keyed auth probe to a product Supabase proves the runner reached product infrastructure')
+  // …so the goto-only product failures keep ordinary product-naming wording, not "reached none".
+  const fails = ['BackOffice', 'Arivioo'].map((p) => fail(GOTO, p))
+  assert.equal(isUnreachableRun(fails, { reachedAnyProduct: reachedAnyProduct(results) }), false)
+})
+
+check('auth-backends floor spec ALONE is network-free and is NOT breadth evidence', () => {
+  // The half that still must be excluded: if the ONLY pass in auth-backends is its floor assertion
+  // (counts an env-built array, no I/O) and the only other passes are the excluded api-health file,
+  // nothing product-reaching passed → still a blackout. Spec-title exclusion, not file exclusion.
+  const results = { suites: [
+    productSuite('backoffice', 'BackOffice', [failedGoto]),
+    { title: 'api-health/auth-backends.spec.ts', suites: [{ title: 'Auth backends', specs: [
+      { title: 'auth: at least 14 projects are actually being checked', tests: [passedTest] },
+    ] }] },
+    { title: 'api-health/external-apis.spec.ts', suites: [{ title: 'External APIs', specs: [{ title: 'brandfetch', tests: [passedTest] }] }] },
+  ] }
+  assert.equal(reachedAnyProduct(results), false,
+    'the network-free floor spec plus third-party api-health probes are not proof a product was reached')
+})
+
 if (process.exitCode) console.error(`\n${passed} passed, and at least one failed.`)
 else console.log(`\n${passed} checks passed - an unreachable runner no longer reads as six product outages.`)
