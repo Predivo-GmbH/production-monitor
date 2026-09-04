@@ -403,6 +403,24 @@ ta('THE ONE THAT MATTERS — a stubbed query path cannot pass a query_returns_no
   assert.match(s.unknowns[0].f.reason, /could not be proved/)
 })
 
+ta('THE ONE THAT MATTERS — a query naming no project_ref is UNKNOWN, never run against the board', async () => {
+  // The fallback used to be `args.project_ref || boardProjectRef()`. A done_when whose SQL is about
+  // ReplyFlow but carries no project_ref (46 of 51 open query finish-tests did, some naming their
+  // real project only in a `-- comment` nothing parses) was run against the BOARD's own DB, returned
+  // zero rows, and read as PASS — "I cannot check this" turned into "it is finished", pushing a live
+  // security row to awaiting_signoff on Roger's lane. A missing project_ref is unknown, full stop.
+  const spy = boardSpy()
+  const ranAgainst = []
+  const deps = { ...healthy(), boardProjectRef: 'xoecpzfsskalvjrtcbbl', runQuery: async (ref, sql) => { ranAgainst.push(ref); return { status: 200, rows: [] } } }
+  const dw = { kind: 'query_returns_no_rows', args: { sql: "select proname from pg_proc where proname = 'handle_send_email' -- dqmhsdzldkxngwjrxois" } }
+  const s = await sweep([item({ slug: 'names-no-project', done_when: dw })], { deps, offer: spy.offer })
+  assert.equal(s.passes.length, 0)
+  assert.equal(s.unknowns.length, 1)
+  assert.equal(spy.calls.offers.length, 0)
+  assert.equal(ranAgainst.length, 0, 'a query with no project_ref must never reach a database — least of all the board\'s own')
+  assert.match(s.unknowns[0].f.reason, /names no Supabase project_ref/)
+})
+
 ta('THE ONE THAT MATTERS — an intercepted fetch cannot pass a url_answers row', async () => {
   // Same shape: probeUrl returns exactly the required 200. Only the network canary — a hostname
   // that cannot resolve, and did — says the 200 is a fiction.

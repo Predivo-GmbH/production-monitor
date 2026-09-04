@@ -395,8 +395,16 @@ async function evalQuery(args, deps) {
   const safe = sqlIsReadOnly(args.sql)
   if (!safe.ok) return unknown(`the finish-test's query was refused: ${safe.reason}. A refused test proves nothing`)
 
-  const ref = args.project_ref || deps.boardProjectRef || boardProjectRef()
-  if (!ref) return unknown('no Supabase project was named and the board\'s own project could not be identified')
+  // A query finish-test MUST name the project it is asked about. It used to fall back to the board's
+  // OWN project when project_ref was absent — but a done_when whose SQL is about ReplyFlow, answered
+  // against the board's DB, returns zero rows and reads as PASS. That is "I cannot check this"
+  // rendered as "it is finished": on 2026-09-04 a query naming its project only in a `-- comment`
+  // (which nothing parses) was run against the board, returned zero rows, and was pushed to
+  // awaiting_signoff on Roger's lane. So an absent project_ref is UNKNOWN, never the board — and the
+  // named project still has to prove it can be opened below. Substituting the board's own project is
+  // exactly the substitution that turns a non-answer into a false close, so it never happens.
+  const ref = args.project_ref
+  if (!ref) return unknown('this finish-test names no Supabase project_ref, so it cannot be run against the right database — the board\'s own project must never be substituted, or "I cannot check this" becomes "it is finished"')
 
   const prove = deps.proveQueryPath || realProveQueryPath
   const proof = await prove(ref)
