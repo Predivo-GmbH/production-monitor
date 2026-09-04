@@ -73,7 +73,7 @@ function readBoSecret(env = process.env) {
 /**
  * The whole decision, pure and testable.
  *
- * @param signals  fleet_signals rows: {source, key, severity, needs_human, state, page_suppressed_reason}
+ * @param signals  fleet_signals rows: {source, key, severity, needs_human, state, paged_at, page_suppressed_reason}
  * @param policies signal_page_policy rows: {source, may_page}
  */
 export function judgeReachability({ signals, policies }) {
@@ -124,12 +124,20 @@ export function judgeReachability({ signals, policies }) {
   // ── fault 2: a CRITICAL finding that cannot page itself ─────────────────────────────
   // A contradiction, not a threshold: the producer graded it the worst class of thing AND said
   // nobody need be told. One of the two is wrong and only a person can say which.
+  //
+  // BUT a finding that ALREADY PAGED (paged_at set) has demonstrably reached a human, so it is NOT
+  // unreachable: its needs_human was flipped to false AFTER the page went out, and every re-file
+  // since is deduped against that sent page (page_suppressed_reason='dedup'), not muted. Reporting
+  // "this cannot ring your phone" about something whose paged_at proves it rang is a false red —
+  // workpc-push-reverts-laptop-script-edits paged 2026-09-04T17:04:33Z and was still called
+  // unreachable 50 minutes later. A never-paged critical+needs_human=false finding still fires: the
+  // genuine "the worst class of thing, and nobody was ever told" case is fully preserved.
   for (const s of signals) {
-    if (s.severity === 'critical' && s.needs_human !== true && (s.state === 'open' || s.state === 'acknowledged')) {
+    if (s.severity === 'critical' && s.needs_human !== true && !s.paged_at && (s.state === 'open' || s.state === 'acknowledged')) {
       faults.push({
         kind: 'critical-cannot-page',
         source: s.source,
-        detail: `${s.source}/${s.key}: severity is critical but needs_human is false, so the paging rule (needs_human AND critical) refuses it. It is filed as the most serious class of problem and simultaneously as something nobody needs to be told about.`,
+        detail: `${s.source}/${s.key}: severity is critical but needs_human is false, so the paging rule (needs_human AND critical) refuses it, and it has never paged. It is filed as the most serious class of problem and simultaneously as something nobody needs to be told about.`,
       })
     }
   }
@@ -185,7 +193,7 @@ async function main() {
   const since = new Date(Date.now() - LOOKBACK_DAYS * 86400_000).toISOString()
 
   const [signals, policies] = await Promise.all([
-    boGet(secret, `fleet_signals?select=source,key,severity,needs_human,state,page_suppressed_reason&first_seen_at=gte.${since}&limit=5000`),
+    boGet(secret, `fleet_signals?select=source,key,severity,needs_human,state,paged_at,page_suppressed_reason&first_seen_at=gte.${since}&limit=5000`),
     boGet(secret, 'signal_page_policy?select=source,may_page'),
   ])
 

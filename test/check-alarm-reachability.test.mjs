@@ -95,6 +95,19 @@ t('an OPEN critical finding with needs_human=false is a fault — it is a contra
   assert.equal(j.faults.filter((f) => f.kind === 'critical-cannot-page').length, 1)
 })
 
+t('a critical needs_human=false finding that ALREADY PAGED is reachable, not a fault — paged_at proves it rang', () => {
+  // workpc-push-reverts-laptop-script-edits, live 2026-09-04: critical, needs_human flipped false,
+  // state open — but paged_at=17:04:33Z and every re-file since deduped against that sent page. It
+  // reached him. The check called it "cannot ring your phone" 50 min after it rang; that is the red
+  // this guard removes. The never-paged case one test below still fires.
+  const j = judgeReachability({
+    signals: [sig({ source: 'monitoring-hygiene', key: 'workpc-push-reverts-laptop-script-edits', severity: 'critical', needs_human: false, state: 'open', paged_at: '2026-09-04T17:04:33.559467+00:00', page_suppressed_reason: 'dedup' })],
+    policies: ARMED,
+  })
+  assert.equal(j.verdict, 'ok', 'a finding that already paged has reached a human')
+  assert.equal(j.faults.filter((f) => f.kind === 'critical-cannot-page').length, 0)
+})
+
 t('an acknowledged critical that cannot page still counts; a resolved one does not', () => {
   const ack = judgeReachability({
     signals: [sig({ severity: 'critical', needs_human: false, state: 'acknowledged' })],
