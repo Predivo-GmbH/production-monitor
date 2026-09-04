@@ -1,6 +1,6 @@
 import { createMailTransport } from './lib/smtp.mjs'
 import { sendOrEscalate } from './lib/alert-fallback.mjs'
-import { extractFailures, canaryRows, deriveFailures, isNoDetailFallback, failedStepRows } from './lib/parse-failures.mjs'
+import { extractFailures, canaryRows, deriveFailures, isNoDetailFallback, failedStepRows, isCleanCancelledRun, NO_REPORT_PROJECT } from './lib/parse-failures.mjs'
 import { previousDedupView, shouldSuppressAlert } from './lib/alert-dedup.mjs'
 import { readFileSync, existsSync } from 'fs'
 import { execSync } from 'child_process'
@@ -43,7 +43,7 @@ if (existsSync(resultsPath)) {
 } else {
   // No report at all → the run died before Playwright wrote results (infra / timeout / crash).
   failures = [{
-    project: 'Run failed — no report produced',
+    project: NO_REPORT_PROJECT,
     test: 'results.json missing',
     error: 'test-results/results.json was not generated — the run likely crashed or timed out before Playwright wrote a report. Open the run logs.',
     file: '',
@@ -102,6 +102,21 @@ if (hasAutoFixes) {
         file: e.file || '',
       }))
     : failures
+}
+
+// ── A CANCELLED run with nothing actually broken must not page (2026-09-04 board incident
+// alerter-pages-on-cancelled-run, run 33861839218). The alert step is gated `failure() ||
+// cancelled()` so a job-timeout that DID find failures still reaches a human — but the same guard
+// fires on a run cancelled while every spec passed (a concurrency supersede, or the job merely
+// overrunning its cap). By this point the step-failure lookup above has already turned any real
+// failed STEP into named rows, so if all that remains is a synthetic no-evidence fallback AND the
+// run was cancelled with no step failure, there is genuinely nothing to report. FAIL-SAFE: a
+// non-test step failure sets failure()=true (RUN_WAS_CANCELLED false) → we still page; any real
+// spec/canary row is non-synthetic → we still page. RUN_WAS_CANCELLED = `cancelled() && !failure()`
+// is passed by monitor.yml; when absent (manual run / other caller) this never suppresses.
+if (isCleanCancelledRun(failures, { cancelledNoFailure: process.env.RUN_WAS_CANCELLED === 'true' }) && !hasAutoFixes) {
+  console.log('Run was cancelled with no failed test, canary, or step (supersede or job-timeout over a green run) — nothing to alert. Not sending.')
+  process.exit(0)
 }
 
 // ── Edge-triggered dedup (Roger's alerting philosophy: don't re-page hourly for a KNOWN ongoing

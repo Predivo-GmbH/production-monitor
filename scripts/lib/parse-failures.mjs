@@ -126,11 +126,48 @@ export function findLaunderedFailures(results) {
  *  actually failed (see failedStepRows). */
 export const NO_DETAIL_PROJECT = 'Run failed — no per-test detail'
 
+/** The project label of the OTHER synthetic fallback send-alert.mjs emits when the run died before
+ *  Playwright wrote any report at all (test-results/results.json absent). Shared here so both the
+ *  producer (send-alert.mjs) and isCleanCancelledRun() name the same string. */
+export const NO_REPORT_PROJECT = 'Run failed — no report produced'
+
 /** True when `failures` is exactly the content-free no-per-test-detail fallback — i.e. the
  *  run went red on a non-test step (Supabase build currency / machine health / expire-sessions)
  *  while every Playwright spec passed, so there is nothing test-shaped to show. */
 export function isNoDetailFallback(failures = []) {
   return failures.length === 1 && failures[0]?.project === NO_DETAIL_PROJECT
+}
+
+/**
+ * A CANCELLED monitor run that carries NO concrete evidence of anything broken must not page.
+ *
+ * WHY THIS EXISTS (2026-09-04, board incident alerter-pages-on-cancelled-run, run 33861839218).
+ * The alert step is gated `if: failure() || cancelled()` (commit c8db569) so a JOB-TIMEOUT that
+ * DID find failures still reaches a human — a real fix. But the same widening pages on a run that
+ * was cancelled with everything GREEN: a concurrency supersede, or (as on 33861839218) the job
+ * merely overrunning its 40-minute cap after a 27-minute Chromium install, with all 204 specs
+ * passing. deriveFailures then finds nothing and synthesises a "no per-test detail" row, so the
+ * mail says "1 failure(s)" over a body that says "0 failed" — an alert that refutes itself.
+ *
+ * The scalpel: fire this ONLY when the run was cancelled AND no workflow STEP reported failure
+ * (`cancelled() && !failure()`, passed in as cancelledNoFailure) AND `failures` holds nothing but
+ * a synthetic no-evidence fallback row — no failed spec, no named canary, no failed step, no
+ * top-level error. Any ONE concrete failure row (real project name) makes this false and the alert
+ * fires as before. FAIL-SAFE: a non-test STEP failure sets failure()=true → cancelledNoFailure is
+ * false → we page (2026-08-30 class preserved); a job-timeout WITH failing specs yields real rows
+ * → not synthetic → we page (c8db569's intent preserved).
+ *
+ * @param {Array} failures            the rows deriveFailures/send-alert resolved for this run
+ * @param {{cancelledNoFailure?: boolean}} opts  cancelledNoFailure = `cancelled() && !failure()`
+ * @returns {boolean} true = suppress the alert (clean cancellation, nothing is wrong)
+ */
+export function isCleanCancelledRun(failures, { cancelledNoFailure } = {}) {
+  if (!cancelledNoFailure) return false
+  if (!Array.isArray(failures)) return false
+  if (failures.length === 0) return true
+  if (failures.length !== 1) return false
+  const project = failures[0]?.project
+  return project === NO_DETAIL_PROJECT || project === NO_REPORT_PROJECT
 }
 
 /** Turn the `jobs` array of `gh run view <id> --json jobs` into alert rows naming each STEP

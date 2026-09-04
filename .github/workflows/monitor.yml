@@ -830,6 +830,11 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           ALERT_EMAIL: rogmueller1976@gmail.com
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # True ONLY when the run was cancelled AND no step failed — a concurrency supersede or the
+          # job overrunning its cap over an all-green run. send-alert.mjs uses it to suppress the
+          # self-refuting "1 failure(s) / 0 failed" phantom (2026-09-04 alerter-pages-on-cancelled-run).
+          # A non-test step failure keeps failure()=true here, so this stays false and the alert fires.
+          RUN_WAS_CANCELLED: ${{ cancelled() && !failure() }}
           GH_TOKEN: ${{ github.token }}   # edge-triggered dedup: query the previous run + download its results.json to suppress duplicate alerts for an already-known ongoing failure
           # Reads secret METADATA ONLY (updated_at, never a value) to tell a locked mailbox apart from
           # a login rotated mid-run: the default github.token above CANNOT list secrets, so without a
