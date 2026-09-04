@@ -301,9 +301,27 @@ export function closureCap(env = process.env) {
   return Number.isFinite(n) && n >= 0 ? n : DEFAULT_MAX_CLOSURES
 }
 
+/**
+ * UNION, NEVER REPLACE — and the variable used to be called `extra` while doing the opposite.
+ *
+ * Measured 2026-09-04 across three parallel sweeps of the board: at least eight open rows are
+ * unclosable BY CONSTRUCTION, because their subject is a script under `~/.claude/scripts` or
+ * `C:/ClaudeShared/scripts` and `testPathIsRunnable` refuses anything outside the roots — which
+ * makes the row UNKNOWN, never FAIL. A perfect test could never clear them. The fleet's own
+ * operator tooling was unreachable by the board's finish-test machinery, and nothing said so:
+ * an out-of-root path and a genuinely unevaluatable check produce the identical verdict.
+ *
+ * Two halves to the fix and both are needed. The scheduled task now SETS `CLOSER_TEST_ROOTS`
+ * (see setup-closer-task.ps1). And this function no longer lets that variable REPLACE the main
+ * root: setting it used to silently drop `C:/Business/Internal Projects`, so a well-meant
+ * "let it also see ClaudeShared" would have turned every product row UNKNOWN in one edit. That
+ * is the same shape as a new exit code that only half-answers its contract.
+ */
 export function testRoots(env = process.env) {
   const extra = String(env.CLOSER_TEST_ROOTS || '').split(delimiter).map((s) => s.trim()).filter(Boolean)
-  return extra.length ? extra : DEFAULT_TEST_ROOTS
+  const out = [...DEFAULT_TEST_ROOTS]
+  for (const r of extra) if (!out.includes(r)) out.push(r)
+  return out
 }
 
 /**

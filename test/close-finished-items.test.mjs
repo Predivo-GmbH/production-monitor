@@ -38,7 +38,7 @@ import assert from 'node:assert'
 import { spawnSync } from 'node:child_process'
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join, parse, resolve } from 'node:path'
+import { delimiter, dirname, join, parse, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 // THE FILESYSTEM ROOT OF WHATEVER MACHINE IS RUNNING THIS (added 2026-09-03).
@@ -55,7 +55,7 @@ const PROJECTS = `${ROOT}Business/Internal Projects`
 import {
   ACTIONABLE_STATUSES, UNTOUCHABLE_STATUSES, KINDS, SKIP,
   parseDoneWhen, evaluateDoneWhen, sweep, selectItems, verdict, receiptFor, offerToBoard,
-  sqlIsReadOnly, testPathIsRunnable, sentryStatusIsSettled, isDryRun, closureCap,
+  sqlIsReadOnly, testPathIsRunnable, testRoots, sentryStatusIsSettled, isDryRun, closureCap,
   loadBoardCredentials, boardProjectRef, SENTRY_ISSUE_PATHS, isOwedToRoger, silentRowsInHisLane, selfDocumentingRef, evaluationStamp, recordEvaluations,
 } from '../scripts/close-finished-items.mjs'
 import { PASS, FAIL, UNKNOWN, reportedPass, VERDICT_MARKER } from '../scripts/lib/check-verdict.mjs'
@@ -953,3 +953,37 @@ t('an empty or missing result set writes nothing and never throws', async () => 
     assert.equal(stat.failed.length, 0)
   }
 })
+
+// ══ CLOSER_TEST_ROOTS UNIONS, IT DOES NOT REPLACE ══════════════════════════════════════════
+//
+// Measured 2026-09-04 across three parallel board sweeps: at least eight open rows are unclosable
+// BY CONSTRUCTION because their subject is a script under ~/.claude/scripts or C:/ClaudeShared,
+// which testPathIsRunnable refuses — producing UNKNOWN, never FAIL. The variable that was meant to widen the roots was NAMED `extra` and REPLACED them, so the one edit that
+// widen the roots was named  and REPLACED them, so the one edit that would have unblocked
+// those rows would silently have made every product row unevaluatable instead.
+{
+  const base = testRoots({})
+  assert.ok(base.length >= 1, 'with nothing set there is still a default root')
+
+  const widened = testRoots({ CLOSER_TEST_ROOTS: ['/x/claude-scripts', '/y/shared'].join(delimiter) })
+  for (const r of base) {
+    assert.ok(widened.includes(r),
+      `setting CLOSER_TEST_ROOTS must never drop ${r} — dropping it turns every product row UNKNOWN`)
+  }
+  assert.ok(widened.includes('/x/claude-scripts'), 'the operator-tooling root is now runnable')
+  assert.ok(widened.includes('/y/shared'), 'every listed root is added, not just the first')
+  assert.equal(widened.length, base.length + 2, 'union, so nothing is invented either')
+
+  // A root already covered by the default must not be stored twice: a duplicate root makes the
+  // same path look like two permissions and is how a later reader miscounts the coverage.
+  assert.deepEqual(testRoots({ CLOSER_TEST_ROOTS: base[0] }), base)
+
+  // Blank, whitespace and empty segments are not roots. An empty root would match every path.
+  assert.deepEqual(testRoots({ CLOSER_TEST_ROOTS: '' }), base)
+  assert.deepEqual(testRoots({ CLOSER_TEST_ROOTS: ['', '   ', ''].join(delimiter) }), base)
+
+  // Hostile input is survived rather than thrown on — this runs unattended, hourly.
+  for (const v of [null, undefined, 0, 42, {}, []]) {
+    assert.doesNotThrow(() => testRoots({ CLOSER_TEST_ROOTS: v }))
+  }
+}

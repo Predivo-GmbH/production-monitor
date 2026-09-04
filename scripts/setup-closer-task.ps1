@@ -58,7 +58,20 @@ if (-not (Test-Path $runner)) { throw "Runner not found: $runner" }
 # The quoting matters: `set "VAR=1" &&` not `set VAR=1 &&`, or the trailing space is captured into
 # the value and the ==='1' check silently fails -- the same trap already documented in
 # setup-board-drainer-task.ps1.
-$cmd = ('/c set "CLOSER_CONFIRM=1" && "{0}" "{1}"' -f $node, $runner)
+# CLOSER_TEST_ROOTS — WITHOUT THIS, THE FLEET'S OWN OPERATOR TOOLING CAN NEVER BE CHECKED.
+# Measured 2026-09-04 across three parallel sweeps of the board: at least eight open rows are
+# unclosable BY CONSTRUCTION, because their subject is a script under the Claude tree or
+# C:\ClaudeShared\scripts and `testPathIsRunnable` refuses any path outside the roots. A refused
+# path is recorded UNKNOWN, never FAIL — so a PERFECT test on one of those rows would still never
+# clear it, and the row looks identical to one whose check genuinely could not run. Nothing said so.
+#
+# Built from $HOME rather than written out, because the two machines have different user folders
+# (the laptop is not roger_rwjnmnz) and a hardcoded profile path here would silently cover nothing.
+# `testRoots()` UNIONS this with C:\Business\Internal Projects rather than replacing it — it used
+# to replace, which meant this very line would have turned every product row unevaluatable.
+$extraRoots = @((Join-Path $HOME '.claude\scripts'), 'C:\ClaudeShared\scripts') -join ';'
+
+$cmd = ('/c set "CLOSER_CONFIRM=1" && set "CLOSER_TEST_ROOTS={2}" && "{0}" "{1}"' -f $node, $runner, $extraRoots)
 $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument $cmd
 
 $start   = (Get-Date).AddMinutes(3)
