@@ -204,14 +204,26 @@ export function isUnreachableRun(failures, opts = {}) {
   return true
 }
 
-/** Did the run get a PASSING result from at least one REAL product? The monitor's own self-tests
- *  (tests/self/*, e.g. the SMTP alert-transport check) are excluded on purpose: they can pass while
- *  the runner cannot reach any product, and counting them would defeat the breadth gate above — a
- *  passing self-test would relabel every genuine total outage back into "N failure(s) across N
- *  project(s)". A passing PRODUCT spec, by contrast, proves the runner reached that product. */
+/** Top-level tests/ folders whose specs prove NOTHING about product reachability, so a pass in one
+ *  must never count as breadth evidence for isUnreachableRun's gate. self/ is the monitor's own
+ *  self-tests (SMTP transport). But there are three MORE (2026-09-04, board incident add8152:
+ *  breadth-gate-counts-network-free-spec-as-product-reached): keepalive/ passes with ZERO I/O
+ *  (supabase-keepalive asserts projects.length>=14 on an env-built array; keepalive-workflow-presence
+ *  reads the GitHub API), api-health/ hits third-party hosts (api.brandfetch.io, www.google.com) that
+ *  answer even when every monitored product is unreachable, and ci-health/ hits only the GitHub API.
+ *  Each of those passes in a total product blackout, so counting them relabels the blackout back into
+ *  "N failure(s) across N project(s)" — exactly what commit 37b7982 was written to remove. */
+const NON_PRODUCT_SUITE_PREFIXES = ['self/', 'api-health/', 'ci-health/', 'keepalive/']
+
+/** Did the run get a PASSING result from at least one REAL product? Suites under the infrastructure
+ *  folders above are excluded on purpose: they can pass while the runner cannot reach any product,
+ *  and counting them would defeat the breadth gate — a passing infra spec would relabel every genuine
+ *  total outage back into "N failure(s) across N project(s)". A passing PRODUCT spec, by contrast,
+ *  proves the runner reached that product. */
 export function reachedAnyProduct(results) {
   for (const fileSuite of results?.suites ?? []) {
-    if (typeof fileSuite.title === 'string' && fileSuite.title.startsWith('self/')) continue
+    if (typeof fileSuite.title === 'string'
+      && NON_PRODUCT_SUITE_PREFIXES.some((p) => fileSuite.title.startsWith(p))) continue
     if (suiteHasPassingSpec(fileSuite)) return true
   }
   return false

@@ -157,5 +157,41 @@ check('reachedAnyProduct is false for an empty or resultless report', () => {
   assert.equal(reachedAnyProduct(null), false)
 })
 
+check('a total blackout where only NETWORK-FREE infra specs pass is NOT "reached a product"', () => {
+  // The 2026-09-04 defect (board add8152). reachedAnyProduct excluded only self/, so the three
+  // infrastructure folders that exist in the REAL report — keepalive/ (asserts an env-built array,
+  // no I/O), api-health/ (third-party hosts that answer during a product blackout), ci-health/
+  // (GitHub API only) — counted as "a product was reached." Modelled here with the real suite-title
+  // shape "<folder>/<file>.spec.ts": every PRODUCT suite failed at page.goto, and the only passes are
+  // those three infra suites. reachedAnyProduct must be FALSE, or a total blackout reverts to
+  // "N product outages" — the exact wording commit 37b7982 removed.
+  const results = { suites: [
+    productSuite('backoffice', 'BackOffice', [failedGoto]),
+    productSuite('arivioo', 'Arivioo', [failedGoto]),
+    { title: 'keepalive/supabase-keepalive.spec.ts', suites: [{ title: 'Keep-alive', specs: [{ title: '14 projects', tests: [passedTest] }] }] },
+    { title: 'keepalive/keepalive-workflow-presence.spec.ts', suites: [{ title: 'Keep-alive presence', specs: [{ title: 'workflow', tests: [passedTest] }] }] },
+    { title: 'api-health/external-apis.spec.ts', suites: [{ title: 'External APIs', specs: [{ title: 'brandfetch', tests: [passedTest] }] }] },
+    { title: 'ci-health/nightly-gauntlet.spec.ts', suites: [{ title: 'Nightly gauntlet', specs: [{ title: 'gauntlet ran', tests: [passedTest] }] }] },
+    { title: 'self/alert-transport.spec.ts', suites: [{ title: 'Alerting — SMTP transport', specs: [{ title: 'sends', tests: [passedTest] }] }] },
+  ] }
+  assert.equal(reachedAnyProduct(results), false,
+    'passing infra/self suites in a product blackout must not count as breadth evidence')
+  // …and end to end: the goto-only failure set must therefore still classify as unreachable.
+  const fails = ['BackOffice', 'Arivioo'].map((p) => fail(GOTO, p))
+  assert.equal(isUnreachableRun(fails, { reachedAnyProduct: reachedAnyProduct(results) }), true,
+    'a blackout whose only passes are network-free infra specs must stay classified unreachable')
+})
+
+check('reachedAnyProduct stays TRUE when a real product passes alongside the infra suites', () => {
+  // The safe direction: the fix must not over-exclude. One genuine product pass among the infra
+  // suites still proves the runner had a network and saw a product → ordinary wording, not blackout.
+  const results = { suites: [
+    productSuite('backoffice', 'BackOffice', [failedGoto]),
+    productSuite('arivioo', 'Arivioo', [passedTest]),
+    { title: 'api-health/external-apis.spec.ts', suites: [{ title: 'External APIs', specs: [{ title: 'brandfetch', tests: [passedTest] }] }] },
+  ] }
+  assert.equal(reachedAnyProduct(results), true)
+})
+
 if (process.exitCode) console.error(`\n${passed} passed, and at least one failed.`)
 else console.log(`\n${passed} checks passed - an unreachable runner no longer reads as six product outages.`)
