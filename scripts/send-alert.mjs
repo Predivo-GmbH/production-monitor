@@ -1,6 +1,6 @@
 import { createMailTransport } from './lib/smtp.mjs'
 import { sendOrEscalate } from './lib/alert-fallback.mjs'
-import { extractFailures, canaryRows, deriveFailures, isNoDetailFallback, failedStepRows, isCleanCancelledRun, isUnreachableRun, NO_REPORT_PROJECT } from './lib/parse-failures.mjs'
+import { extractFailures, canaryRows, deriveFailures, isNoDetailFallback, failedStepRows, isCleanCancelledRun, isUnreachableRun, reachedAnyProduct, NO_REPORT_PROJECT } from './lib/parse-failures.mjs'
 import { previousDedupView, shouldSuppressAlert } from './lib/alert-dedup.mjs'
 import { readFileSync, existsSync } from 'fs'
 import { execSync } from 'child_process'
@@ -26,6 +26,10 @@ if (existsSync(canaryPath)) {
 
 // Parse Playwright JSON results
 let failures = []
+// Did the run reach at least one real product (any product spec passed)? undefined = unknown
+// (no report, or the report would not parse). Feeds isUnreachableRun's breadth gate so a single
+// product outage is never relabelled "could not reach any product".
+let reachedProduct
 const resultsPath = 'test-results/results.json'
 if (existsSync(resultsPath)) {
   try {
@@ -33,6 +37,7 @@ if (existsSync(resultsPath)) {
     // deriveFailures prefers per-test failures, then a NAMED canary/step failure, then
     // Playwright's top-level errors, then the last-resort generic line.
     failures = deriveFailures(results, canaryFailures)
+    reachedProduct = reachedAnyProduct(results)
   } catch (e) {
     failures = [{ project: 'Parser', test: 'results.json', error: `Failed to parse: ${e.message}` }]
   }
@@ -114,7 +119,7 @@ if (hasAutoFixes) {
 // non-test step failure sets failure()=true (RUN_WAS_CANCELLED false) → we still page; any real
 // spec/canary row is non-synthetic → we still page. RUN_WAS_CANCELLED = `cancelled() && !failure()`
 // is passed by monitor.yml; when absent (manual run / other caller) this never suppresses.
-const unreachableRun = isUnreachableRun(failures)
+const unreachableRun = isUnreachableRun(failures, { reachedAnyProduct: reachedProduct })
 
 if (isCleanCancelledRun(failures, { cancelledNoFailure: process.env.RUN_WAS_CANCELLED === 'true' }) && !hasAutoFixes) {
   console.log('Run was cancelled with no failed test, canary, or step (supersede or job-timeout over a green run) — nothing to alert. Not sending.')
@@ -264,7 +269,7 @@ if (allFixed) {
   // calling a step failure a failed test is the 2026-08-30 "1 test(s) failed when every test
   // passed" incident. The table names exactly what broke.
   headerSubtitle = unreachableRun
-    ? `${failures.length} check(s) never ran — every one failed at the first page load, so the runner could not reach the host. This is NOT ${Object.keys(projectGroups).length} product outages.`
+    ? `${failures.length} check(s) never ran — every one failed at the first page load, and no product answered: the runner reached none of the ${Object.keys(projectGroups).length} product(s) it checked. From this one vantage point a runner networking fault and a real outage look identical — verify from another machine.`
     : `${failures.length} failure(s) across ${Object.keys(projectGroups).length} project(s)`
 }
 

@@ -25,7 +25,7 @@
  * product outages to the one thing that is actually known: nothing could be reached.
  */
 import assert from 'node:assert/strict'
-import { isUnreachableRun } from '../scripts/lib/parse-failures.mjs'
+import { isUnreachableRun, reachedAnyProduct } from '../scripts/lib/parse-failures.mjs'
 
 let passed = 0
 const check = (name, fn) => {
@@ -90,6 +90,71 @@ check('the real incident shape: 33 failures across six products, all goto timeou
   assert.equal(new Set(failures.map((f) => f.project)).size, 6)
   assert.equal(isUnreachableRun(failures), true,
     'the run that produced "[ALERT] 33 failure(s)" across six products must classify as unreachable')
+})
+
+// ── BREADTH GATE (2026-09-04, board incident 160601d:unreachable-run-misreads-real-outage).
+// The predicate above cannot, from the failure text alone, tell a runner with no network apart
+// from a product that is genuinely down — so a REAL outage was being relabelled the monitor's own
+// networking problem. The gate: only say "could not reach ANY product" when the run reached NONE.
+
+check('ONE product down while the rest are reachable is a TARGETED outage, not a dead runner (shape a)', () => {
+  // The 2026-09-04 gap: nginx/DNS drops one product, its specs all page.goto-timeout, the other
+  // five products pass. list.every() is still true — but the runner clearly HAD a network, so this
+  // must keep the ordinary "[ALERT] N failure(s) — <that product>" wording, not drop the name and
+  // claim "This is NOT 1 product outages." reachedAnyProduct=true drags it back to ordinary wording.
+  assert.equal(isUnreachableRun([fail(GOTO, 'BackOffice')], { reachedAnyProduct: true }), false)
+  assert.equal(isUnreachableRun([fail(GOTO, 'BackOffice'), fail(GOTO, 'BackOffice')], { reachedAnyProduct: true }), false)
+})
+
+check('reached NOTHING (no product passed) still classifies as unreachable — shape b / the original', () => {
+  // The shared host is down (or the runner has no network): six products, all goto, nothing passed.
+  // We still flag it — an unreachable host matters — but the header wording no longer ASSERTS it is
+  // NOT an outage, because from one vantage point it might be exactly that.
+  const six = ['Arivioo', 'BackOffice', 'BoatBuddy', 'Distribution-OS', 'Jass-Tour', 'LaunchReady']
+    .map((p) => fail(GOTO, p))
+  assert.equal(isUnreachableRun(six, { reachedAnyProduct: false }), true)
+})
+
+check('an unknown reach signal (no/unparseable report) preserves the prior behaviour', () => {
+  // Callers that cannot compute reachedAnyProduct pass nothing; the gate must not silently flip the
+  // classification for them. Absent opts → the goto-only run is still unreachable as before.
+  assert.equal(isUnreachableRun([fail(GOTO), fail(GOTO)]), true)
+  assert.equal(isUnreachableRun([fail(GOTO), fail(GOTO)], {}), true)
+})
+
+// ── reachedAnyProduct(results): the breadth signal, computed from the FULL Playwright report.
+const passedTest = { status: 'expected', results: [{ status: 'passed' }] }
+const failedGoto = { status: 'unexpected', results: [{ status: 'failed', errors: [{ message: GOTO }] }] }
+const productSuite = (folder, product, tests) => ({
+  title: `${folder}/production-monitor.spec.ts`,
+  suites: [{ title: `${product} — Production Monitor`, specs: tests.map((t, i) => ({ title: `spec ${i}`, tests: [t] })) }],
+})
+
+check('reachedAnyProduct is true when at least one product spec passed', () => {
+  const results = { suites: [
+    productSuite('backoffice', 'BackOffice', [failedGoto, failedGoto]),
+    productSuite('arivioo', 'Arivioo', [passedTest]),
+  ] }
+  assert.equal(reachedAnyProduct(results), true)
+})
+
+check('reachedAnyProduct is FALSE when every product failed at the door — even if a self-test passed', () => {
+  // The regression this guards: the monitor's own SMTP self-test (tests/self/*) can pass while the
+  // runner cannot reach a single product. If that counted as "reached a product", every genuine
+  // total outage would be relabelled back into "N failure(s) across N project(s)". self/ is excluded.
+  const results = { suites: [
+    productSuite('backoffice', 'BackOffice', [failedGoto]),
+    productSuite('arivioo', 'Arivioo', [failedGoto]),
+    { title: 'self/alert-transport.spec.ts', suites: [{ title: 'Alerting — SMTP transport', specs: [{ title: 'sends', tests: [passedTest] }] }] },
+  ] }
+  assert.equal(reachedAnyProduct(results), false,
+    'a passing self-test must not be mistaken for having reached a product')
+})
+
+check('reachedAnyProduct is false for an empty or resultless report', () => {
+  assert.equal(reachedAnyProduct({ suites: [] }), false)
+  assert.equal(reachedAnyProduct({}), false)
+  assert.equal(reachedAnyProduct(null), false)
 })
 
 if (process.exitCode) console.error(`\n${passed} passed, and at least one failed.`)

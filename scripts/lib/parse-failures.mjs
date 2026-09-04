@@ -179,11 +179,55 @@ export function isNoDetailFallback(failures = []) {
  * wrong, not the alert. The caller rewrites the subject instead of dropping the mail, because
  * silencing this would hide a real outage.
  */
-export function isUnreachableRun(failures) {
+export function isUnreachableRun(failures, opts = {}) {
   const list = Array.isArray(failures) ? failures : []
   if (list.length === 0) return false
   const goto = new RegExp(String.raw`page\.goto:\s*(Timeout|net::)`, 'i')
-  return list.every((f) => goto.test(stripAnsi(String(f?.error ?? ''))))
+  if (!list.every((f) => goto.test(stripAnsi(String(f?.error ?? ''))))) return false
+  // BREADTH GATE (2026-09-04, board incident 160601d:unreachable-run-misreads-real-outage).
+  // "The monitor could not reach ANY product" is only honest when it reached NONE. Two real
+  // outages were being relabelled as the monitor's own networking problem:
+  //   (a) ONE product goes down (nginx/DNS) while the rest pass — its specs are the only failures,
+  //       all page.goto timeouts, so list.every() was true and the mail dropped the product name
+  //       and said "This is NOT 1 product outages" over a genuine single-product outage;
+  //   (b) the SHARED host these products sit on goes down — all six genuinely fail, and the mail
+  //       asserted "This is NOT 6 product outages" when it was precisely six.
+  // The discriminator the human used on 2026-09-03 was a SECOND vantage point. We cannot probe one
+  // reliably from the runner (a true runner-network outage would fail that probe too, re-inventing
+  // the bug), but we DO have a cheap breadth signal: did the run get a passing result from even one
+  // real product? If so (reachedAnyProduct === true) the runner's network was up and it saw that
+  // product, so a page.goto-only failure set is a TARGETED outage of the product(s) that DID fail —
+  // keep the ordinary wording that NAMES them. Unknown (undefined) preserves prior behaviour for
+  // callers that cannot compute it. Even when this returns true, send-alert.mjs no longer ASSERTS
+  // "not N outages": from one vantage a total outage and a dead runner are indistinguishable.
+  if (opts.reachedAnyProduct === true) return false
+  return true
+}
+
+/** Did the run get a PASSING result from at least one REAL product? The monitor's own self-tests
+ *  (tests/self/*, e.g. the SMTP alert-transport check) are excluded on purpose: they can pass while
+ *  the runner cannot reach any product, and counting them would defeat the breadth gate above — a
+ *  passing self-test would relabel every genuine total outage back into "N failure(s) across N
+ *  project(s)". A passing PRODUCT spec, by contrast, proves the runner reached that product. */
+export function reachedAnyProduct(results) {
+  for (const fileSuite of results?.suites ?? []) {
+    if (typeof fileSuite.title === 'string' && fileSuite.title.startsWith('self/')) continue
+    if (suiteHasPassingSpec(fileSuite)) return true
+  }
+  return false
+}
+
+/** True if any spec anywhere under this suite (recursing into nested describes) has a passed result. */
+function suiteHasPassingSpec(suite) {
+  for (const spec of suite?.specs ?? []) {
+    for (const test of spec?.tests ?? []) {
+      if ((test?.results ?? []).some((r) => r?.status === 'passed')) return true
+    }
+  }
+  for (const child of suite?.suites ?? []) {
+    if (suiteHasPassingSpec(child)) return true
+  }
+  return false
 }
 
 export function isCleanCancelledRun(failures, { cancelledNoFailure } = {}) {
