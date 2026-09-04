@@ -95,7 +95,12 @@ async function tipChangedFiles(repo, fromSha, toSha) {
   const r = await gh(`/repos/${OWNER}/${repo}/compare/${fromSha}...${toSha}`)
   if (!r.ok || !Array.isArray(r.body?.files)) return null
   if (r.body.files.length >= 300) return null
-  return r.body.files.map((f) => f.filename)
+  // Include a rename's previous_filename too. GitHub Actions' own paths-ignore tests BOTH the old
+  // and new path of a rename, so a file renamed INTO an ignored path (src/foo.ts -> docs/foo.ts)
+  // would still TRIGGER a staging run under the old path - yet mapping f.filename alone reports only
+  // the ignorable new path, so the gate would read it as harmless and promote. Reporting both makes
+  // this gate match the paths-ignore semantics it claims to copy.
+  return r.body.files.flatMap((f) => (f.previous_filename ? [f.filename, f.previous_filename] : [f.filename]))
 }
 
 /** Is any fleet deploy in flight? Same question the PreToolUse serializer asks. */

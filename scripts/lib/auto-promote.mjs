@@ -221,6 +221,19 @@ export function decide(p) {
     if (!Array.isArray(files)) {
       return { promote: false, reason: `${repo}: ${short}, and I could not read which files differ - refusing to ship a difference I have not seen` }
     }
+    // AN EMPTY LIST IS NOT DEPLOY-EQUIVALENCE - it is proof the tip is NOT AHEAD of the gated
+    // commit. promote-internal reads compare/stagingSha...refHeadSha (three-dot), whose files[] is
+    // the diff from the MERGE BASE to the head. When the branch tip is an ancestor of the gated
+    // staging commit the merge base IS the tip, so files[] is []. Dispatching the branch ref would
+    // then ship its tip - which does NOT contain the gated staging work at all - under a log line
+    // naming the proven commit. That is the exact failure the "behind" branch above refuses, wearing
+    // an "ahead" mask: whenever staging holds work the deploy branch lacks (the documented staging-
+    // first window), compareStatus is "ahead", the tip != stagingSha, and files[] is empty. Found on
+    // 3907a5c: the new wouldShip.length guard let [] fall straight through to promote:true and would
+    // have dispatched deploy.yml on master every hour until somebody merged.
+    if (!files.length) {
+      return { promote: false, reason: `${repo}: the branch tip is behind the commit whose gates were proven - ${short}, and the tip adds nothing on top of it, so dispatching would ship the branch (which lacks the gated staging work), not what was gated. Merge staging into the deploy branch and this promotes itself next hour.` }
+    }
     const wouldShip = files.filter((f) => !isIgnorablePath(f, p?.ignorePaths))
     if (wouldShip.length) {
       return { promote: false, reason: `${repo}: the proven commit is not the one that would ship - ${short}, and ${wouldShip.length} changed file(s) no gate has seen would go out with it (e.g. ${wouldShip[0]}). Let staging catch up and this promotes itself next hour.` }

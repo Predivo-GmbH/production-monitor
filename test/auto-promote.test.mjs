@@ -261,6 +261,30 @@ test('an UNREADABLE file list refuses - a difference I have not seen is not a ha
   }
 })
 
+test('AN EMPTY diff with a DIVERGING tip refuses - empty is not equivalence, it is proof the tip is behind the gated commit', () => {
+  // The three-dot compare stagingSha...refHeadSha returns [] when the branch tip is an ancestor of
+  // the gated staging commit. That is NOT "builds the same thing" - dispatching the branch ref then
+  // ships a tip that does not contain the gated work at all. Must refuse, distinctly from "no gate
+  // has seen these files".
+  const d = decide(ok({ stagingSha: 'bbbbbbb', refHeadSha: 'aaaaaaa', tipChangedFiles: [] }))
+  assert.equal(d.promote, false)
+  assert.match(d.reason, /behind the commit whose gates were proven/)
+})
+
+test('3907a5c REGRESSION: distribution-os ahead, empty diff, ignorePaths [] must refuse - it would have shipped master hourly', () => {
+  // Reproduced against the real repo: staging held work master lacked (compare "ahead"), the deploy
+  // branch tip was an ancestor of the gated staging commit so the diff was [], and with
+  // ignorePaths: [] the empty list fell through to promote:true and would have dispatched deploy.yml
+  // on master every hour. An empty list must never satisfy the fully-ignorable guard.
+  const d = decide(ok({
+    repo: 'distribution-os', ignorePaths: [],
+    prodSha: '7444255', stagingSha: '65c513f', refHeadSha: '465ce6e',
+    compareStatus: 'ahead', tipChangedFiles: [],
+  }))
+  assert.equal(d.promote, false)
+  assert.match(d.reason, /behind the commit whose gates were proven/)
+})
+
 test('no ignorePaths means nothing is ignorable - Distribution-OS ships from a dispatch-only file', () => {
   const d = decide(ok({ repo: 'distribution-os', ignorePaths: [], stagingSha: 'aaa', refHeadSha: 'bbb', tipChangedFiles: ['README.md'] }))
   assert.equal(d.promote, false)
