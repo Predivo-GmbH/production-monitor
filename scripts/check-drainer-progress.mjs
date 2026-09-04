@@ -185,13 +185,23 @@ const NOT_A_FINDING = new Set([
  * source is the work board itself, and anything carrying `detail.work_item`, which is the pointer
  * the drainer writes when it hands a finding over. What remains is findings that no machine will
  * ever classify and no human has been given. That is the quietest failure on this page.
+ *
+ * `parkedRows` is the population that carries `detail.parked=true` read across ALL states, not only
+ * the active (open/acknowledged) board — because assertion 6's gap is otherwise a race (2026-09-04).
+ * `detail.parked=true` survives a resolve (detail MERGES in board-drainer.mjs), so a parked row the
+ * closer momentarily resolves and its producer re-opens still carries the flag the whole time; it
+ * just drops out of the active read for those seconds. Read the flag wherever it lives and the
+ * denominator of the gap stops depending on the instant the two reads happened to fall on. When
+ * `parkedRows` is not supplied it falls back to the active rows — the pre-fix behaviour, kept so the
+ * pure unit tests can hand a single array — which is only safe when nothing is bouncing states.
  */
-export function summariseBoard(rows, { isWorkable = workableFinding } = {}) {
+export function summariseBoard(rows, { isWorkable = workableFinding, parkedRows = null } = {}) {
   const active = Array.isArray(rows) ? rows : []
   const findings = active.filter((r) => !NOT_A_FINDING.has(r.source))
   const inReach = findings.filter((r) => isWorkable(r))
   const outOfReach = findings.filter((r) => !isWorkable(r) && !r?.detail?.work_item)
-  const parkedPublished = active.filter((r) => r?.detail?.parked === true)
+  const parkedSource = Array.isArray(parkedRows) ? parkedRows : active
+  const parkedPublished = parkedSource.filter((r) => r?.detail?.parked === true)
   const nameOf = (r) => `${r.source}/${r.key}`
   return {
     active: active.length,
@@ -467,8 +477,20 @@ async function main() {
       secret,
       'fleet_signals?select=source,key,severity,state,detail&state=in.(open,acknowledged)&limit=2000',
     )
-    board = summariseBoard(rows)
-    console.log(`board: ${board.findings} active finding(s), ${board.inReach} in the fixer's reach, ${board.outOfReach.length} out of reach and unowned, ${board.parkedPublished.length} publishing parked=true`)
+    // Assertion 6's parkedPublished is read across ALL states, in a SEPARATE query from the active
+    // board above. If it came from `rows` (open/acknowledged only), a parked row the closer resolves
+    // for a few seconds and its producer re-opens drops out of the read while its detail.parked=true
+    // flag stays put (detail merges on resolve), so gap = drainer.parked - 0 fires parks-unpublished
+    // on a timing artefact — exactly what happened 2026-09-04T08:07:12Z, 2.97s before the re-open,
+    // landing needs_human=true on Roger's lane. Reading the flag wherever it lives closes the race.
+    // Folded into the SAME try, so a failure of either read downgrades to board=null (skip, never
+    // guess) rather than judging half a board.
+    const parkedRows = await boGet(
+      secret,
+      'fleet_signals?select=source,key,detail&detail->>parked=eq.true&limit=2000',
+    )
+    board = summariseBoard(rows, { parkedRows })
+    console.log(`board: ${board.findings} active finding(s), ${board.inReach} in the fixer's reach, ${board.outOfReach.length} out of reach and unowned, ${board.parkedPublished.length} publishing parked=true (across all states)`)
   } catch (e) {
     console.error(`::warning::the active board could not be read (${String(e.message).slice(0, 160)}); judging on the drainer's own numbers alone this run`)
   }

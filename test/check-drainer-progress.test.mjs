@@ -374,6 +374,28 @@ t('a publication gap under the floor is a warning, not a crisis', () => {
   assert.equal(j.severity, 'warning')
 })
 
+t('THE 3-SECOND RACE (2026-09-04): a parked row the closer momentarily resolved still counts — no phantom gap', () => {
+  // 2026-09-04T08:07:12.716Z: the closer resolved healthchecks/inbox-daily-summary (the ONLY row
+  // publishing detail.parked=true) at 08:02, this check read the active (open/acknowledged) board,
+  // and the row's producer re-opened it at 08:07:15.686Z — 2.97s too late to be in that read.
+  // gap = drainer.parked(1) - openParked(0) = 1 fired parks-unpublished with needs_human=true on a
+  // pure timing artefact. detail.parked=true survives a resolve (detail MERGES in board-drainer.mjs),
+  // so the flag is on the row throughout; parkedPublished is now read across ALL states, closing it.
+  const resolvedButFlagged = { source: 'healthchecks', key: 'inbox-daily-summary', state: 'resolved', detail: { parked: true } }
+  // Reading only the active board (the pre-fix fallback) is what manufactured the gap:
+  assert.deepEqual(summariseBoard([row('commit-review', 'a')]).parkedPublished, [],
+    'nothing carrying parked=true is open during the bounce')
+  // Counting parked=true across ALL states DOES see the resolved-but-flagged row:
+  const board = summariseBoard([row('commit-review', 'a')], { parkedRows: [resolvedButFlagged] })
+  assert.deepEqual(board.parkedPublished, ['healthchecks/inbox-daily-summary'])
+  const j = judgeDrainer({
+    heartbeat: { last_seen_at: ago(10), detail: { considered: 5, parked: 1, dispatchable: 0, dispatched: 0, last_dispatch_at: ago(30) } },
+    board, now: NOW,
+  })
+  assert.equal(j.verdict, 'ok', 'the resolve/re-open bounce must not manufacture a parks-unpublished gap')
+  assert.notEqual(j.verdict, 'parks-unpublished')
+})
+
 t('the page agreeing with the drainer is not an alarm', () => {
   const j = judgeDrainer({
     heartbeat: { last_seen_at: ago(10), detail: { considered: 40, parked: 2, dispatchable: 0, dispatched: 0, last_dispatch_at: ago(30) } },
