@@ -108,6 +108,29 @@ t('a critical needs_human=false finding that ALREADY PAGED is reachable, not a f
   assert.equal(j.faults.filter((f) => f.kind === 'critical-cannot-page').length, 0)
 })
 
+t('a critical needs_human=false whose paged_at predates its current page_due_at fires again — the current page is outstanding', () => {
+  // migration 128: "Due is page_due_at > paged_at, not paged_at is null", and migration 140:
+  // paged_at is never cleared. So an old delivered page (paged_at set) with a NEWER page now due
+  // and unpaged (page_due_at > paged_at) has NOT reached a human for its current occurrence — the
+  // bare `!paged_at` test the d99e066 commit added would have suppressed it for the full 30-day
+  // lookback while the dedup that actually protects expired after cooldown_hours=6.
+  const j = judgeReachability({
+    signals: [sig({ source: 'monitoring-hygiene', key: 'k', severity: 'critical', needs_human: false, state: 'open', paged_at: '2026-09-04T10:00:00.000000+00:00', page_due_at: '2026-09-04T17:00:00.000000+00:00' })],
+    policies: ARMED,
+  })
+  assert.equal(j.verdict, 'unreachable', 'a page fell due after the last delivery and never went out')
+  assert.equal(j.faults.filter((f) => f.kind === 'critical-cannot-page').length, 1)
+})
+
+t('a critical needs_human=false whose paged_at is at or after its page_due_at is reachable — the current page went out', () => {
+  const j = judgeReachability({
+    signals: [sig({ source: 'monitoring-hygiene', key: 'k', severity: 'critical', needs_human: false, state: 'open', paged_at: '2026-09-04T17:04:33.559467+00:00', page_due_at: '2026-09-04T17:00:00.000000+00:00' })],
+    policies: ARMED,
+  })
+  assert.equal(j.verdict, 'ok', 'the page due for the current occurrence was delivered')
+  assert.equal(j.faults.filter((f) => f.kind === 'critical-cannot-page').length, 0)
+})
+
 t('an acknowledged critical that cannot page still counts; a resolved one does not', () => {
   const ack = judgeReachability({
     signals: [sig({ severity: 'critical', needs_human: false, state: 'acknowledged' })],

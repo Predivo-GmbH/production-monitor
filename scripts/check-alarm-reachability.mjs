@@ -73,7 +73,7 @@ function readBoSecret(env = process.env) {
 /**
  * The whole decision, pure and testable.
  *
- * @param signals  fleet_signals rows: {source, key, severity, needs_human, state, paged_at, page_suppressed_reason}
+ * @param signals  fleet_signals rows: {source, key, severity, needs_human, state, paged_at, page_due_at, page_suppressed_reason}
  * @param policies signal_page_policy rows: {source, may_page}
  */
 export function judgeReachability({ signals, policies }) {
@@ -125,15 +125,22 @@ export function judgeReachability({ signals, policies }) {
   // A contradiction, not a threshold: the producer graded it the worst class of thing AND said
   // nobody need be told. One of the two is wrong and only a person can say which.
   //
-  // BUT a finding that ALREADY PAGED (paged_at set) has demonstrably reached a human, so it is NOT
-  // unreachable: its needs_human was flipped to false AFTER the page went out, and every re-file
-  // since is deduped against that sent page (page_suppressed_reason='dedup'), not muted. Reporting
-  // "this cannot ring your phone" about something whose paged_at proves it rang is a false red —
-  // workpc-push-reverts-laptop-script-edits paged 2026-09-04T17:04:33Z and was still called
-  // unreachable 50 minutes later. A never-paged critical+needs_human=false finding still fires: the
-  // genuine "the worst class of thing, and nobody was ever told" case is fully preserved.
+  // BUT a finding whose CURRENT occurrence has already paged has demonstrably reached a human, so
+  // it is not unreachable — reporting "this cannot ring your phone" about something that just rang
+  // is a false red (workpc-push-reverts-laptop-script-edits paged 2026-09-04T17:04:33Z and was
+  // still called unreachable 50 minutes later). "Already paged" is NOT a bare `paged_at` presence
+  // test, though: nothing ever clears paged_at (BackOffice migration 140: "a page that really went
+  // out is history, not state"), so `!paged_at` suppresses for the whole ALARM_LOOKBACK window
+  // while the dedup that actually protects expires after cooldown_hours (default 6). BackOffice
+  // migration 128 already ruled this exact column: "Due is page_due_at > paged_at, not paged_at is
+  // null." So a page has reached a human for the current occurrence only when paged_at is at or
+  // after page_due_at (page_due_at null = no page outstanding). A finding that paged once and then
+  // had a newer page fall due unpaged, or that never paged at all, still fires — the genuine "the
+  // worst class of thing, and nobody was ever told" case is fully preserved.
   for (const s of signals) {
-    if (s.severity === 'critical' && s.needs_human !== true && !s.paged_at && (s.state === 'open' || s.state === 'acknowledged')) {
+    const reachedCurrentOccurrence =
+      s.paged_at != null && (s.page_due_at == null || new Date(s.paged_at) >= new Date(s.page_due_at))
+    if (s.severity === 'critical' && s.needs_human !== true && !reachedCurrentOccurrence && (s.state === 'open' || s.state === 'acknowledged')) {
       faults.push({
         kind: 'critical-cannot-page',
         source: s.source,
@@ -193,7 +200,7 @@ async function main() {
   const since = new Date(Date.now() - LOOKBACK_DAYS * 86400_000).toISOString()
 
   const [signals, policies] = await Promise.all([
-    boGet(secret, `fleet_signals?select=source,key,severity,needs_human,state,paged_at,page_suppressed_reason&first_seen_at=gte.${since}&limit=5000`),
+    boGet(secret, `fleet_signals?select=source,key,severity,needs_human,state,paged_at,page_due_at,page_suppressed_reason&first_seen_at=gte.${since}&limit=5000`),
     boGet(secret, 'signal_page_policy?select=source,may_page'),
   ])
 
