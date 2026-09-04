@@ -13,7 +13,7 @@
  * Pure: no network, no credentials, no database. Run: node test/advance-lanes.test.mjs
  */
 import assert from 'node:assert'
-import { LANES, nextLane, heldBack, planFor, isDryRun, moveCap } from '../scripts/advance-lanes.mjs'
+import { LANES, nextLane, heldBack, planFor, isDryRun, moveCap, statusForLane } from '../scripts/advance-lanes.mjs'
 
 let n = 0
 const t = (name, fn) => { fn(); n++; console.log(`  ok - ${name}`) }
@@ -104,6 +104,38 @@ t('hostile input never throws and never advances anything', () => {
     const p = planFor(v)
     if (p.act === 'advance') assert.fail(`${JSON.stringify(v)} must not advance`)
   }
+})
+
+// ══ THE MOVE MUST NOT LIE TO THE OTHER TRIGGERS ═════════════════════════════════════════════
+// A PATCH of { lane } alone leaves status out of the statement, so trg_work_items_next_has_no_owner
+// (Cockpit sql/061) fires first, sees the OLD status `next`, and strips owner_session on the exact
+// todo -> in_progress move that only ever happens to a CLAIMED row — landing it In Progress with no
+// owner (the state sql/076 forbids). We send the derived status with the lane so 061/062/074 see
+// where the row is going. This mirrors sql/101's own map; if that map drifts, this must too.
+t('every lane maps to the status sql/101 gives it', () => {
+  assert.equal(statusForLane('backlog'), 'next')
+  assert.equal(statusForLane('refined'), 'next')
+  assert.equal(statusForLane('todo'), 'next')
+  assert.equal(statusForLane('in_progress'), 'in_progress')
+  assert.equal(statusForLane('in_review'), 'in_progress')
+  assert.equal(statusForLane('in_testing'), 'in_progress')
+  assert.equal(statusForLane('ready_for_release'), 'awaiting_signoff')
+})
+
+t('every advance target carries a non-null status, so the PATCH never omits it', () => {
+  for (let i = 0; i < LANES.length - 1; i++) {
+    const to = nextLane(LANES[i])
+    assert.ok(statusForLane(to) != null,
+      `advancing ${LANES[i]} -> ${to} must send a status; a null would drop the column and re-open the bug`)
+  }
+})
+
+t('the todo -> in_progress move sends in_progress, not the stale next', () => {
+  // The regression itself: this is the transition that stripped owner_session in ebade94.
+  const to = nextLane('todo')
+  assert.equal(to, 'in_progress')
+  assert.equal(statusForLane(to), 'in_progress',
+    'if this ever returns next again, the advancer nulls the owner of every row it promotes out of To Do')
 })
 
 console.log(`\n${n} passed`)

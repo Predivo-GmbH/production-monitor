@@ -57,6 +57,27 @@ export function nextLane(lane) {
   return LANES[i + 1]
 }
 
+/**
+ * The status a lane carries, mirroring Cockpit sql/101's own map. We send it WITH the lane so the
+ * write does not lie to the other BEFORE-ROW triggers.
+ *
+ * A PATCH of `{ lane }` alone leaves `status` out of the statement, so every other trigger sees the
+ * row's OLD status. They fire alphabetically, and trg_work_items_next_has_no_owner (061) fires
+ * before trg_work_items_sync_status (101): on a `todo -> in_progress` move it still sees status
+ * `next`, strips owner_session + claimed_at, and 101 THEN rewrites status to in_progress — landing
+ * a claimed row In Progress with no owner, the exact state sql/076 forbids. Sending the derived
+ * status makes 061/062/074 see the status the row is actually moving to. 101 recomputes it from the
+ * lane regardless, so the final status is unchanged; only the in-flight triggers stop being lied to.
+ */
+export function statusForLane(lane) {
+  switch (String(lane)) {
+    case 'backlog': case 'refined': case 'todo': return 'next'
+    case 'in_progress': case 'in_review': case 'in_testing': return 'in_progress'
+    case 'ready_for_release': return 'awaiting_signoff'
+    default: return null
+  }
+}
+
 /** A row a machine may not touch, and the reason, or null when it is fair game. */
 export function heldBack(row) {
   if (!row || typeof row !== 'object') return 'not a row'
@@ -164,7 +185,7 @@ async function main() {
     const res = await fetch(`${url}/rest/v1/work_items?id=eq.${row.id}`, {
       method: 'PATCH',
       headers: { ...H, 'content-type': 'application/json', Prefer: 'return=minimal' },
-      body: JSON.stringify({ lane: plan.to }),
+      body: JSON.stringify({ lane: plan.to, status: statusForLane(plan.to) }),
     })
     if (res.status === 204) moved++
     else console.log(`     FAILED   ${row.slug}: HTTP ${res.status}`)
