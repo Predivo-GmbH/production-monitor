@@ -86,36 +86,64 @@ t('an unarmed source that has NEVER filed anything page-worthy is not a fault', 
 })
 
 // ── fault 2: a critical finding that cannot page itself ────────────────────────────────────
-t('an OPEN critical finding with needs_human=false is a fault — it is a contradiction', () => {
+// These four replace the three that tested `critical && !needs_human`. That combination was the
+// old paging rule, not a fault: `needs_human` means "Roger's hands are required", derived from the
+// who_must_act prefix, so every Claude-owned critical tripped it — 33 of the 64 criticals ever
+// filed, an alarm nobody could ever clear. BackOffice migration 169 took needs_human out of the
+// paging branch, and the check now asks the only question that survives it: did the rule that
+// actually ran refuse a page to an open critical?
+t('THE LIVE FAILURE, 2026-09-04: an open critical the database stamped not-eligible is a fault', () => {
   const j = judgeReachability({
-    signals: [sig({ source: 'monitoring-hygiene', key: 'supabase-disk-pressure-rotates-across-projects', severity: 'critical', needs_human: false, state: 'open' })],
-    policies: ARMED,
+    signals: [sig({ source: 'monitoring-hygiene', key: 'workpc-push-reverts-laptop-script-edits', severity: 'critical', needs_human: false, state: 'open', page_suppressed_reason: 'not-eligible' })],
+    policies: [...ARMED, { source: 'monitoring-hygiene', may_page: true }],
   })
   assert.equal(j.verdict, 'unreachable')
   assert.equal(j.faults.filter((f) => f.kind === 'critical-cannot-page').length, 1)
+  assert.match(j.faults[0].detail, /not the one we think is running/)
 })
 
-t('an acknowledged critical that cannot page still counts; a resolved one does not', () => {
-  const ack = judgeReachability({
-    signals: [sig({ severity: 'critical', needs_human: false, state: 'acknowledged' })],
+t('a Claude-owned critical that ARMED is not a fault — that is migration 169 working', () => {
+  // The exact row above, once 169 is live: still needs_human=false, because the fix is Claude's,
+  // and page_due_at set. Reporting this as unreachable is what made the old check uncloseable.
+  const j = judgeReachability({
+    signals: [sig({ severity: 'critical', needs_human: false, state: 'open', page_suppressed_reason: null })],
     policies: ARMED,
   })
-  assert.equal(ack.verdict, 'unreachable')
-  const done = judgeReachability({
-    signals: [sig({ severity: 'critical', needs_human: false, state: 'resolved' })],
-    policies: ARMED,
-  })
-  assert.equal(done.verdict, 'ok', 'a closed finding needs nobody paged')
+  assert.equal(j.verdict, 'ok')
+  assert.equal(j.faults.length, 0)
 })
 
-t('needs_human must be strictly true — a missing or truthy-ish value is not consent to page', () => {
-  for (const nh of [undefined, null, 'true', 1]) {
+t('a critical held by a suppressor that is a real decision is not a fault', () => {
+  // dedup, quiet-hours, flapping and batch-capped all mean "it WILL/DID ring, just not again now".
+  // Only 'not-eligible' means the rule refused it outright, and only that is impossible after 169.
+  for (const reason of ['dedup', 'quiet-hours', 'flapping', 'batch-capped']) {
     const j = judgeReachability({
-      signals: [sig({ severity: 'critical', needs_human: nh, state: 'open' })],
+      signals: [sig({ severity: 'critical', needs_human: true, state: 'open', page_suppressed_reason: reason })],
       policies: ARMED,
     })
-    assert.equal(j.verdict, 'unreachable', `needs_human=${String(nh)} must not be read as true`)
+    assert.equal(j.verdict, 'ok', `${reason} is a delay, not a refusal`)
   }
+})
+
+t('a RESOLVED critical stamped not-eligible is not a fault — nobody must be paged for it', () => {
+  // upsert_signal writes not-eligible onto resolved rows too (it carries the previous reason
+  // forward), so without the state test every closed row would resurrect this alarm forever.
+  const j = judgeReachability({
+    signals: [sig({ severity: 'critical', needs_human: false, state: 'resolved', page_suppressed_reason: 'not-eligible' })],
+    policies: ARMED,
+  })
+  assert.equal(j.verdict, 'ok')
+})
+
+t('an open critical on a source with may_page=false is fault 1, never fault 2', () => {
+  // policy-off is the mute-source fault and has its own remedy (add the policy row). Counting it
+  // twice would report one problem as two and send a person to the wrong fix.
+  const j = judgeReachability({
+    signals: [sig({ source: 'report', severity: 'critical', needs_human: false, state: 'open', page_suppressed_reason: 'not-eligible' })],
+    policies: [...ARMED, { source: 'report', may_page: false }],
+  })
+  assert.equal(j.faults.filter((f) => f.kind === 'critical-cannot-page').length, 0)
+  assert.equal(j.faults.filter((f) => f.kind === 'mute-source').length, 1)
 })
 
 // ── the healthy end state ──────────────────────────────────────────────────────────────────
