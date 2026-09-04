@@ -606,12 +606,32 @@ function emailDigest(subject, body) {
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────────
+// ── dead-man heartbeat (2026-09-05) ───────────────────────────────────────────────────
+// A dead-man switch answers ONE question: did the scheduled job FIRE? So the self-skip paths
+// (kill switch set, or not armed) ping too - the job ran and behaved exactly as designed, and
+// taking the check DOWN for a deliberate off is the false alarm that teaches people to ignore
+// the mail. What stops that being a green light for doing nothing is that the OUTCOME travels
+// in the ping BODY, so the check page says which of scanned / self-skipped / failed happened.
+//
+// The url lives in the machine-local hc config, which is never committed. There is deliberately
+// NO hardcoded fallback: a broken config must fail visibly rather than become a silent green.
+async function hcPingUxScout(suffix, body) {
+  try {
+    const { homedir } = await import('node:os')
+    const cfgPath = join(homedir(), '.claude', 'scripts', 'hc-config.json')
+    const url = JSON.parse(readFileSync(cfgPath, 'utf-8')).ping_urls?.['ux-scout']
+    if (!url) { log('HEARTBEAT CONFIG MISSING - not pinging; the check will go DOWN and alert'); return }
+    await fetch(url + suffix, { method: 'POST', body: String(body).slice(0, 900), signal: AbortSignal.timeout(10000) })
+  } catch (e) { log(`heartbeat ping failed: ${String(e)}`) }
+}
+
 async function main() {
-  if (DISABLED) { log('KILL SWITCH set (UX_SCOUT_DISABLED=1), exiting.'); return }
+  if (DISABLED) { log('KILL SWITCH set (UX_SCOUT_DISABLED=1), exiting.'); await hcPingUxScout('', 'ran; kill switch UX_SCOUT_DISABLED=1 is set - deliberate, not a failure'); return }
   if (!ENABLED) {
     // Default posture is wired-but-off, exactly like the Board Drainer and the paid-key
     // gate: registering the script must never be the same act as arming it.
     console.log('ux-scout: UX_SCOUT_ENABLED not set, self-skipping (exit 0)')
+    await hcPingUxScout('', 'ran; UX_SCOUT_ENABLED not set, wired-but-off by design - deliberate, not a failure')
     return
   }
   log(`UX Scout start, mode=${LIVE ? 'LIVE' : 'DRY-RUN'}, window=${WINDOW_DAYS}d`)
@@ -701,14 +721,16 @@ async function main() {
     log('  quiet week, no email sent')
   }
   log('UX Scout done.')
+  await hcPingUxScout('', `ran the full scan, mode=${LIVE ? 'LIVE' : 'DRY-RUN'}, window=${WINDOW_DAYS}d`)
 }
 
 // Run-as-script guard. Compared via pathToFileURL rather than string-building a file://
 // URL: on Windows `import.meta.url` is file:///C:/... (three slashes) and the hand-built
 // form has two, so the naive comparison silently never matches and main() never runs.
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().catch((e) => {
+  main().catch(async (e) => {
     log(`FATAL: ${String(e)}`)
+    try { await hcPingUxScout('/fail', `FATAL: ${String(e)}`) } catch { /* the log line above is the last resort */ }
     try {
       const tmp = join(STATE_DIR, 'fatal.txt')
       writeFileSync(tmp, `UX Scout run failed:\n\n${String(e)}\n${e?.stack || ''}`, 'utf-8')
