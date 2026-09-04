@@ -819,6 +819,23 @@ jobs:
       #
       # send-alert.mjs is safe on a cancelled run: a missing test-results/results.json is already
       # a handled case ("the run likely crashed or timed out before Playwright wrote a report").
+
+      # cancelled() and failure() are STATUS CHECK FUNCTIONS, and GitHub accepts them in exactly
+      # ONE place: an `if:`. The same expression in `env:` (b6336e1, 2026-09-04) made GitHub REFUSE
+      # THE WHOLE FILE - HTTP 422 "Unrecognized function: 'cancelled'" - so run 33872552961 started
+      # NO JOBS. A run with no jobs has no alert step, so the monitor died and could not report its
+      # own death: from 12:23:48Z every run was a red that told nobody. The state therefore has to
+      # be captured by a step whose `if:` may legally hold it, and read out of the steps context.
+      #
+      # Placed IMMEDIATELY before the alerter on purpose: failure() flips mid-job (see :87), so the
+      # two must read the same moment. When this step is skipped outputs.value is '' and
+      # RUN_WAS_CANCELLED is false, so the alert FIRES - the safe direction for everything that is
+      # not a proven clean cancellation.
+      - name: Record a clean cancellation for the alerter
+        id: clean_cancel
+        if: ${{ cancelled() && !failure() }}
+        run: echo "value=true" >> "$GITHUB_OUTPUT"
+
       - name: Send alert on failure
         id: alert
         if: ${{ failure() || cancelled() }}
@@ -834,7 +851,9 @@ jobs:
           # job overrunning its cap over an all-green run. send-alert.mjs uses it to suppress the
           # self-refuting "1 failure(s) / 0 failed" phantom (2026-09-04 alerter-pages-on-cancelled-run).
           # A non-test step failure keeps failure()=true here, so this stays false and the alert fires.
-          RUN_WAS_CANCELLED: ${{ cancelled() && !failure() }}
+          # Read out of the steps context, NOT written here as `cancelled() && !failure()` - see
+          # the recorder step above for why that spelling takes the whole workflow down.
+          RUN_WAS_CANCELLED: ${{ steps.clean_cancel.outputs.value == 'true' }}
           GH_TOKEN: ${{ github.token }}   # edge-triggered dedup: query the previous run + download its results.json to suppress duplicate alerts for an already-known ongoing failure
           # Reads secret METADATA ONLY (updated_at, never a value) to tell a locked mailbox apart from
           # a login rotated mid-run: the default github.token above CANNOT list secrets, so without a
