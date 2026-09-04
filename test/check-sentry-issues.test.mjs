@@ -12,6 +12,7 @@
 import assert from 'node:assert'
 import {
   isLiveEnvironment, liveEnvironments, candidateKeys, keyFor, severityFor, signalFor, reconcile,
+  isCredentialRefusal,
   readWithRetry, READ_ATTEMPTS, FILED_BY,
   nextCursor,
   MAX_ISSUE_PAGES,
@@ -195,14 +196,69 @@ t('a row this producer filed is not resolved while the issue is still live', () 
 })
 
 // ── what the board is told ────────────────────────────────────────────────────
-t('nothing this producer files can ever ring a phone', () => {
-  for (const i of [B7, RFEC, RFED, CM2, BA]) {
+// ── what may ring a phone, and what may not (Roger's decision, 2026-09-04, option C) ──────────
+//
+// The rule this pins is the whole point of the 2026-09-02 post-mortem: this producer SAW the
+// "Unregistered API key" outage and filed it, and the grading silenced it. B7 (`Smartlead HTTP
+// 401: Plan expired!`) and RFEC (`JWT issued at future`) are REAL fixtures read from the live org
+// on 2026-08-27, and both are refusals — so the old assertion "nothing here can ever ring a phone"
+// was, on this very data, asserting the defect.
+
+t('an ordinary application error still cannot ring a phone', () => {
+  for (const i of [RFED, CM2, BA]) {
     const sig = signalFor(i, keyFor(i, BOARD))
     // upsert_signal is only eligible to page on needs_human AND critical. An application error is
     // code, so a machine owns it: "Needs you" on this board means it needs ROGER.
     assert.equal(sig.needs_human, false, i.shortId)
     assert.notEqual(sig.severity, 'critical', i.shortId)
   }
+})
+
+t('a REFUSED CREDENTIAL rings, because no machine here can mint a replacement key', () => {
+  for (const i of [B7, RFEC]) {
+    const sig = signalFor(i, keyFor(i, BOARD))
+    assert.equal(sig.needs_human, true, i.shortId)
+    assert.equal(sig.severity, 'critical', i.shortId)
+    assert.match(sig.summary, /A key or login was REFUSED/, i.shortId)
+  }
+})
+
+t('the outage that started this would now page — both halves of it', () => {
+  const unregistered = (culprit) => ({
+    id: '1', shortId: 'REPLYFLOW-EDGE-J', project: 'replyflow-edge', level: 'error',
+    title: `Error: ${culprit}: Unregistered API key`, culprit, count: 35, userCount: 0,
+    firstSeen: '2026-09-02T20:29:29Z', lastSeen: '2026-09-02T21:02:11Z', environments: ['production'],
+  })
+  for (const c of ['Failed to recover stale jobs', 'Failed to query expiring tokens']) {
+    const sig = signalFor(unregistered(c), 'k')
+    assert.equal(sig.severity, 'critical', c)
+    assert.equal(sig.needs_human, true, c)
+  }
+})
+
+t('a person saying "this is not live" is never overridden by the pattern', () => {
+  // Both wordings are real board rows. Without this, option C would page for a defect that is not
+  // in production and for one that was already fixed — the two false pages option B could not avoid.
+  const staging = { id: '2', shortId: 'BACKOFFICE-9', project: 'backoffice', level: 'error', count: 15, userCount: 0, environments: [], title: '[not live] stripe-webhook returns HTTP 401 when the FX lookup blips' }
+  const cleared = { id: '3', shortId: 'BACKOFFICE-4', project: 'backoffice', level: 'error', count: 15, userCount: 0, environments: [], title: 'Cleared in Sentry: backoffice is throwing an error: unauthorized' }
+  for (const i of [staging, cleared]) {
+    assert.equal(isCredentialRefusal(i), false, i.shortId)
+    assert.equal(signalFor(i, 'k').needs_human, false, i.shortId)
+  }
+})
+
+t('a token being READ is not a token being REFUSED', () => {
+  // "Failed to query expiring tokens" alone is a table read, not a rejection. Matching bare
+  // `token` would have paged for every customer-token query in the fleet.
+  assert.equal(isCredentialRefusal({ title: 'Error: Failed to query expiring tokens: timeout' }), false)
+  assert.equal(isCredentialRefusal({ title: 'Error: Failed to query expiring tokens: JWT expired' }), true)
+})
+
+t('the refusal is judged on the words, never on Sentry\'s level', () => {
+  // severityFor() would call this one "warning"; the content is what decides.
+  const i = { title: 'Error: Unregistered API key', level: 'warning', count: 1, userCount: 0, environments: [] }
+  assert.equal(severityFor(i), 'warning')
+  assert.equal(signalFor(i, 'k').severity, 'critical')
 })
 
 t('severity is Sentry\'s own level, not a guess', () => {
