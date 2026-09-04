@@ -62,7 +62,14 @@ const targets = discoverAuthTargets();
  */
 const MINIMUM_TARGETS = 14;
 
-test('auth: at least 14 projects are actually being checked', () => {
+// @network-free is READ BY THE ALERT, not by a test filter. This spec counts an env-built array and
+// makes no request, so it passes in a total product blackout; scripts/lib/parse-failures.mjs
+// (NON_PRODUCT_SPEC_TAG) must not count it as proof the runner reached a product, or a blackout gets
+// relabelled "N failure(s) across N project(s)". The exclusion used to be keyed on this test's TITLE,
+// which meant rewording the sentence below — or raising MINIMUM_TARGETS past 14 — silently switched
+// the gate off. Do not remove the tag; test/a-spec-exclusion-cannot-drift-on-a-reworded-title.test.mjs
+// fails if you do. The keyed probes further down deliberately carry NO tag: they are the real evidence.
+test('auth: at least 14 projects are actually being checked', { tag: '@network-free' }, () => {
   expect(
     targets.length,
     `Only ${targets.length} projects have both a _SUPABASE_URL and an _ANON_KEY, so the rest are not checked at all: ${targets.map((t) => t.name).join(', ')}`,

@@ -226,12 +226,33 @@ export function isUnreachableRun(failures, opts = {}) {
  *  floor spec needs excluding, which the spec-title set below does. */
 const NON_PRODUCT_SUITE_PREFIXES = ['self/', 'ci-health/', 'keepalive/', 'api-health/external-apis.spec.ts']
 
-/** Individual spec TITLES excluded at spec granularity, because they pass with ZERO network I/O even
- *  inside a file that otherwise DOES prove reachability. auth-backends.spec.ts:65 ("auth: at least 14
- *  projects are actually being checked") only counts an env-built array of targets and would pass in
- *  a total blackout; the per-target keyed auth probes below it in the same file are the real breadth
- *  evidence and are kept. Skipped by suiteHasPassingSpec. */
-const NON_PRODUCT_SPEC_TITLES = new Set(['auth: at least 14 projects are actually being checked'])
+/** The Playwright TAG that marks ONE spec as proving nothing about product reachability, because it
+ *  passes with ZERO network I/O even inside a file that otherwise DOES prove reachability. Written on
+ *  the spec as `test('…', { tag: '@network-free' }, …)`; Playwright's JSON reporter puts it in
+ *  `spec.tags` with the '@' stripped, which is what suiteHasPassingSpec reads. Today it marks
+ *  auth-backends.spec.ts's floor assertion, which only counts an env-built array of targets and would
+ *  pass in a total blackout; the per-target keyed auth probes in the same file carry no tag and stay
+ *  counted, because they are the real breadth evidence.
+ *
+ *  WHY A TAG AND NOT THE SPEC TITLE (2026-09-04, board incident
+ *  57ff3eb:spec-title-exclusion-couples-to-editable-literal). This exclusion was first keyed on the
+ *  title STRING 'auth: at least 14 projects are actually being checked' — a human-editable sentence
+ *  carrying a number that changes the moment the fleet grows past 14. Reword the test for clarity, or
+ *  raise MINIMUM_TARGETS to 15, and the exclusion silently stops matching: the network-free floor spec
+ *  counts as breadth evidence again and relabels a total product blackout back into "N failure(s)
+ *  across N project(s)" — the exact defect commit 37b7982 was written to remove, reintroduced by a
+ *  rename, with nothing able to see it happen. A tag has no other purpose, so nobody edits it for
+ *  readability, and test/a-spec-exclusion-cannot-drift-on-a-reworded-title.test.mjs reads the real
+ *  spec file and FAILS if the marked spec ever loses the tag or the two sides stop agreeing. */
+export const NON_PRODUCT_SPEC_TAG = 'network-free'
+
+/** True when a spec carries the exclusion tag. Playwright's JSON reporter strips the leading '@'
+ *  (reporters/json.js: `tags: test.tags.map((tag) => tag.substring(1))`), but a hand-written fixture
+ *  or a future reporter change may keep it, so both spellings are accepted — that is tolerating one
+ *  reporter detail, not keying on prose. */
+function isNonProductSpec(spec) {
+  return (spec?.tags ?? []).some((t) => String(t).replace(/^@/, '') === NON_PRODUCT_SPEC_TAG)
+}
 
 /** Did the run get a PASSING result from at least one REAL product? Suites under the infrastructure
  *  folders above are excluded on purpose: they can pass while the runner cannot reach any product,
@@ -248,10 +269,10 @@ export function reachedAnyProduct(results) {
 }
 
 /** True if any spec anywhere under this suite (recursing into nested describes) has a passed result,
- *  skipping the network-free spec titles that prove nothing about reachability. */
+ *  skipping specs tagged @network-free, which prove nothing about reachability. */
 function suiteHasPassingSpec(suite) {
   for (const spec of suite?.specs ?? []) {
-    if (typeof spec?.title === 'string' && NON_PRODUCT_SPEC_TITLES.has(spec.title)) continue
+    if (isNonProductSpec(spec)) continue
     for (const test of spec?.tests ?? []) {
       if ((test?.results ?? []).some((r) => r?.status === 'passed')) return true
     }

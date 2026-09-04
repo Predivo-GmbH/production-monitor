@@ -204,7 +204,7 @@ check('api-health/auth-backends per-target probes ARE breadth evidence (board 1d
     productSuite('backoffice', 'BackOffice', [failedGoto]),
     productSuite('arivioo', 'Arivioo', [failedGoto]),
     { title: 'api-health/auth-backends.spec.ts', suites: [{ title: 'Auth backends', specs: [
-      { title: 'auth: at least 14 projects are actually being checked', tests: [passedTest] }, // network-free floor
+      { title: 'auth: at least 14 projects are actually being checked', tags: ['network-free'], tests: [passedTest] }, // network-free floor, excluded by its TAG
       { title: 'auth backend answers, so a customer can log in: BACKOFFICE', tests: [passedTest] }, // real keyed probe
       { title: 'auth backend answers, so a customer can log in: REPLYFLOW', tests: [passedTest] },
     ] }] },
@@ -219,11 +219,12 @@ check('api-health/auth-backends per-target probes ARE breadth evidence (board 1d
 check('auth-backends floor spec ALONE is network-free and is NOT breadth evidence', () => {
   // The half that still must be excluded: if the ONLY pass in auth-backends is its floor assertion
   // (counts an env-built array, no I/O) and the only other passes are the excluded api-health file,
-  // nothing product-reaching passed → still a blackout. Spec-title exclusion, not file exclusion.
+  // nothing product-reaching passed → still a blackout. Spec-TAG exclusion, not file exclusion — the
+  // title below is irrelevant to the gate now (board 57ff3eb), only `tags` decides.
   const results = { suites: [
     productSuite('backoffice', 'BackOffice', [failedGoto]),
     { title: 'api-health/auth-backends.spec.ts', suites: [{ title: 'Auth backends', specs: [
-      { title: 'auth: at least 14 projects are actually being checked', tests: [passedTest] },
+      { title: 'auth: at least 14 projects are actually being checked', tags: ['network-free'], tests: [passedTest] },
     ] }] },
     { title: 'api-health/external-apis.spec.ts', suites: [{ title: 'External APIs', specs: [{ title: 'brandfetch', tests: [passedTest] }] }] },
   ] }
