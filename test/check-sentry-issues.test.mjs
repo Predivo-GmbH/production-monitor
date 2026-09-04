@@ -236,15 +236,20 @@ t('the outage that started this would now page — both halves of it', () => {
   }
 })
 
-t('a person saying "this is not live" is never overridden by the pattern', () => {
-  // Both wordings are real board rows. Without this, option C would page for a defect that is not
-  // in production and for one that was already fixed — the two false pages option B could not avoid.
-  const staging = { id: '2', shortId: 'BACKOFFICE-9', project: 'backoffice', level: 'error', count: 15, userCount: 0, environments: [], title: '[not live] stripe-webhook returns HTTP 401 when the FX lookup blips' }
-  const cleared = { id: '3', shortId: 'BACKOFFICE-4', project: 'backoffice', level: 'error', count: 15, userCount: 0, environments: [], title: 'Cleared in Sentry: backoffice is throwing an error: unauthorized' }
-  for (const i of [staging, cleared]) {
-    assert.equal(isCredentialRefusal(i), false, i.shortId)
-    assert.equal(signalFor(i, 'k').needs_human, false, i.shortId)
-  }
+t('a refusal is graded purely on the words — there is no "[not live]"/"Cleared in Sentry" title brake', () => {
+  // The old test hand-built issue objects whose `title` began "[not live]" or "Cleared in Sentry"
+  // and asserted a title brake suppressed them. That was untrue of the real path: those two
+  // prefixes are BOARD-ROW conventions — a person annotates a row, and the resolve step writes
+  // "Cleared in Sentry:" onto a row — never Sentry's own text. isCredentialRefusal only ever sees a
+  // Sentry title (mapIssue copies it verbatim, its one construction site), which can carry neither,
+  // so the brake was unreachable and these fixtures could not occur in production. It is now gone,
+  // and a title that DOES contain a refusal word grades as one whatever else it says:
+  assert.equal(isCredentialRefusal({ title: '[not live] Unregistered API key' }), true)
+  assert.equal(isCredentialRefusal({ title: 'Cleared in Sentry: backoffice unauthorized' }), true)
+  // What actually keeps a not-live or already-fixed fault off the phone is UPSTREAM of grading, each
+  // half pinned by its own real-path test above:
+  //   staging-only  -> excluded from the live set   ("the staging-only money defect ... the bar working")
+  //   already fixed -> resolved, nothing seen since  ("resolved on the board, nothing seen since ...")
 })
 
 t('a token being READ is not a token being REFUSED', () => {

@@ -212,20 +212,22 @@ export const CREDENTIAL_REFUSAL = new RegExp([
 ].join('|'), 'i')
 
 /**
- * Titles a person wrote to say "this is NOT a live production fault". Never paged, whatever they
- * say. Both wordings are real and both would otherwise have produced a false page: one row begins
- * "Cleared in Sentry" (already fixed) and one begins "[not live]" (a staging-only money defect a
- * person filed by hand).
- */
-const NOT_LIVE_PREFIX = /^\s*(\[not live\]|cleared in sentry)/i
-
-/**
  * Is this error a refused credential? Judged on the title and the culprit, never on the level —
  * the level is what got this wrong in the first place.
+ *
+ * There is deliberately NO "[not live]" / "Cleared in Sentry" title escape hatch. Those two
+ * prefixes are BOARD-ROW conventions — a person annotates a row, and this script writes
+ * "Cleared in Sentry:" onto a resolved row at the resolve step — never Sentry's own text. The
+ * only title this function ever sees is a Sentry title (mapIssue copies it verbatim), which can
+ * carry neither, so such a brake was unreachable: it read as a working safeguard while suppressing
+ * nothing, which is worse than none. A not-live or already-fixed fault is kept off the phone
+ * UPSTREAM of grading — a staging-only issue is never in the live set (isLiveEnvironment), and an
+ * already-fixed one is resolved on the board with nothing seen since (reconcile leaves it
+ * resolved). Option C (Roger, 2026-09-04) does not rest on the removed brake; the decision doc
+ * measured its seven pages to contain none about a fixed or not-live fault.
  */
 export function isCredentialRefusal(issue) {
   const text = `${issue?.title ?? ''} ${issue?.culprit ?? ''}`
-  if (NOT_LIVE_PREFIX.test(String(issue?.title ?? ''))) return false
   return CREDENTIAL_REFUSAL.test(text)
 }
 
