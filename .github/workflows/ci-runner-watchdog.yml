@@ -45,6 +45,22 @@ jobs:
 
       # A red run in the GitHub UI is NOT an alert - nobody is watching the GitHub UI. Without
       # this the fleet could sit on paid runners for days and the first sign would be the bill.
+      # DELIBERATELY STILL `failure()` ALONE, AND THE ONLY ALARM IN THIS REPO THAT IS
+      # (2026-09-04). Every other mailer here now reads `failure() || cancelled()`, because a job
+      # killed by its own timeout-minutes concludes `cancelled` and `failure()` is false there —
+      # so the overrun is the one failure the alarm cannot report (monitor.yml, run 33818609882).
+      #
+      # That fix is WRONG for this workflow and only this one. It runs */10 with
+      # `cancel-in-progress: true` at :27, on purpose: a watchdog only ever needs the newest run,
+      # so older runs are cancelled ROUTINELY, several times an hour. Paging on `cancelled()`
+      # here would not report an overrun, it would mail Roger every time the cron superseded
+      # itself. A step condition cannot tell a supersede from a timeout.
+      #
+      # What covers the gap instead is the dead-man's switch at :78 — `if: always()`, so it runs
+      # in a cancelled job too, and guard-heartbeat.mjs pings /fail when this job could not
+      # certify what it watches. That is the compensating control, and it is why
+      # test/alarm-steps-can-run.test.mjs exempts cancel-in-progress:true workflows rather than
+      # failing them: the exemption is paid for, not waived.
       - name: Email when the fleet falls back to paid runners
         id: alert
         if: failure()

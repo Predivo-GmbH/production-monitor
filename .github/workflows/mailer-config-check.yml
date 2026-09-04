@@ -62,9 +62,13 @@ jobs:
       # A red run in the GitHub UI is NOT an alert - nobody is watching the GitHub UI. A row in a
       # database is not an alert either; that is precisely what let the August outage run for
       # four days.
+      # `|| cancelled()`: this job declares a timeout-minutes, and a job killed by its own cap
+      # concludes `cancelled`, in which `failure()` is false — the overrun would be the one
+      # failure this alarm could not report. Proven on monitor.yml, run 33818609882 (2026-09-04).
+      # Safe here: cancel-in-progress is false, so a cancellation is never a routine supersede.
       - name: Email when a product cannot send
         id: alert
-        if: failure()
+        if: ${{ failure() || cancelled() }}
         run: node scripts/send-mailer-alert.mjs
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}

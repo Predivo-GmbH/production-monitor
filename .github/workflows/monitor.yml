@@ -80,7 +80,28 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # THE LOUD CAP MUST BE REACHABLE BEHIND THE SILENT ONE (2026-09-04, run 33818609882).
+    #
+    # This was 25, and the step below at :141 carries `timeout-minutes: 18` with a comment
+    # explaining that a STEP cap fails loud while this JOB cap goes `cancelled` and silences
+    # every `failure()` path. Both are right. Together they were incoherent, and the arithmetic
+    # says so — measured on that run:
+    #
+    #   head  (checkout, setup-node, npm ci, browser install, OTP inbox clear)   3m42s
+    #   the Playwright step, if it ever used the cap written for it              18m00s
+    #   tail  (the always() sensors after it, 00:07:55 - 23:59:17)               8m50s
+    #                                                                          --------
+    #                                                                           30m32s  > 25m
+    #
+    # So the 18-minute cap designed to be LOUD could never fire: this one fired first, EVERY
+    # time, and produced the silent conclusion. On 33818609882 Playwright stopped itself at 15m
+    # on its own globalTimeout and the job STILL blew this cap at 00:05:34 — 32 failed tests and
+    # the whole fleet unreachable, concluded `cancelled`, and "Send alert on failure" skipped.
+    #
+    # 40 clears the proven 30m32s worst case by ~31%. It costs nothing to raise: GitHub bills
+    # the minutes a job USES, not the cap it declares. The cap is a backstop, not a budget.
+    # The real fix is at :775 — the alarm no longer depends on this number being right.
+    timeout-minutes: 40
 
     steps:
       - uses: actions/checkout@v5
@@ -770,9 +791,37 @@ jobs:
           ALERT_EMAIL: rogmueller1976@gmail.com
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
+      # THE ALARM MUST SURVIVE THE JOB'S OWN TIMEOUT (2026-09-04, run 33818609882).
+      #
+      # This was `if: failure()`. A job that hits its `timeout-minutes` concludes `cancelled`,
+      # and in a cancelled job `failure()` is FALSE — so the one step whose entire purpose is to
+      # tell a human was the one step the overrun switched off. That run found 32 failed tests
+      # and all 12 products unreachable, and mailed nobody.
+      #
+      # What makes it worth fixing HERE rather than only by raising the cap: `failure()` FLIPPED
+      # mid-job. "Auto-fix known failure patterns" and "Auto-heal" are gated on `failure()` too
+      # and they RAN, at 00:03:32, because cancellation was not signalled until 00:05:34. Every
+      # failure()-gated step before that line got the true reading; this one, reached at 00:07:55,
+      # got the false one. The alarm was the only thing on the wrong side of it — and it always
+      # will be, because it is deliberately last. Raising the cap moves that line; it does not
+      # remove it. Only this condition does.
+      #
+      # Deliberately NOT applied to Auto-fix/Auto-heal above: those CHANGE production (auto-heal
+      # redeploys sites). Widening a notifier is free; widening a redeploy is not. The rule this
+      # encodes, and that test/alarm-steps-can-run.test.mjs now enforces over every workflow, is
+      # narrow on purpose: a step that SENDS MAIL must survive cancellation, nothing else.
+      #
+      # `cancel-in-progress: false` at :78 is what makes this safe to page on. In this workflow a
+      # cancellation can only be the timeout or a human at the keyboard — never a routine
+      # supersede — so there is no run this can spam. ci-runner-watchdog.yml, which does set
+      # cancel-in-progress: true, is exempt for exactly that reason and leans on its dead-man's
+      # switch instead.
+      #
+      # send-alert.mjs is safe on a cancelled run: a missing test-results/results.json is already
+      # a handled case ("the run likely crashed or timed out before Playwright wrote a report").
       - name: Send alert on failure
         id: alert
-        if: failure()
+        if: ${{ failure() || cancelled() }}
         run: node scripts/send-alert.mjs
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}

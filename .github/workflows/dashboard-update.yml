@@ -86,8 +86,13 @@ jobs:
       # "Run failed - no report produced / results.json missing" - which says nothing about
       # a dead FTP password. It also dedups against monitor.yml's history, which would let
       # an unrelated red monitor SUPPRESS this alarm. Same reasoning as drift-check.yml.
+      #
+      # `|| cancelled()`: this job declares a timeout-minutes, and a job killed by its own cap
+      # concludes `cancelled`, in which `failure()` is false — the overrun would be the one
+      # failure this alarm could not report. Proven on monitor.yml, run 33818609882 (2026-09-04).
+      # Safe here: this workflow sets no concurrency at all, so nothing supersedes its runs.
       - name: Send alert on failure
-        if: failure()
+        if: ${{ failure() || cancelled() }}
         run: node scripts/send-dashboard-alert.mjs
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -211,8 +216,11 @@ jobs:
       # escalation mail and the hourly auto-fix runbook both read. A silent failure here does
       # not just lose one report - it freezes the fleet's view of itself at the last good run
       # while every consumer keeps reading it as current.
+      #
+      # `|| cancelled()`: same rule as the sibling job above — a job killed by its own
+      # timeout-minutes concludes `cancelled`, and `failure()` is false there.
       - name: Send alert on failure
-        if: failure()
+        if: ${{ failure() || cancelled() }}
         run: node scripts/send-dashboard-alert.mjs
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}

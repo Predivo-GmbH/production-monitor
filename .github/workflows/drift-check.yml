@@ -82,8 +82,12 @@ jobs:
       # Drift-specific sender: renders the real drift findings (drift-results.json /
       # pipeline-drift-results.json) instead of send-alert.mjs's Playwright "no report
       # produced" fallback, which fired because this job never runs Playwright.
+      # `|| cancelled()`: this job declares a timeout-minutes, and a job killed by its own cap
+      # concludes `cancelled`, in which `failure()` is false — the overrun would be the one
+      # failure this alarm could not report. Proven on monitor.yml, run 33818609882 (2026-09-04).
+      # Safe here: cancel-in-progress is false, so a cancellation is never a routine supersede.
       - name: Send alert on failure
-        if: failure()
+        if: ${{ failure() || cancelled() }}
         run: node scripts/send-drift-alert.mjs
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}

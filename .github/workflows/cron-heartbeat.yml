@@ -69,8 +69,13 @@ jobs:
       # a problem that is being worked on. Two dispatches on 2026-09-02 sent two
       # such emails about findings the session had already diagnosed. A dispatched
       # run still goes red, so nothing becomes invisible.
+      # `|| cancelled()`: this job declares a timeout-minutes, and a job killed by its own cap
+      # concludes `cancelled`, in which `failure()` is false — so the overrun would be the one
+      # failure this alarm could not report. Proven on production-monitor's monitor.yml,
+      # run 33818609882 (2026-09-04). Safe here because this workflow sets
+      # cancel-in-progress: false, so a cancellation is never a routine supersede.
       - name: Send heartbeat alert on failure
-        if: failure() && github.event_name == 'schedule'
+        if: ${{ (failure() || cancelled()) && github.event_name == 'schedule' }}
         run: node scripts/send-heartbeat-alert.mjs
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
