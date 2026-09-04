@@ -379,6 +379,20 @@ export function judgeDrainer({
     }
   } else {
     const parked = Number(parkedRaw)
+    // ASSERTION 6, BY KEYS NOT COUNTS (2026-09-04). Commit 43a1c78 widened parkedPublished to read
+    // detail.parked=true across ALL states, to stop a 3-second resolve/re-open bounce inventing a
+    // gap. But `gap = parked - parkedPublished.length` is a bare COUNT across two different
+    // populations: `parked` is the drainer's active-board count, while parkedPublished now includes
+    // stale detail.parked=true flags stranded on resolved/closed rows (detail MERGES on resolve,
+    // board-drainer.mjs), so each such stale flag SUBTRACTS one from the gap and can hide a real
+    // unpublished park. Worse, the masking correlates with the fault: the same failed flag-write
+    // both strands the flag and is exactly what assertion 6 exists to catch. When the drainer
+    // publishes the keys it parked (detail.parked_keys), compare SETS: a gap is a parked KEY with no
+    // row carrying its flag, so an unrelated stale flag can never cancel a missing one. Fall back to
+    // the count comparison only for heartbeats predating parked_keys (self-heals on the next run).
+    const parkedKeys = Array.isArray(detail.parked_keys) ? detail.parked_keys : null
+    const publishedSet = board ? new Set(board.parkedPublished) : new Set()
+    const missing = parkedKeys ? parkedKeys.filter((k) => !publishedSet.has(k)) : null
     // THE DENOMINATOR IS THE BOARD WHEN THE BOARD IS KNOWN (assertion 5). `considered` is what the
     // drainer looked at after discarding every source it cannot write to, so measuring against it
     // asks "of the work it still attempts, how much has it abandoned?" — a question that stays
@@ -397,7 +411,7 @@ export function judgeDrainer({
         verdict: 'given-up',
         severity: 'critical',
         title: 'The fleet auto-fixer has given up on most of the board',
-        summary: `${basis} These need a person. A parked or out-of-reach finding carries needs_human=false, so nothing pages on it and it never reaches the work board either — it exists only on the /signals page, and a page is PULL.${parkedGap(board, parked)}${board && board.outOfReach.length ? ` Never tried: ${board.outOfReach.slice(0, 12).join(', ')}${board.outOfReach.length > 12 ? `, +${board.outOfReach.length - 12} more` : ''}.` : ''}`,
+        summary: `${basis} These need a person. A parked or out-of-reach finding carries needs_human=false, so nothing pages on it and it never reaches the work board either — it exists only on the /signals page, and a page is PULL.${parkedGap(board, parked, missing)}${board && board.outOfReach.length ? ` Never tried: ${board.outOfReach.slice(0, 12).join(', ')}${board.outOfReach.length > 12 ? `, +${board.outOfReach.length - 12} more` : ''}.` : ''}`,
         abandoned: board ? board.outOfReach : [],
       }
     }
@@ -405,13 +419,16 @@ export function judgeDrainer({
     // ASSERTION 6, on its own. It sits after given-up because given-up is the more actionable
     // fact, and its summary already carries the same sentence via parkedGap() — so the gap can
     // never be hidden by a louder verdict, only re-reported under it.
-    const gap = board ? parked - board.parkedPublished.length : 0
+    const gap = board ? (missing ? missing.length : parked - board.parkedPublished.length) : 0
     if (board && gap > 0) {
+      const summary = missing
+        ? `The drainer parked ${parked} finding(s) this run, and ${gap} of them have NO row on the board publishing detail.parked=true, so no query, no page and no person can name them: ${missing.slice(0, 12).join(', ')}${missing.length > 12 ? `, +${missing.length - 12} more` : ''}. The flag is written once, in the branch that first records an item stuck, and nothing ever re-asserts it — so a park whose write failed, or one made before the flag existed, is invisible for ever.`
+        : `The drainer's own count says ${parked} finding(s) are parked, and only ${board.parkedPublished.length} row(s) on the board publish detail.parked=true. The other ${gap} exist as abandoned only inside the drainer's local state file on one machine: no query, no page and no person can name them. The flag is written once, in the branch that first records an item stuck, and nothing ever re-asserts it — so a park whose write failed, or one made before the flag existed, is invisible for ever.`
       return {
         verdict: 'parks-unpublished',
         severity: gap >= parkFloor ? 'critical' : 'warning',
         title: 'The fleet auto-fixer cannot say WHICH findings it abandoned',
-        summary: `The drainer's own count says ${parked} finding(s) are parked, and only ${board.parkedPublished.length} row(s) on the board publish detail.parked=true. The other ${gap} exist as abandoned only inside the drainer's local state file on one machine: no query, no page and no person can name them. The flag is written once, in the branch that first records an item stuck, and nothing ever re-asserts it — so a park whose write failed, or one made before the flag existed, is invisible for ever.`,
+        summary,
       }
     }
   }
@@ -429,10 +446,13 @@ export function judgeDrainer({
 
 /** One sentence, appended to any verdict that already knows `board`, so the publication gap of
  *  assertion 6 is never swallowed by a louder verdict firing first. */
-function parkedGap(board, parked) {
+function parkedGap(board, parked, missing = null) {
   if (!board) return ''
-  const gap = parked - board.parkedPublished.length
+  const gap = missing ? missing.length : parked - board.parkedPublished.length
   if (gap <= 0) return ''
+  if (missing) {
+    return ` Worse: ${gap} of those parked findings publish detail.parked=true on NO row, so they cannot even be NAMED from the board — they are abandoned only inside the drainer's local state file: ${missing.slice(0, 12).join(', ')}${missing.length > 12 ? `, +${missing.length - 12} more` : ''}.`
+  }
   return ` Worse: only ${board.parkedPublished.length} of those ${parked} parked findings publish detail.parked=true on their row, so ${gap} of them cannot even be NAMED from the board — they are abandoned only inside the drainer's local state file.`
 }
 

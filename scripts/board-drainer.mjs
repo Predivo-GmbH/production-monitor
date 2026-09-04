@@ -266,6 +266,11 @@ const runStats = {
   dispatchable: 0,    // passed the severity bar and not parked — work the drainer MAY take
   dispatched: 0,      // agents actually launched this run
   parked: 0,          // at the attempt ceiling: suppressed, deliberately (excludes the one revived below)
+  parked_keys: [],    // source/key of each STILL-suppressed parked finding (2026-09-04). The
+                      // parks-unpublished check compares these KEYS against the rows carrying
+                      // detail.parked=true, not bare counts — so a stale parked=true stranded on a
+                      // departed row can no longer subtract from the gap and hide a real unpublished
+                      // park. Matches `parked` exactly (excludes the one revived by the 24h retry).
   parked_retry: null, // the one parked key handed back to the agent this run, or null (Plan B B3.2)
   parked_handed_over: 0, // parked findings routed to the work board this run (2026-09-02, 3a-bis).
                          // Without it, "parked: 0" cannot be told apart from a clean board, and
@@ -2908,6 +2913,10 @@ async function main() {
   // the exact 30-hour failure, and it is invisible to any alarm that only asks "did it run?".
   runStats.dispatchable = eligible
   runStats.parked = parked.length
+  // Publish WHICH keys are parked, not just how many. `parked` here already excludes the one the
+  // 24h retry revived (see selectWorkQueue), so this set matches runStats.parked and is the exact
+  // population the parks-unpublished check names as un-nameable when a flag write fails to land.
+  runStats.parked_keys = parked.map((e) => `${e.inc.source}/${e.inc.key}`)
   runStats.parked_retry = parkedRetry ? `${parkedRetry.inc.source}/${parkedRetry.inc.key}` : null
   runStats.escalated = toEscalate.length
   if (belowBar) log(`  severity threshold '${THRESHOLD}': ${belowBar} item(s) below the bar, classified and logged above but not dispatched.`)

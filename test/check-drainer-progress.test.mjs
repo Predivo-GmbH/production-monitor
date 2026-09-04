@@ -396,6 +396,46 @@ t('THE 3-SECOND RACE (2026-09-04): a parked row the closer momentarily resolved 
   assert.notEqual(j.verdict, 'parks-unpublished')
 })
 
+t('THE STALE-FLAG MASK (2026-09-04): a parked=true stranded on a departed row cannot hide a real unpublished park', () => {
+  // 43a1c78 fixed the race by reading detail.parked=true across ALL states, but left assertion 6 as
+  // a bare COUNT: `gap = parked - parkedPublished.length`. A stale flag on a resolved/closed row
+  // (detail MERGES on resolve, board-drainer.mjs:582) then subtracts from the gap. Here: 2 active
+  // parked, only 1 (commit-review/a) published its flag — the exact failed-flag-write assertion 6
+  // exists to catch — plus 1 stale flag on a departed row (healthchecks/gone). By count,
+  // parkedPublished=2 and 2-2=0, so the check would stay GREEN while commit-review/b is nameable to
+  // nobody. Comparing KEYS (detail.parked_keys) is immune: the stale key matches no parked key.
+  const parkedRows = [
+    { source: 'commit-review', key: 'a', detail: { parked: true } },                        // published, still active
+    { source: 'healthchecks', key: 'gone', state: 'resolved', detail: { parked: true } },   // STALE flag on a departed row
+  ]
+  const board = summariseBoard([row('commit-review', 'a'), row('commit-review', 'b')], { parkedRows })
+  assert.equal(board.parkedPublished.length, 2, 'the stale flag inflates the published count to equal the parked count')
+  const j = judgeDrainer({
+    heartbeat: { last_seen_at: ago(10), detail: {
+      considered: 5, parked: 2, parked_keys: ['commit-review/a', 'commit-review/b'],
+      dispatchable: 0, dispatched: 0, last_dispatch_at: ago(30),
+    } },
+    board, now: NOW,
+  })
+  assert.equal(j.verdict, 'parks-unpublished', 'a stale flag on a departed row must NOT hide the real unpublished park')
+  assert.match(j.summary, /commit-review\/b/, 'the park that cannot be named is reported by key')
+  assert.doesNotMatch(j.summary, /commit-review\/a/, 'the published park is not falsely reported as un-nameable')
+})
+
+t('the pre-parked_keys count fallback still fires the honest direction (no keys published yet)', () => {
+  // A heartbeat that predates parked_keys (older drainer, or the first run after this deploy) falls
+  // back to the count comparison. It must still catch the plain case — more parked than published —
+  // even though it cannot yet defeat the stale-flag mask. This self-heals the moment the drainer
+  // publishes parked_keys on its next real run.
+  const j = judgeDrainer({
+    heartbeat: { last_seen_at: ago(10), detail: { considered: 40, parked: 6, dispatchable: 0, dispatched: 0, last_dispatch_at: ago(30) } },
+    board: { active: 40, findings: 40, inReach: 40, outOfReach: [], parkedPublished: ['a/1'] },
+    now: NOW,
+  })
+  assert.equal(j.verdict, 'parks-unpublished')
+  assert.match(j.summary, /only 1 row/)
+})
+
 t('the page agreeing with the drainer is not an alarm', () => {
   const j = judgeDrainer({
     heartbeat: { last_seen_at: ago(10), detail: { considered: 40, parked: 2, dispatchable: 0, dispatched: 0, last_dispatch_at: ago(30) } },
