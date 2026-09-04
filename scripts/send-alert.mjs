@@ -1,6 +1,6 @@
 import { createMailTransport } from './lib/smtp.mjs'
 import { sendOrEscalate } from './lib/alert-fallback.mjs'
-import { extractFailures, canaryRows, deriveFailures, isNoDetailFallback, failedStepRows, isCleanCancelledRun, NO_REPORT_PROJECT } from './lib/parse-failures.mjs'
+import { extractFailures, canaryRows, deriveFailures, isNoDetailFallback, failedStepRows, isCleanCancelledRun, isUnreachableRun, NO_REPORT_PROJECT } from './lib/parse-failures.mjs'
 import { previousDedupView, shouldSuppressAlert } from './lib/alert-dedup.mjs'
 import { readFileSync, existsSync } from 'fs'
 import { execSync } from 'child_process'
@@ -114,6 +114,8 @@ if (hasAutoFixes) {
 // non-test step failure sets failure()=true (RUN_WAS_CANCELLED false) → we still page; any real
 // spec/canary row is non-synthetic → we still page. RUN_WAS_CANCELLED = `cancelled() && !failure()`
 // is passed by monitor.yml; when absent (manual run / other caller) this never suppresses.
+const unreachableRun = isUnreachableRun(failures)
+
 if (isCleanCancelledRun(failures, { cancelledNoFailure: process.env.RUN_WAS_CANCELLED === 'true' }) && !hasAutoFixes) {
   console.log('Run was cancelled with no failed test, canary, or step (supersede or job-timeout over a green run) — nothing to alert. Not sending.')
   process.exit(0)
@@ -261,7 +263,9 @@ if (allFixed) {
   // "failure(s)", not "test(s)": a row here can be a failed non-test STEP or a canary, and
   // calling a step failure a failed test is the 2026-08-30 "1 test(s) failed when every test
   // passed" incident. The table names exactly what broke.
-  headerSubtitle = `${failures.length} failure(s) across ${Object.keys(projectGroups).length} project(s)`
+  headerSubtitle = unreachableRun
+    ? `${failures.length} check(s) never ran — every one failed at the first page load, so the runner could not reach the host. This is NOT ${Object.keys(projectGroups).length} product outages.`
+    : `${failures.length} failure(s) across ${Object.keys(projectGroups).length} project(s)`
 }
 
 const html = `
@@ -339,7 +343,14 @@ const subject = allFixed
   ? `[AUTO-FIXED] ${autoFixCount} issue(s) resolved automatically`
   : hasAutoFixes
     ? `[PARTIAL FIX] ${failures.length} issue(s) need attention, ${autoFixCount} auto-fixed`
-    : `[ALERT] ${failures.length} failure(s) — ${projectSummary}`
+    : unreachableRun
+      // EVERY failure was a page.goto timeout: the runner never reached the host, so nothing
+      // downstream was tested. Saying "33 failure(s) across 6 project(s)" invents six product
+      // outages out of one unreachable runner - measured 2026-09-03, when the six sites answered
+      // 200/301 from another machine minutes later. Still alerted, because an unreachable host
+      // matters; only the sentence changes.
+      ? `[ALERT] the monitor could not reach any product - ${failures.length} check(s) never ran`
+      : `[ALERT] ${failures.length} failure(s) — ${projectSummary}`
 
 // Building the transport is INSIDE the guarded call on purpose. createMailTransport resolves and
 // pins the MX host's A record, so a DNS or connect failure throws HERE, before sendMail is ever

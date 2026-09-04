@@ -161,6 +161,31 @@ export function isNoDetailFallback(failures = []) {
  * @param {{cancelledNoFailure?: boolean}} opts  cancelledNoFailure = `cancelled() && !failure()`
  * @returns {boolean} true = suppress the alert (clean cancellation, nothing is wrong)
  */
+/**
+ * Did EVERY failure in this run happen before the browser reached the product at all?
+ *
+ * page.goto is the FIRST navigation. When every single failure carries that timeout, the runner
+ * could not reach the host and NOTHING downstream was tested. Measured 2026-09-03/04: a run where
+ * the runner could not reach 80.74.145.155 produced "[ALERT] 33 failure(s) - Arivioo (4),
+ * BackOffice (11), BoatBuddy (4), Distribution-OS (7), Jass-Tour (5), LaunchReady (2)", every one
+ * of them a page.goto timeout, while the six sites answered 200/301 from another machine minutes
+ * later. Six products did not break; one runner could not see them.
+ *
+ * publish-check-results.mjs already abstains for this case on the DASHBOARD side (51eeed1). This
+ * is the same defect in the other consumer: the alert counts SPECS, not fields, so the mail kept
+ * saying 33 failures after the dashboard had stopped saying it.
+ *
+ * NOT a suppression. An unreachable host is worth telling him about - it is the SENTENCE that is
+ * wrong, not the alert. The caller rewrites the subject instead of dropping the mail, because
+ * silencing this would hide a real outage.
+ */
+export function isUnreachableRun(failures) {
+  const list = Array.isArray(failures) ? failures : []
+  if (list.length === 0) return false
+  const goto = new RegExp(String.raw`page\.goto:\s*(Timeout|net::)`, 'i')
+  return list.every((f) => goto.test(stripAnsi(String(f?.error ?? ''))))
+}
+
 export function isCleanCancelledRun(failures, { cancelledNoFailure } = {}) {
   if (!cancelledNoFailure) return false
   if (!Array.isArray(failures)) return false
