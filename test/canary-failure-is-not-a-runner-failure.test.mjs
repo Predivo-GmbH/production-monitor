@@ -118,6 +118,22 @@ console.log('\nSHAPE — the runner routes the monitor path through this decisio
     assert.match(src, /if \(isNonTestStepFailure\(resultsRaw\)\)[\s\S]{0,400}state\.lastHandledRun = run\.databaseId[\s\S]{0,200}return/,
       'the branch must record handled (dedup) and return before the agent/attempt block')
   })
+
+  // THE ZERO-JOBS HOLE. A run GitHub refused has 0 jobs, so no test-results artifact exists and the
+  // isNonTestStepFailure guard above can never reach it (its report is absent, not clean → it stays
+  // conservative and reds the check). The runner must fence that case separately, up front, by the
+  // job count — and it must do so BEFORE the download/agent block, else the false red is back.
+  // Live: 2026-09-04 12:33Z run #33873320876 (0 jobs) flapped agenttriage-localrunner red one tick.
+  ok('a run GitHub REFUSED (0 jobs) is fenced by job count and returns BEFORE the download/agent block', () => {
+    assert.match(src, /jobCount\(run\.databaseId\) === 0/, 'the monitor path must short-circuit a zero-job run')
+    // The zero-job branch dedups and returns, so no attempt is recorded and the verdict stays green.
+    assert.match(src, /if \(jobCount\(run\.databaseId\) === 0\)[\s\S]{0,500}state\.lastHandledRun = run\.databaseId[\s\S]{0,200}return/,
+      'the branch must record handled (dedup) and return before recording any attempt')
+    const jobGate = src.indexOf('jobCount(run.databaseId) === 0')
+    const download = src.indexOf('gh run download ${run.databaseId}') // the actual call, not the comment
+    assert.ok(jobGate > 0 && download > jobGate,
+      'the zero-job fence must sit BEFORE the artifact download — a refused run has no artifact to fetch')
+  })
 }
 
 console.log(`\n${failures === 0 ? 'PASS' : 'FAIL'} — ${failures} failing assertion(s)\n`)

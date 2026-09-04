@@ -83,6 +83,17 @@ function log(msg) {
 function loadState() { try { return JSON.parse(readFileSync(STATE, 'utf-8')) } catch { return {} } }
 function saveState(s) { try { writeFileSync(STATE, JSON.stringify(s, null, 2)) } catch { /* noop */ } }
 
+// How many jobs GitHub actually STARTED for a run. 0 = GitHub refused the workflow and dispatched
+// nothing (an expression it parses but rejects, a concurrency cancel before dispatch). Returns null
+// when the count can't be read, so a caller stays conservative on an API hiccup rather than
+// guessing "refused".
+function jobCount(runId) {
+  try {
+    const n = parseInt(sh(`gh api repos/${REPO}/actions/runs/${runId}/jobs --jq .total_count`).trim(), 10)
+    return Number.isFinite(n) ? n : null
+  } catch (e) { log(`could not read job count for #${runId}: ${e.message.split('\n')[0]}`); return null }
+}
+
 // Pristine clone of THIS repo (isolated from Roger's own working copy), refreshed to origin/master.
 function refreshClone() {
   if (!existsSync(join(WORKDIR, '.git'))) {
@@ -121,6 +132,24 @@ function triageMonitor(state) {
   }
 
   log(`monitor run #${run.databaseId} FAILED — triaging locally on the subscription${DRY ? ' [DRY RUN]' : ''}...`)
+
+  // 2b. A run GitHub REFUSED starts ZERO jobs: it dispatched no test job, so no spec executed and
+  //     there is no test-results artifact to fetch. conclusion=failure, but nothing in the local
+  //     spec-triage tier's scope ran. That death is the MONITOR's own, owned by its no-jobs alert
+  //     (deriveFailures + the a-refused-workflow ratchet, 68d1915). isNonTestStepFailure can't see
+  //     it — its report is absent, not just clean, so that guard stays conservative (→ run the
+  //     agent → no verdict → this dead-man reds). Zero jobs is UNAMBIGUOUS proof no spec ran, so it
+  //     is safe to treat as out-of-scope and stay green, exactly like a non-test-step failure.
+  //     Live: 2026-09-04 12:33Z run #33873320876 (0 jobs) flapped agenttriage-localrunner red for
+  //     one tick. Null (couldn't read the count) falls through to the normal conservative path.
+  if (jobCount(run.databaseId) === 0) {
+    log(`monitor run #${run.databaseId} was refused by GitHub — 0 jobs ran, so no spec executed and there is no artifact to triage; the monitor's own no-jobs alert owns it, nothing in the local triage tier's scope`)
+    state.lastHandledRun = run.databaseId
+    state.lastHandledAt = new Date().toISOString()
+    saveState(state)
+    log(`done with run #${run.databaseId}`)
+    return
+  }
 
   // 3. pristine clone
   try {
