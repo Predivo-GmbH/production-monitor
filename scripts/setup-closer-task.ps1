@@ -69,7 +69,13 @@ if (-not (Test-Path $runner)) { throw "Runner not found: $runner" }
 # (the laptop is not roger_rwjnmnz) and a hardcoded profile path here would silently cover nothing.
 # `testRoots()` UNIONS this with C:\Business\Internal Projects rather than replacing it — it used
 # to replace, which meant this very line would have turned every product row unevaluatable.
-$extraRoots = @((Join-Path $HOME '.claude\scripts'), 'C:\ClaudeShared\scripts') -join ';'
+# THE PARENT FOLDERS, NOT THE `scripts` SUBFOLDER. First registered 2026-09-04 pointing at
+# `.claude\scripts` and `ClaudeShared\scripts`, and the very next run still refused
+# `C:/ClaudeShared/memory-tree-no-secrets.test.mjs` — which sits directly in ClaudeShared, not
+# under scripts. A root that is one folder too deep fails EXACTLY like no root at all: the row
+# is recorded UNKNOWN, never FAIL, and reads as "could not be checked" rather than "was not
+# allowed to be checked". Widened to the two trees themselves.
+$extraRoots = @((Join-Path $HOME '.claude'), 'C:\ClaudeShared') -join ';'
 
 $cmd = ('/c set "CLOSER_CONFIRM=1" && set "CLOSER_TEST_ROOTS={2}" && "{0}" "{1}"' -f $node, $runner, $extraRoots)
 $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument $cmd
