@@ -576,19 +576,45 @@ export async function sweep(items, { deps = {}, offer = null, max = Infinity } =
   return buckets
 }
 
-/** Which items this job may look at at all, and why each rejected one was rejected. */
+/**
+ * Which items this job may look at at all, and why each rejected one was rejected.
+ *
+ * THREE LISTS, NOT TWO — AND THE THIRD IS THE ONE THAT TAKES WORK OFF ROGER.
+ *
+ * Measured on the live board 2026-09-04: of 31 open rows carrying a finish-test that had NEVER
+ * been evaluated, 20 are `kind: human` and correctly none of a machine's business — but **eleven
+ * carry a machine-checkable check and had never once been run**, because they are owed to Roger
+ * and this function dropped them before `sweep` ever saw them.
+ *
+ * JUDGING IS NOT ACTING, AND CONFLATING THEM COST HIM HIS OWN LANE. A row owed to Roger must
+ * never be CLOSED by a machine — that rule is absolute and unchanged. But refusing to LOOK at it
+ * is a different thing entirely, and it has a cost he pays: the world moves on, the question
+ * becomes moot, and nothing anywhere notices. His lane can only ever grow. A verdict written onto
+ * a blocked row costs him nothing and can tell him "the thing you were going to decide has
+ * already resolved itself" — which is the only way a lane of questions gets shorter without him
+ * answering every one of them.
+ *
+ * So: `judgeOnly` rows are swept with no `offer`, their verdict is recorded, and they are never
+ * handed to `workClose`. `untouchable` keeps its original meaning — rows nothing here looks at,
+ * which now means the wrong status, or owed to him with no machine check to run.
+ */
 export function selectItems(rows) {
   const actionable = []
+  const judgeOnly = []
   const untouchable = []
   for (const r of rows || []) {
     if (UNTOUCHABLE_STATUSES.includes(r.status)) { untouchable.push(r); continue }
     if (!ACTIONABLE_STATUSES.includes(r.status)) { untouchable.push(r); continue }
     // A question addressed to Roger is his to answer, whatever the finish-test says. Held here
     // rather than at the close, so it never reaches workClose and never shows up as a near-miss.
-    if (isOwedToRoger(r)) { untouchable.push(r); continue }
+    if (isOwedToRoger(r)) {
+      if (r.done_when !== null && r.done_when !== undefined) judgeOnly.push(r)
+      else untouchable.push(r)
+      continue
+    }
     actionable.push(r)
   }
-  return { actionable, untouchable }
+  return { actionable, judgeOnly, untouchable }
 }
 
 // ── I/O ──────────────────────────────────────────────────────────────────────────────────────
@@ -987,8 +1013,9 @@ async function main() {
     return v.code
   }
 
-  const { actionable, untouchable } = selectItems(rows)
+  const { actionable, judgeOnly, untouchable } = selectItems(rows)
   console.log(`  board: ${rows.length} open item(s); ${actionable.length} this job may act on, ` +
+    `${judgeOnly.length} owed to Roger but carrying a machine check (judged, never closed), ` +
     `${untouchable.length} left alone (${UNTOUCHABLE_STATUSES.join('/')})`)
 
   // A row in his lane that asks him nothing costs him exactly as much attention as a real
@@ -1017,6 +1044,21 @@ async function main() {
   const { results, passes, fails, unknowns, skipped, outcomes } = swept
   const evaluated = results.filter((r) => r.f.state !== SKIP)
 
+  // HIS ROWS ARE JUDGED, NEVER CLOSED. No `offer` is passed, so nothing here can reach workClose;
+  // the only effect is a verdict written onto the row. Eleven rows on the live board carried a
+  // machine-checkable check and had never once been run, because they were dropped before the
+  // sweep. A question that the world has already answered stays in his lane for ever otherwise.
+  const hisSwept = await sweep(judgeOnly, { offer: null })
+  if (hisSwept.results.length) {
+    const hisPasses = hisSwept.passes
+    console.log(`  HIS LANE, JUDGED: ${hisSwept.results.length} check(s) run on rows owed to Roger — ` +
+      `${hisPasses.length} now pass, ${hisSwept.fails.length} do not, ${hisSwept.unknowns.length} could not be judged. ` +
+      'None was closed and none can be.')
+    for (const r of hisPasses) {
+      console.log(`     MOOT?    ${r.item.slug}: its check now passes — the decision he is holding may already be settled`)
+    }
+  }
+
   for (const r of unknowns) console.log(`     UNKNOWN  ${r.item.slug}: ${r.f.reason}`)
   for (const r of fails) console.log(`     not yet  ${r.item.slug}: ${r.f.reason}`)
   for (const r of skipped) console.log(`     for Roger  ${r.item.slug}: ${r.f.reason}`)
@@ -1043,7 +1085,7 @@ async function main() {
   // done_checked_at from a run that changed nothing would be a claim the board never earned.
   // Failures are reported, never thrown: bookkeeping must not undo a close that already happened.
   if (!dry) {
-    const stamped = await recordEvaluations(swept.results)
+    const stamped = await recordEvaluations(swept.results.concat(hisSwept.results))
     console.log(`  recorded on the board: ${stamped.written} verdict(s) written` +
       `${stamped.failed.length ? `, ${stamped.failed.length} FAILED (${stamped.failed.slice(0, 3).join('; ')})` : ''}`)
   }

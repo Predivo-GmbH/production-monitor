@@ -820,6 +820,40 @@ t('DEFECT: selectItems must HOLD the owed row, not merely refuse it at the close
   assert.deepEqual(untouchable.map((r) => r.slug).sort(), ['owed', 'parked'])
 })
 
+t('a row owed to Roger that carries a machine check is JUDGED, never closed', () => {
+  // Measured on the live board 2026-09-04: 31 open rows carried a finish-test that had NEVER been
+  // evaluated. 20 were kind:human and correctly none of a machine's business — but ELEVEN carried
+  // a machine-checkable check and had never once been run, because selectItems dropped them before
+  // sweep ever saw them. Judging is not acting. A verdict on a blocked row costs him nothing and
+  // is the only way a lane of questions gets SHORTER without him answering every one of them.
+  const { actionable, judgeOnly, untouchable } = selectItems([
+    { slug: 'his-with-check', status: 'blocked', blocked_question: 'yes or no?', done_when: { kind: 'query_returns_no_rows' } },
+    { slug: 'his-no-check', status: 'blocked', blocked_question: 'yes or no?' },
+    { slug: 'his-null-check', status: 'blocked', blocked_owner: 'roger', done_when: null },
+    { slug: 'plain', status: 'next', done_when: { kind: 'test_exits_zero' } },
+    { slug: 'parked', status: 'awaiting_signoff', done_when: { kind: 'test_exits_zero' } },
+  ])
+  assert.deepEqual(actionable.map((r) => r.slug), ['plain'],
+    'nothing owed to Roger may ever enter the list this job acts on')
+  assert.deepEqual(judgeOnly.map((r) => r.slug), ['his-with-check'],
+    'only his rows that actually have a machine check to run')
+  assert.deepEqual(untouchable.map((r) => r.slug).sort(), ['his-no-check', 'his-null-check', 'parked'],
+    'his rows with nothing to run stay untouched, and a parked row is still off-limits by status')
+})
+
+ta('judging his rows can never close one: sweep with no offer produces no outcome', async () => {
+  const spy = boardSpy()
+  const s = await sweep(
+    [item({ slug: 'his-passing', done_when: { kind: 'url_answers', args: { url: 'https://example.invalid/', status: 200 } } })],
+    { deps: healthy(), offer: null },
+  )
+  assert.equal(s.outcomes.length, 0, 'no offer, so nothing was ever handed to the board')
+  assert.equal(s.deferred, 0)
+  assert.equal(spy.calls.close.length, 0, 'and workClose was never reached')
+  assert.equal(spy.calls.offers.length, 0, 'the offer path was not entered at all')
+  assert.equal(s.results.length, 1, 'but the check WAS run, which is the whole point')
+})
+
 await Promise.all(pending)
 
 console.log(`\n${n} tests passed.`)
