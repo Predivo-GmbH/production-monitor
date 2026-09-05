@@ -266,11 +266,27 @@ export function classify(fingerprints, known, hints = new Map()) {
 }
 
 /**
+ * Reserved names that can NEVER be a live outside service. RFC 2606 / RFC 6761 set aside
+ * example.com/.net/.org and the TLDs .example/.test/.invalid/.localhost precisely so they can
+ * appear in code as placeholders without ever resolving to someone's real server. A URL built
+ * on one is a fixture or a doc sample, not a vendor — `app.example.com` in a test file is the
+ * textbook case. Reporting them is pure noise: there is no tools-list row that could ever make
+ * the finding go away, so it would sit `confirmed` forever. localhost/*.local are the same idea.
+ */
+export function isReservedExampleHostname(host) {
+  if (host === 'localhost') return true
+  if (/(^|\.)example\.(com|net|org)$/.test(host)) return true
+  if (/\.(example|test|invalid|localhost|local)$/.test(host)) return true
+  return false
+}
+
+/**
  * A hostname we have never seen is usually a documentation link, not a vendor. Only hostnames
  * that look like an API endpoint are worth reporting; everything else would bury the real
  * findings under every MDN link in the codebase.
  */
 export function isReportableHostname(host) {
+  if (isReservedExampleHostname(host)) return false    // RFC-reserved placeholder, never a vendor
   if (/^(api|app|server|cloud|dashboard)\./.test(host)) return true
   if (/\.(googleapis|supabase)\.(com|co)$/.test(host)) return false     // covered by their own rows
   return false

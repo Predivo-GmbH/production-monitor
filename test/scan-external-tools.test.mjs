@@ -102,6 +102,21 @@ test('only endpoint-shaped hostnames are worth reporting', () => {
   assert.equal(isReportableHostname('xyz.supabase.co'), false)      // covered by the Supabase row
 })
 
+test('RFC-reserved example/test hostnames are never a vendor, even when endpoint-shaped', () => {
+  // app.example.com is the textbook placeholder — endpoint-shaped, so the app./api. rule would
+  // otherwise report it. It can never resolve to a real service, and no tools-list row could
+  // ever clear the finding, so it must not be reportable in the first place.
+  assert.equal(isReportableHostname('app.example.com'), false)
+  assert.equal(isReportableHostname('api.example.org'), false)
+  assert.equal(isReportableHostname('example.com'), false)
+  assert.equal(isReportableHostname('app.acme.test'), false)
+  assert.equal(isReportableHostname('api.internal.localhost'), false)
+  assert.equal(isReportableHostname('server.dev.invalid'), false)
+  assert.equal(isReportableHostname('localhost'), false)
+  // A real vendor whose name merely CONTAINS "example" as a label is still reported.
+  assert.equal(isReportableHostname('api.example-vendor.com'), true)
+})
+
 test('npm packages never raise a finding, env vars and secrets always do', () => {
   assert.equal(isReportable({ kind: 'npm_package', pattern: 'left-pad' }), false)
   assert.equal(isReportable({ kind: 'env_var', pattern: 'NEW_THING_KEY' }), true)
