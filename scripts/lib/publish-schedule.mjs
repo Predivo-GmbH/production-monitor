@@ -28,7 +28,13 @@ const PS = [
 
 /** Ask the scheduler. Returns the raw JSON text; throws if PowerShell is not there or refuses. */
 export function readSchedulerJson() {
-  return execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', PS], { encoding: 'utf8', timeout: 60_000 })
+  // ENCODED, NOT -Command. The first real run on the laptop (2026-09-05) reported "scheduler
+  // unreadable: Command failed: powershell.exe ... -Command Get-Scheduled" - a multi-line script
+  // handed to -Command is cut at the first newline by the shell that spawns it. -EncodedCommand
+  // carries the whole script as one base64 token, which is also how the same read already worked
+  // over SSH the same morning. Quoting is not a detail; it is where three reads failed today.
+  const encoded = Buffer.from(PS, 'utf16le').toString('base64')
+  return execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], { encoding: 'utf8', timeout: 60_000 })
 }
 
 /**
