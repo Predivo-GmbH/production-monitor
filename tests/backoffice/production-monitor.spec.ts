@@ -1,6 +1,7 @@
 import { test, expect } from '@playwright/test'
 import { loginViaMagicLink, ensureTestUser } from '../../lib/auth'
 import { waitForOtpEmail, describeOtpFailure, MailboxUnreachableError } from '../../lib/imap'
+import { skipOrStand } from '../../lib/retrySkip'
 import { createClient } from '@supabase/supabase-js'
 import {
   projectRefFromUrl,
