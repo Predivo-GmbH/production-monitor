@@ -18,12 +18,23 @@ import { hostname } from 'node:os'
 /** Only the tasks that touch the board or feed it. Everything else on the laptop is not "Claude". */
 export const BOARD_TASK_PATTERN = /Board|Closer|Night|Drainer|Advancer|Verify Sweep|Triage|Inbox|Brain|KB|Commit|Measure|Monthly|Autofix|Engine|Google Issues|Work On It/i
 
+// ONE BAD TASK MUST NOT BLANK THE SCHEDULE. The first two real runs on the laptop failed inside
+// this script: a Windows task reports LastTaskResult 2147943568, which overflows an [int] cast and
+// throws, and a throw anywhere ended the whole read with exit 1. So each task is read inside its own
+// try, the result is a [long], and a task that still cannot be read is skipped - the board then
+// shows the machines it could read rather than none.
 const PS = [
-  "Get-ScheduledTask | ForEach-Object {",
-  "  $i = $_ | Get-ScheduledTaskInfo",
-  "  $trig = ($_.Triggers | ForEach-Object { if ($_.Repetition.Interval) { 'every ' + $_.Repetition.Interval } elseif ($_.StartBoundary) { 'daily at ' + ([datetime]$_.StartBoundary).ToString('HH:mm') } else { 'once' } }) -join ' / '",
-  "  [pscustomobject]@{ name=$_.TaskName; state=[string]$_.State; cadence=$trig; next=$(if ($i.NextRunTime) { $i.NextRunTime.ToString('o') } else { $null }); last=$(if ($i.LastRunTime -and $i.LastRunTime.Year -gt 2000) { $i.LastRunTime.ToString('o') } else { $null }); result=[int]$i.LastTaskResult }",
-  "} | ConvertTo-Json -Compress",
+  "$ErrorActionPreference = 'Continue'",
+  "$out = @()",
+  "foreach ($t in Get-ScheduledTask) {",
+  "  try {",
+  "    $i = $t | Get-ScheduledTaskInfo",
+  "    $trig = ($t.Triggers | ForEach-Object { if ($_.Repetition.Interval) { 'every ' + $_.Repetition.Interval } elseif ($_.StartBoundary) { 'daily at ' + ([datetime]$_.StartBoundary).ToString('HH:mm') } else { 'once' } }) -join ' / '",
+  "    $out += [pscustomobject]@{ name=$t.TaskName; state=[string]$t.State; cadence=$trig; next=$(if ($i.NextRunTime) { $i.NextRunTime.ToString('o') } else { $null }); last=$(if ($i.LastRunTime -and $i.LastRunTime.Year -gt 2000) { $i.LastRunTime.ToString('o') } else { $null }); result=[long]$i.LastTaskResult }",
+  "  } catch { }",
+  "}",
+  "$out | ConvertTo-Json -Compress",
+  "exit 0",
 ].join('\n')
 
 /** Ask the scheduler. Returns the raw JSON text; throws if PowerShell is not there or refuses. */
