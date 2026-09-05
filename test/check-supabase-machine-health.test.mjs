@@ -15,7 +15,7 @@
 import assert from 'node:assert'
 import fs2 from 'node:fs'
 import { spawnSync } from 'node:child_process'
-import { metricValue, exitDecision, discover, blindSignal, coverageGaps, missingFindings, productionOnly, loadBaseline, escalation, diskSignal, diskKey, recoveredKeys, recoverySignal, dedupeByRef } from '../scripts/check-supabase-machine-health.mjs'
+import { metricValue, exitDecision, discover, blindKey, blindSignalFor, recoveredBlindKeys, blindRecoverySignal, legacyBlindRecoverySignal, LEGACY_BLIND_KEY, coverageGaps, missingFindings, productionOnly, loadBaseline, escalation, diskSignal, diskKey, recoveredKeys, recoverySignal, dedupeByRef } from '../scripts/check-supabase-machine-health.mjs'
 
 let passed = 0
 let failed = 0
@@ -205,23 +205,94 @@ check('identical counters between samples must NOT read as 0.00 MB/s OK', () => 
 // Both regressions come from 986d205, which moved the "we found something" path onto the
 // signals board and left the "we could not look" path behind. See blindSignal()'s comment.
 
-check('blindSignal returns null when every machine was readable', () => {
-  assert.equal(blindSignal([{ product: 'ReplyFlow', level: 'ok' }, { product: 'Valrano', level: 'fail' }]), null,
-    'a readable fleet must not file a blindness row')
+// --- BLINDNESS DEBOUNCE + RECOVERY (2026-09-05, 2nd drain of supabase-disk-blind: JASSTOUR 09-01,
+// ARIVIOO now). The predecessor filed ONE aggregate `supabase-disk-blind` row with needs_human on
+// ANY unreadable finding — no consecutive-run debounce — so a single transient metrics-scrape miss
+// (ARIVIOO read fine 12 of the prior 13 runs) filed a paging critical at 03:00 for a machine fine
+// an hour later; and recoveredKeys() only ever resolved `supabase-disk:` keys, so it could never
+// self-clear. Blindness now gets the same two-run debounce + recovery the disk-LOAD path already
+// had (item 62512b15), keyed per machine as `supabase-disk-blind:<product>`. ---
+
+check('BLIND DEBOUNCE: the FIRST time a machine is unreadable files a WARNING that may NOT page', () => {
+  const { consecutive, confirmed } = escalation(undefined)
+  assert.equal(consecutive, 1)
+  assert.equal(confirmed, false, 'THE BUG: one transient scrape miss must not be allowed to ring a phone')
+  const row = blindSignalFor({ product: 'ARIVIOO', detail: 'metrics endpoint returned no usable sample' }, { consecutive, confirmed })
+  assert.equal(row.needs_human, false, 'needs_human is the flag that rings at 03:00 — a single miss must never set it')
+  assert.equal(row.severity, 'warning')
+  assert.equal(row.key, 'supabase-disk-blind:ARIVIOO', 'per-machine key, so the debounce is per machine and stable across runs')
+  assert.match(row.summary, /NOT alerted/, 'and the board row must say so, so a reader is not misled')
 })
 
-check('blindSignal names every blind machine and asks for a human', () => {
-  const row = blindSignal([
-    { product: 'ReplyFlow', level: 'ok' },
-    { product: 'ChannelMover', level: 'unreadable', detail: 'no key configured' },
-    { product: 'YTMigration', level: 'unreadable', detail: 'metrics endpoint returned no usable sample' },
-  ])
-  assert.equal(row.needs_human, true, 'a switched-off watchdog needs a person')
+check('BLIND DEBOUNCE: the SECOND consecutive unreadable run escalates and may page', () => {
+  const prior = { key: 'supabase-disk-blind:ARIVIOO', detail: { consecutive: 1 } }
+  const { consecutive, confirmed } = escalation(prior)
+  assert.equal(consecutive, 2)
+  assert.equal(confirmed, true, 'a machine unreadable across two hourly runs is a genuinely blind watchdog')
+  const row = blindSignalFor({ product: 'ARIVIOO', detail: 'metrics endpoint returned no usable sample' }, { consecutive, confirmed })
+  assert.equal(row.needs_human, true)
   assert.equal(row.severity, 'critical')
-  assert.equal(row.key, 'supabase-disk-blind', 'the key must be stable so repeat sightings update one row')
-  assert.match(row.summary, /ChannelMover/)
-  assert.match(row.summary, /YTMigration/, 'every blind machine must be named, not just the first')
-  assert.match(row.summary, /no key configured/, 'the reason must travel with the row')
+  assert.match(row.title, /2 runs in a row/, 'the title must say what makes it real, not just that it is loud')
+})
+
+check('BLIND STATUS: the HTTP status travels onto the row so 401 vs 429 is diagnosable', () => {
+  const row = blindSignalFor({ product: 'ARIVIOO', detail: 'metrics endpoint returned HTTP 429 — no usable sample', httpStatus: 429 }, { consecutive: 1, confirmed: false })
+  assert.equal(row.detail.httpStatus, 429, 'the code that explains WHY it was unreadable must be on the row')
+  assert.match(row.summary, /HTTP 429/, 'and visible in the human text — the 2026-09-05 drain could not tell 401 from 429 from timeout')
+})
+
+check('BLIND RECOVERY: a machine READ again this run clears its blind row', () => {
+  const open = ['supabase-disk-blind:ARIVIOO', 'supabase-disk-blind:JASSTOUR']
+  const measured = [{ product: 'ARIVIOO', level: 'ok', mbs: 0.26 }]
+  assert.deepEqual(recoveredBlindKeys(open, measured), ['supabase-disk-blind:ARIVIOO'],
+    'reading a usable sample again is exactly what a transient scrape miss does — the row must self-clear')
+})
+
+check('BLIND RECOVERY: any readable level clears blindness (a high-disk read is loud, not blind)', () => {
+  const open = ['supabase-disk-blind:REPLYFLOW']
+  assert.deepEqual(recoveredBlindKeys(open, [{ product: 'REPLYFLOW', level: 'warn', mbs: 9.1 }]), ['supabase-disk-blind:REPLYFLOW'])
+  assert.deepEqual(recoveredBlindKeys(open, [{ product: 'REPLYFLOW', level: 'fail', mbs: 13 }]), ['supabase-disk-blind:REPLYFLOW'],
+    'a machine reading high on disk is no longer BLIND — it has a disk-load row of its own')
+})
+
+check('BLIND RECOVERY: a machine STILL unreadable, or one never sampled, keeps its blind row', () => {
+  const open = ['supabase-disk-blind:ARIVIOO', 'supabase-disk-blind:JASSTOUR']
+  const measured = [{ product: 'VALRANO', level: 'ok' }]  // neither ARIVIOO nor JASSTOUR were read this run
+  assert.deepEqual(recoveredBlindKeys(open, measured), [],
+    '"we did not look" is not "it recovered" — closing on absence turns a blind spot into a clean bill of health')
+  // and an unreadable finding is not a recovery either
+  assert.deepEqual(recoveredBlindKeys(open, [{ product: 'ARIVIOO', level: 'unreadable' }]), [])
+})
+
+check('BLIND RECOVERY never touches the disk-LOAD keys, and disk-LOAD recovery never touches the blind keys', () => {
+  const open = ['supabase-disk:VALRANO', 'supabase-disk-blind:ARIVIOO', 'products-down:ReplyFlow']
+  const measured = [{ product: 'VALRANO', level: 'ok' }, { product: 'ARIVIOO', level: 'ok' }]
+  assert.deepEqual(recoveredKeys(open, measured), ['supabase-disk:VALRANO'], 'the load path owns only supabase-disk:')
+  assert.deepEqual(recoveredBlindKeys(open, measured), ['supabase-disk-blind:ARIVIOO'], 'the blind path owns only supabase-disk-blind:')
+})
+
+check('blindRecoverySignal closes the per-machine row and says what re-reading proved', () => {
+  const r = blindRecoverySignal(blindKey('ARIVIOO'))
+  assert.equal(r.state, 'resolved')
+  assert.equal(r.key, 'supabase-disk-blind:ARIVIOO')
+  assert.match(r.title, /ARIVIOO/)
+  assert.match(r.summary, /again/)
+})
+
+check('MIGRATION: the legacy aggregate row is superseded, so the pre-fix incident self-clears', () => {
+  const r = legacyBlindRecoverySignal()
+  assert.equal(r.key, LEGACY_BLIND_KEY, 'it resolves the exact aggregate key the old code filed')
+  assert.equal(r.key, 'supabase-disk-blind')
+  assert.equal(r.state, 'resolved')
+  assert.match(r.summary, /per machine/, 'and explains it is replaced by the granular rows, not just deleted')
+})
+
+check('a first blind sighting is a WARNING but the RUN is still red (safety floor is not the page)', () => {
+  // exitDecision owns the run-level exit: ANY unreadable machine is non-zero, independent of
+  // whether the per-machine page has confirmed. The debounce lowers the PAGE, never the red run.
+  const d = exitDecision([{ product: 'ARIVIOO', level: 'unreadable' }, { product: 'VALRANO', level: 'ok' }])
+  assert.equal(d.code, 1, 'a blind machine reds the run on the very first sighting — the page waits, the red does not')
+  assert.match(d.message, /ARIVIOO/)
 })
 
 // This one deliberately runs the REAL CLI in a subprocess. A function-level test is exactly

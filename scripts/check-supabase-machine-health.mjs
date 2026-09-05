@@ -154,7 +154,14 @@ async function sample(ref, key) {
   const res = await fetch(`https://${ref}.supabase.co/customer/v1/privileged/metrics`, {
     headers: { Authorization: 'Basic ' + Buffer.from('service_role:' + key).toString('base64') },
   })
-  if (!res.ok) return null
+  // An HTTP error carries WHY the read failed — 401 (key rotated/expired), 429 (scrape rate
+  // limited), 5xx (vendor). It returns a status-only object rather than null so checkMachines()
+  // can put that code on the board and in the log: the 2026-09-05 ARIVIOO blind drain could not
+  // tell 401-vs-429-vs-timeout apart because this path swallowed the status silently. The object
+  // has no `read` field, so the `a.read == null` unreadable guard below still fires exactly as
+  // before. A network throw (timeout, DNS) never reaches here — it is caught to null by the
+  // caller, and a null status reads as "timeout/network".
+  if (!res.ok) return { httpStatus: res.status }
   const t = await res.text()
   return {
     at: Date.now(),
@@ -257,7 +264,11 @@ export async function checkMachines(env = process.env) {
     // A machine we cannot read is reported, not silently skipped: a check that goes quiet
     // when it loses access reads as "all clear", which is the failure mode this file exists for.
     if (!a || !b || a.read == null || b.read == null) {
-      findings.push({ product: t.product, level: 'unreadable', detail: 'metrics endpoint returned no usable sample' })
+      const httpStatus = a?.httpStatus ?? b?.httpStatus ?? null
+      const detail = httpStatus
+        ? `metrics endpoint returned HTTP ${httpStatus} — no usable sample`
+        : 'metrics endpoint returned no usable sample'
+      findings.push({ product: t.product, level: 'unreadable', detail, httpStatus })
       return
     }
     // Counters that did not move at all mean we sampled inside one refresh window, not that
@@ -323,7 +334,10 @@ export function missingFindings(gaps) {
 }
 
 /**
- * The board row for a watchdog that has gone BLIND, as opposed to one that found something.
+ * The board row for a watchdog that has gone BLIND for ONE machine, as opposed to one that found
+ * something. Blindness is now debounced and recovered per machine, exactly like the disk-LOAD
+ * path (escalation()/diskSignal()/recoveredKeys()), because it had neither and that is the whole
+ * bug this replaces.
  *
  * 986d205 routed the "we found something" path onto the signals board, because a bare exit(1)
  * only reds the run and send-alert.mjs reads Playwright's results.json — so the email lists
@@ -331,20 +345,41 @@ export function missingFindings(gaps) {
  * on the old bare-exit route, so the one state that means "this watchdog is switched off for
  * that product" was also the one state nobody could see. Pure, so it is tested without network.
  *
- * This does NOT make blindness green: the caller still exits non-zero afterwards, per the
- * house rule in fleet-signal.mjs that only a failed READ exits non-zero.
+ * THE BUG THIS FIXES (2026-09-05, 2nd drain: JASSTOUR 09-01, ARIVIOO now). The predecessor filed
+ * ONE aggregate `supabase-disk-blind` row with needs_human on ANY unreadable finding — no
+ * consecutive-run debounce — so a single transient metrics-scrape miss on any of 11 machines
+ * (ARIVIOO read fine 12 of the prior 13 runs) filed a paging critical, at 03:00, for a machine
+ * that was fine an hour later. And recoveredKeys() only ever resolved `supabase-disk:` keys, so
+ * the aggregate row could never self-clear. This is the disk-LOAD debounce (item 62512b15,
+ * "the disk alarm can wake you for a machine fine 25 min later") applied to the blindness half:
+ * a first unreadable sighting is a WARNING nobody is woken for that STILL reds the run, and only
+ * the SAME machine unreadable on two consecutive runs may page.
+ *
+ * This does NOT make blindness green: the caller still exits non-zero afterwards on ANY unreadable
+ * machine, per the house rule in fleet-signal.mjs that only a failed READ exits non-zero. Safety
+ * is preserved (every blind run is red); only the 03:00 PAGE waits for confirmation.
  */
-export function blindSignal(findings) {
-  const blind = findings.filter((f) => f.level === 'unreadable')
-  if (!blind.length) return null
+export const blindKey = (product) => `supabase-disk-blind:${product}`
+
+// The single aggregate key this check filed before blindness was tracked per machine. No run
+// files it any more, so an open one would stand open forever; the CLI supersedes it once (see
+// legacyBlindRecoverySignal) in favour of the per-machine rows.
+export const LEGACY_BLIND_KEY = 'supabase-disk-blind'
+
+export function blindSignalFor(f, { confirmed, consecutive }) {
+  const status = f.httpStatus ? ` (HTTP ${f.httpStatus})` : ''
   return signal({
-    key: 'supabase-disk-blind',
-    product: 'fleet',
-    severity: 'critical',
-    needsHuman: true,
-    title: `The Supabase disk watchdog is blind for ${blind.length} machine(s)`,
-    summary: `No disk reading could be taken for: ${blind.map((f) => `${f.product} (${f.detail})`).join(', ')}. For these machines nothing is watching disk IO at all, which is the state the fleet was in on 2026-08-29 when only Supabase's own billing email revealed ScoutCopilot burning 7.74 MB/s. A machine going quiet is not a machine behaving.`,
-    detail: { blind: blind.map((f) => ({ product: f.product, detail: f.detail })) },
+    key: blindKey(f.product),
+    product: f.product,
+    severity: confirmed ? 'critical' : 'warning',
+    needsHuman: confirmed,
+    title: confirmed
+      ? `The Supabase disk watchdog has been blind for ${f.product} on ${consecutive} runs in a row`
+      : `The Supabase disk watchdog could not read ${f.product} once — confirming on the next run`,
+    summary: confirmed
+      ? `No disk reading could be taken for ${f.product}${status} on ${consecutive} consecutive monitor runs (latest: ${f.detail}). For this machine nothing is watching disk IO at all — the state the fleet was in on 2026-08-29 when only Supabase's own billing email revealed ScoutCopilot burning 7.74 MB/s. A machine going quiet on two runs running is not a machine behaving.`
+      : `No disk reading could be taken for ${f.product}${status} in this run (${f.detail}). Filed but NOT alerted: a single scrape miss is not a blind watchdog — the metrics endpoint routinely drops one sample (a 429, a momentary timeout) and reads fine the next run. If the NEXT monitor run also cannot read ${f.product}, this escalates and is allowed to ring. The run is still red now, so the miss is never silently green.`,
+    detail: { product: f.product, reason: f.detail, httpStatus: f.httpStatus ?? null, ref: f.ref ?? null, consecutive, confirmed },
   })
 }
 
@@ -414,6 +449,46 @@ export function recoverySignal(key) {
   }
 }
 
+/**
+ * Blind rows to close: a machine that had an open `supabase-disk-blind:` row and was READ again
+ * this run. Any readable level clears it — a machine reading high on disk is no longer BLIND, it
+ * has a disk-LOAD row of its own. Guarded on genuine re-measurement exactly like recoveredKeys():
+ * a machine still unreadable, or one this run never sampled at all, keeps its open row, because
+ * "we did not look" is not "it recovered" and closing on absence turns a blind spot into a clean
+ * bill of health. This is the recovery path the aggregate `supabase-disk-blind` row never had —
+ * why the ARIVIOO/JASSTOUR transients could file but never self-clear.
+ */
+export function recoveredBlindKeys(openKeys, measuredFindings) {
+  const readableNow = new Set(
+    (measuredFindings ?? []).filter((f) => f.level !== 'unreadable').map((f) => blindKey(f.product)),
+  )
+  return [...(openKeys ?? [])].filter((k) => k.startsWith('supabase-disk-blind:') && readableNow.has(k))
+}
+
+export function blindRecoverySignal(key) {
+  const product = key.slice(`${LEGACY_BLIND_KEY}:`.length)
+  return {
+    source: 'production-monitor', key, kind: 'incident', severity: 'info', state: 'resolved',
+    title: `The Supabase disk watchdog can read ${product} again`,
+    summary: `${product}'s metrics endpoint returned a usable disk reading again, so its watchdog is no longer blind. This cleared on a re-read, which is what a transient scrape miss does.`,
+    link: 'https://cockpit.predivo.ch/signals',
+  }
+}
+
+/**
+ * Supersede the one aggregate `supabase-disk-blind` row this check filed before blindness was
+ * tracked per machine. No run writes that key any more, so without an explicit resolve it stands
+ * open forever; the per-machine rows now carry the true, debounced, self-clearing state.
+ */
+export function legacyBlindRecoverySignal() {
+  return {
+    source: 'production-monitor', key: LEGACY_BLIND_KEY, kind: 'incident', severity: 'info', state: 'resolved',
+    title: 'The fleet-wide "disk watchdog is blind" row is superseded by per-machine rows',
+    summary: `Blindness is now tracked per machine under ${blindKey('<product>')} keys, each of which pages only after the SAME machine is unreadable on two consecutive runs and self-clears when it reads again. This single aggregate row could neither debounce a one-run transient nor recover, which is what filed a paging critical for ARIVIOO (fine 12 of the prior 13 runs). Resolved in favour of the granular rows.`,
+    link: 'https://cockpit.predivo.ch/signals',
+  }
+}
+
 const BO_BASE = 'https://xoecpzfsskalvjrtcbbl.supabase.co'
 
 async function boGet(secret, path) {
@@ -462,34 +537,39 @@ if (process.argv[1] && process.argv[1].endsWith('check-supabase-machine-health.m
   // alert email listing ZERO failures while the real fact appeared nowhere a person looks.
   // Same contract as every neighbouring sensor in monitor.yml: a filed alarm exits 0, and only
   // a failed READ exits non-zero, so one event is never double-reported.
-  // A machine over the line files a board row on the FIRST sighting and is allowed to page only
-  // on the second consecutive one. The previous run's count is read back off the board, which is
-  // the only durable store this check has: the runner is ephemeral, so there is nowhere else a
-  // count could survive between runs. Recovered machines are resolved in the same pass, so the
-  // board reflects the fleet rather than the history of everything that ever spiked.
-  // Guarded on having actually MEASURED something: a run where every machine came back
-  // unreadable has no standing to resolve anybody's row, and must not touch the board at all.
+  // BOTH the over-the-line path AND the blindness path file a board row on the FIRST sighting and
+  // are allowed to page only on the second consecutive one. The previous run's count is read back
+  // off the board, which is the only durable store this check has: the runner is ephemeral, so
+  // there is nowhere else a count could survive between runs. Recovered machines — over-the-line
+  // AND blind — are resolved in the same pass, so the board reflects the fleet rather than the
+  // history of everything that ever spiked or ever missed a scrape.
   const measured = findings.filter((f) => f.level !== 'unreadable')
-  if (measured.length) {
+  if (findings.length) {
     const dry = process.argv.includes("--dry")
     // --dry still READS the board. The read is what decides warning-vs-page, so a preview that
     // skipped it would preview the wrong decision for every machine — which is the whole thing
     // being tested when somebody runs --dry. Only the writes below are suppressed.
     const secret = boardSecret()
 
-    // Read BEFORE writing: once this run files, every key looks "already open".
+    // Read BEFORE writing (once this run files, every key looks "already open") the WHOLE
+    // supabase-disk* family in one query: the disk-LOAD rows (supabase-disk:*), the per-machine
+    // blind rows (supabase-disk-blind:*), and the legacy aggregate (supabase-disk-blind).
+    // `like.supabase-disk*` is SQL LIKE 'supabase-disk%', which matches all three.
     let openRows = []
     try {
-      openRows = await boGet(secret, `fleet_signals?source=eq.production-monitor&key=like.supabase-disk:*&state=eq.open&select=key,detail`)
+      openRows = await boGet(secret, `fleet_signals?source=eq.production-monitor&key=like.supabase-disk*&state=eq.open&select=key,detail`)
     } catch (e) {
-      // A board read failure must not silently downgrade every machine to "first sighting" —
-      // that would switch the pager off for a genuinely sustained breach and read as normal.
+      // A board read failure must not silently downgrade every machine to "first sighting" — that
+      // would switch the pager off for a genuinely sustained breach (load OR blindness) and read
+      // as normal. Both paths fall back to first-sighting warnings below; the run still reds via
+      // exitCode/exit(1), so nothing goes silently green.
       console.error(`::error::could not read the open disk signals, so this run cannot tell a first sighting from a sustained one: ${e.message}`)
       process.exitCode = 1
       openRows = null
     }
     const priorByKey = new Map((openRows ?? []).map((r) => [r.key, r]))
 
+    // disk-LOAD: page only on the second consecutive run over the line.
     for (const f of loud) {
       const { consecutive, confirmed } = escalation(priorByKey.get(diskKey(f.product)))
       const row = diskSignal(f, { confirmed, consecutive })
@@ -498,32 +578,53 @@ if (process.argv[1] && process.argv[1].endsWith('check-supabase-machine-health.m
       console.log(`filed to the cockpit signals board: ${f.product} (run ${consecutive} over the line, ${confirmed ? 'CONFIRMED — may page' : 'unconfirmed — no page'})`)
     }
 
-    // Only resolve what is genuinely open and genuinely quiet now. Never blanket-resolve: a row
-    // closed without its claim being re-measured is the same lie as a row opened without one.
+    // BLINDNESS: the same debounce. A first unreadable sighting of a machine is a WARNING nobody
+    // is woken for; only the SAME machine unreadable on two consecutive runs may page. Every blind
+    // run is still red (the exit below), so safety is preserved — only the 03:00 PAGE waits for
+    // confirmation. This is the ARIVIOO/JASSTOUR one-run-transient fix.
+    for (const f of blind) {
+      const { consecutive, confirmed } = escalation(priorByKey.get(blindKey(f.product)))
+      const row = blindSignalFor(f, { confirmed, consecutive })
+      if (dry) { console.log("[dry] would file: " + row.key + " / " + row.severity + " / " + row.title); continue }
+      try {
+        await fileSignal(secret, row)
+        console.log(`filed to the cockpit signals board: ${row.key} (run ${consecutive} blind, ${confirmed ? 'CONFIRMED — may page' : 'unconfirmed — no page'})`)
+      } catch (e) {
+        console.error(`::error::could not file the blind finding to the board: ${e.message}`)
+      }
+    }
+
+    // Only resolve what is genuinely open and genuinely re-measured this run. Never blanket-resolve:
+    // a row closed without its claim being re-measured is the same lie as a row opened without one.
     if (openRows) {
+      // disk-LOAD recoveries: needs a reading UNDER the line this run.
       for (const key of recoveredKeys(priorByKey.keys(), measured)) {
         if (dry) { console.log(`[dry] would resolve: ${key}`); continue }
         await fileSignal(secret, recoverySignal(key))
         console.log(`recovered: ${key} — signal resolved (measured under ${WARN_MB_S} MB/s this run).`)
       }
-    }
-  }
-  // A machine we could not read is not a clean bill of health, so this one does red the run.
-  // It also files, which the original version did not: "the watchdog is off for this product"
-  // IS a fileable fact, and leaving it on the bare-exit route meant it reached nobody.
-  // Filing never converts it to green, and a board outage while filing must not swallow it.
-  if (blind.length) {
-    const row = blindSignal(findings)
-    if (process.argv.includes('--dry')) {
-      console.log(`[dry] would file: ${row.key} / ${row.severity} / ${row.title}`)
-    } else {
-      try {
-        await fileSignal(boardSecret(), row)
-        console.log(`filed to the cockpit signals board: ${row.key}`)
-      } catch (e) {
-        console.error(`::error::could not file the blind finding to the board: ${e.message}`)
+      // BLINDNESS recoveries: a machine we could READ again this run — the path the old aggregate
+      // row never had, so a transient could file but never self-clear.
+      for (const key of recoveredBlindKeys(priorByKey.keys(), measured)) {
+        if (dry) { console.log(`[dry] would resolve: ${key}`); continue }
+        await fileSignal(secret, blindRecoverySignal(key))
+        console.log(`recovered: ${key} — blind signal resolved (read a usable sample this run).`)
+      }
+      // One-time migration: supersede the single aggregate row no run writes any more, so the
+      // pre-fix `supabase-disk-blind` incident self-clears in favour of the per-machine rows.
+      if (priorByKey.has(LEGACY_BLIND_KEY)) {
+        if (dry) { console.log(`[dry] would resolve: ${LEGACY_BLIND_KEY} (superseded by per-machine rows)`) }
+        else {
+          await fileSignal(secret, legacyBlindRecoverySignal())
+          console.log(`recovered: ${LEGACY_BLIND_KEY} — superseded by per-machine blind rows.`)
+        }
       }
     }
+  }
+  // A machine we could not read is not a clean bill of health, so this reds the run regardless of
+  // whether it paged. The filing above never converts it to green; this is the safety floor that
+  // the per-machine page debounce is deliberately built on top of, not in place of.
+  if (blind.length) {
     console.error(`::error::${blind.length} Supabase machine(s) could not be read — that is not an all-clear: ${blind.map((f) => f.product).join(', ')}`)
     process.exit(1)
   }
