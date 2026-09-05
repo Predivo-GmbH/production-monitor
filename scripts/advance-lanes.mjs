@@ -36,6 +36,7 @@
 import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { readSchedulerJson, toScheduleRows, publishSchedule } from './lib/publish-schedule.mjs'
 
 const CLAUDE_CONFIG = join(homedir(), '.claude.json')
 
@@ -191,6 +192,20 @@ async function main() {
     else console.log(`     FAILED   ${row.slug}: HTTP ${res.status}`)
   }
   if (moving.length > max) console.log(`  LANES_MAX=${max} reached: ${moving.length - max} left for the next run`)
+
+  // THE MACHINE PUBLISHES WHAT IT WILL DO NEXT (2026-09-05). Roger: "when are you going to pick
+  // up? what's next?" No table carried a schedule, so this machine reports its own Task Scheduler
+  // every run. A failure here is reported and never stops the advancer: moving rows is the job,
+  // saying when is the courtesy. Not in --dry, which must leave no trace.
+  if (!dry) {
+    let published = { written: 0, status: 'skipped' }
+    try {
+      published = await publishSchedule(toScheduleRows(readSchedulerJson()), { url, headers: H })
+    } catch (e) {
+      published = { written: 0, status: `scheduler unreadable: ${String(e.message || e).slice(0, 80)}` }
+    }
+    console.log(`  schedule: ${published.written} task(s) published to the board (${published.status})`)
+  }
 
   const verdict = moving.length === 0
     ? `nothing could advance: every one of ${staying.length} row(s) has a stated reason above`
