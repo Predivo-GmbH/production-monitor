@@ -24,6 +24,8 @@ import {
   buildUndeliverableSignal,
   deliverToBoard,
   sendOrEscalate,
+  withdrawUndeliverable,
+  UNDELIVERABLE,
   sendMailCallSites,
   unguardedMailers,
 } from '../scripts/lib/alert-fallback.mjs'
@@ -179,13 +181,115 @@ await t('a stable key, so an ongoing outage dedups instead of filing one signal 
 })
 
 // ── sendOrEscalate: the behaviour that was missing ───────────────────────────────────────
-await t('a successful send files nothing and does not touch the board', async () => {
-  let boardCalls = 0
+await t('a successful send files nothing: with no open "could not email you" row, the board is only read, never written', async () => {
+  let writes = 0
   const r = await sendOrEscalate(async () => 'sent', { subject: 's', failures: [] }, {
-    secret: 'k', fetchImpl: async () => { boardCalls++; return { ok: true, json: async () => ({}) } }, ...quiet,
+    secret: 'k',
+    fetchImpl: async (_u, o) => {
+      if (o?.method === 'POST') writes++
+      return { ok: true, json: async () => [] }   // the read: no row under that key
+    },
+    ...quiet,
   })
   assert.strictEqual(r.delivered, 'smtp')
-  assert.strictEqual(boardCalls, 0, 'the board was written to on a healthy send')
+  assert.strictEqual(writes, 0, 'the board was written to on a healthy send')
+  assert.deepStrictEqual(r.withdrawal, { withdrawn: false, reason: 'never filed' })
+})
+
+// ── withdrawUndeliverable: a delivered mail is the recovery ─────────────────────────────
+//
+// 2026-09-05: send-alert.mjs filed alert-email-undeliverable (CRITICAL, needs_human) at 08:06Z when
+// the runner could not route to the mail host; the next run's resolution mail was DELIVERED at
+// 08:19:56Z and the row stayed open, paging for a server that was answering. Nothing wrote
+// `resolved` because nothing here ever had.
+
+/** A board whose read returns `row` and records every write body. */
+const boardWith = (row, opts = {}) => {
+  const writes = []
+  const fetchImpl = async (u, o) => {
+    if (o?.method === 'POST') {
+      writes.push(JSON.parse(o.body))
+      return opts.writeFails ? { ok: false, status: 503, text: async () => 'down' } : { ok: true, json: async () => ({}) }
+    }
+    assert.match(String(u), /fleet_signals\?/, 'the read went somewhere other than the signals table')
+    assert.match(String(u), /key=eq\.alert-email-undeliverable/, 'the read did not ask for the undeliverable row')
+    if (opts.readFails) return { ok: false, status: 500, text: async () => 'boom' }
+    return { ok: true, json: async () => (row ? [row] : []) }
+  }
+  return { writes, fetchImpl }
+}
+
+await t('an OPEN "could not email you" row is resolved by a successful send — same source, same key, state resolved', async () => {
+  const b = boardWith({ id: 1, state: 'open', key: UNDELIVERABLE.key })
+  const r = await sendOrEscalate(async () => 'sent', { subject: '[RESOLVED] All tests passing again', runUrl: 'https://x/run/1' },
+    { secret: 'k', fetchImpl: b.fetchImpl, ...quiet })
+  assert.strictEqual(r.delivered, 'smtp')
+  assert.deepStrictEqual(r.withdrawal, { withdrawn: true })
+  assert.strictEqual(b.writes.length, 1, `expected exactly one write, got ${b.writes.length}`)
+  const w = b.writes[0]
+  assert.strictEqual(w.source, UNDELIVERABLE.source)
+  assert.strictEqual(w.key, UNDELIVERABLE.key, 'a resolve under a different key would open a NEW row instead of closing the old one')
+  assert.strictEqual(w.state, 'resolved')
+  assert.strictEqual(w.needs_human, false, 'a resolved row must not keep paging')
+  assert.strictEqual(w.severity, 'info')
+  assert.match(w.summary, /\[RESOLVED\] All tests passing again/, 'the withdrawal does not name the mail that proved delivery')
+  assert.strictEqual(w.link, 'https://x/run/1')
+})
+
+await t('an ACKNOWLEDGED row is resolved too (acknowledged is still active on the board)', async () => {
+  const b = boardWith({ id: 1, state: 'acknowledged', key: UNDELIVERABLE.key })
+  const r = await withdrawUndeliverable({ secret: 'k', fetchImpl: b.fetchImpl, ...quiet })
+  assert.deepStrictEqual(r, { withdrawn: true })
+  assert.strictEqual(b.writes.length, 1)
+})
+
+await t('an already-RESOLVED row is left alone: re-stamping it every hour would pollute the self-resolved tile', async () => {
+  const b = boardWith({ id: 1, state: 'resolved', key: UNDELIVERABLE.key })
+  const r = await withdrawUndeliverable({ secret: 'k', fetchImpl: b.fetchImpl, ...quiet })
+  assert.deepStrictEqual(r, { withdrawn: false, reason: 'already resolved' })
+  assert.strictEqual(b.writes.length, 0, 'a settled row was written to again')
+})
+
+await t('a failed READ does not throw and does not turn a delivered mail into an undelivered one', async () => {
+  const b = boardWith(null, { readFails: true })
+  let warned = ''
+  const r = await sendOrEscalate(async () => 'sent', { subject: 's', failures: [] },
+    { secret: 'k', fetchImpl: b.fetchImpl, log: () => {}, errorLog: (m) => { warned += m } })
+  assert.strictEqual(r.delivered, 'smtp', 'the send was reported as anything but delivered')
+  assert.strictEqual(r.withdrawal.withdrawn, false)
+  assert.strictEqual(r.withdrawal.reason, 'error')
+  assert.match(warned, /HTTP 500/, 'the read failure was swallowed without a word')
+  assert.strictEqual(b.writes.length, 0)
+})
+
+await t('a failed WRITE of the resolve does not throw either — the mail went out, the step stays green', async () => {
+  const b = boardWith({ id: 1, state: 'open', key: UNDELIVERABLE.key }, { writeFails: true })
+  const r = await withdrawUndeliverable({ secret: 'k', fetchImpl: b.fetchImpl, ...quiet })
+  assert.strictEqual(r.withdrawn, false)
+  assert.strictEqual(r.reason, 'error')
+  assert.match(r.error, /HTTP 503/)
+})
+
+await t('with no board secret the send still succeeds and the board is not contacted at all', async () => {
+  let calls = 0
+  const r = await sendOrEscalate(async () => 'sent', { subject: 's', failures: [] },
+    { secret: undefined, fetchImpl: async () => { calls++; return { ok: true, json: async () => [] } }, ...quiet })
+  assert.strictEqual(r.delivered, 'smtp')
+  assert.deepStrictEqual(r.withdrawal, { withdrawn: false, reason: 'no-secret' })
+  assert.strictEqual(calls, 0)
+})
+
+await t('the withdrawal is skipped entirely when the send FAILED — a failed mail proves nothing about recovery', async () => {
+  let reads = 0
+  await assert.rejects(
+    sendOrEscalate(async () => { throw new Error('Connection timeout') }, { subject: 's', failures: [] }, {
+      secret: 'k',
+      fetchImpl: async (u, o) => { if (o?.method !== 'POST') reads++; return { ok: true, json: async () => ({}) } },
+      ...quiet,
+    }),
+    /alert email undeliverable/,
+  )
+  assert.strictEqual(reads, 0, 'the undeliverable row was read (and would have been resolved) on a FAILED send')
 })
 
 await t('a failed send files the alarm on the board AND still throws, so the step stays red', async () => {
@@ -299,7 +403,7 @@ const KNOWN_UNGUARDED = [
   'send-drift-alert.mjs',
   'send-heartbeat-alert.mjs',
   'send-mailer-alert.mjs',
-  'send-resolved.mjs',
+  // send-resolved.mjs left this list 2026-09-05: wrapped in sendOrEscalate, BOARD_SUPABASE_SECRET wired.
 ]
 
 const realFiles = readdirSync(SCRIPTS)

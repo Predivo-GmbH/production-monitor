@@ -49,6 +49,10 @@
  */
 
 const SIGNAL_INTAKE = 'https://xoecpzfsskalvjrtcbbl.supabase.co/functions/v1/signal-intake'
+const SIGNALS_REST = 'https://xoecpzfsskalvjrtcbbl.supabase.co/rest/v1/fleet_signals'
+
+/** The one row this file files when mail fails — and the one row only a successful mail can take back. */
+export const UNDELIVERABLE = Object.freeze({ source: 'production-monitor', key: 'alert-email-undeliverable' })
 
 /**
  * Strip any secret VALUE out of text before it is logged or filed.
@@ -322,22 +326,84 @@ export async function deliverToBoard(body, { secret, fetchImpl = fetch, url = SI
 }
 
 /**
+ * Take back the "could not email you" row once a mail has actually gone out.
+ *
+ * A signal filed by this file had no way home. On 2026-09-05 07:38Z the runner lost its route
+ * to the mail host, send-alert.mjs filed `alert-email-undeliverable` as CRITICAL + needs_human at
+ * 08:06Z, and at 08:19:58Z the very next run's resolution email was delivered — proof the server
+ * was reachable again — while the row stayed open on the board, paging for a fault that was
+ * already over. Every neighbouring sensor resolves its own rows on recovery (check-products-down
+ * resolved `products-down:host:80.74.145.155` in that same run); this one did not, because
+ * nothing here ever wrote `resolved`. A delivered mail IS the recovery, so this runs after every
+ * successful send.
+ *
+ * Only an OPEN or ACKNOWLEDGED row is touched: re-posting `resolved` on a settled row every hour
+ * would re-stamp it and pollute the self-resolved tile (the fleet-signal.mjs readSignal rule).
+ *
+ * NEVER THROWS. The mail went out; a bookkeeping failure must not red the step that just proved
+ * delivery, and it must not turn "delivered" into "undelivered" in the caller's eyes.
+ *
+ * @returns { withdrawn: boolean, reason?: string }
+ */
+export async function withdrawUndeliverable({ secret, fetchImpl = fetch, log = console.log, errorLog = console.error, subject, runUrl } = {}) {
+  if (!secret) {
+    log(`no board secret — cannot check whether a ${UNDELIVERABLE.key} signal is still open, so it is left as it is`)
+    return { withdrawn: false, reason: 'no-secret' }
+  }
+  try {
+    const q = `${SIGNALS_REST}?select=id,state,key&source=eq.${encodeURIComponent(UNDELIVERABLE.source)}` +
+      `&key=eq.${encodeURIComponent(UNDELIVERABLE.key)}&limit=1`
+    const res = await fetchImpl(q, {
+      headers: { apikey: secret, Authorization: `Bearer ${secret}`, 'User-Agent': 'alert-fallback/1.0' },
+    })
+    if (!res.ok) throw new Error(`read ${UNDELIVERABLE.key} -> HTTP ${res.status}`)
+    const rows = await res.json()
+    const row = Array.isArray(rows) ? rows[0] : null
+    if (!row) return { withdrawn: false, reason: 'never filed' }
+    if (row.state !== 'open' && row.state !== 'acknowledged') return { withdrawn: false, reason: `already ${row.state}` }
+
+    await deliverToBoard({
+      ...UNDELIVERABLE,
+      kind: 'incident',
+      severity: 'info',
+      needs_human: false,
+      state: 'resolved',
+      title: 'The monitor can email you again',
+      summary:
+        `The hourly monitor delivered "${subject || 'an email'}", which proves the mail server is reachable again. ` +
+        'The earlier "could not email you" entry is withdrawn: whatever the mail could not tell you then has ' +
+        'either been sent since or is on this board as its own row. This cleared without anyone doing anything.',
+      link: runUrl || 'https://cockpit.predivo.ch/signals',
+    }, { secret, fetchImpl })
+    log(`Mail is flowing again: resolved the open ${UNDELIVERABLE.source}/${UNDELIVERABLE.key} signal on the board.`)
+    return { withdrawn: true }
+  } catch (e) {
+    const msg = e?.message ?? String(e)
+    errorLog(`::warning::the mail went out, but the board could not be told that "could not email you" is over: ${msg}`)
+    return { withdrawn: false, reason: 'error', error: msg }
+  }
+}
+
+/**
  * Send, and if the send fails, make the failure audible somewhere that still works.
  *
  * ALWAYS RETHROWS when the mail did not go out. The step must stay red: "we filed it on the
  * board" is a consolation, not a success, and a green step here would mean the next run's dedup
  * treats a never-delivered alert as delivered.
  *
+ * On SUCCESS it also withdraws any open "could not email you" row (see withdrawUndeliverable):
+ * a delivered mail is the only evidence that the fault that row describes is over.
+ *
  * @param send      () => Promise<any>  the actual sendMail call
  * @param context   what to say if it fails (see buildUndeliverableSignal)
  * @param deps      { secret, fetchImpl, log, errorLog } — injected for tests
- * @returns { delivered: 'smtp' } on success
+ * @returns { delivered: 'smtp', withdrawal } on success
  */
 export async function sendOrEscalate(send, context, deps = {}) {
   const { secret, fetchImpl, log = console.log, errorLog = console.error } = deps
+  let r
   try {
-    const r = await send()
-    return { delivered: 'smtp', result: r }
+    r = await send()
   } catch (sendErr) {
     const safe = redactSecrets(sendErr?.message ?? sendErr, context.secrets ?? [])
     const body = buildUndeliverableSignal({ ...context, error: safe })
@@ -367,4 +433,8 @@ export async function sendOrEscalate(send, context, deps = {}) {
     err.escalated = boardError === null
     throw err
   }
+  const withdrawal = await withdrawUndeliverable({
+    secret, fetchImpl, log, errorLog, subject: context?.subject, runUrl: context?.runUrl,
+  })
+  return { delivered: 'smtp', result: r, withdrawal }
 }

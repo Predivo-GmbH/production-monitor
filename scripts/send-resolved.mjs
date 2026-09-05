@@ -1,5 +1,6 @@
 import { createMailTransport } from './lib/smtp.mjs'
 import { execSync } from 'child_process'
+import { sendOrEscalate } from './lib/alert-fallback.mjs'
 
 const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, ALERT_EMAIL, GITHUB_RUN_URL } = process.env
 
@@ -89,18 +90,40 @@ const html = `
   </div>
 `
 
-const transporter = await createMailTransport({
-  host: SMTP_HOST,
-  port: SMTP_PORT,
-  user: SMTP_USER,
-  pass: SMTP_PASS,
-})
+const subject = forceSend ? '[TEST] Resolution email — notification path check' : '[RESOLVED] All tests passing again'
 
-await transporter.sendMail({
-  from: `Production Monitor <${SMTP_USER}>`,
-  to: ALERT_EMAIL,
-  subject: forceSend ? '[TEST] Resolution email — notification path check' : '[RESOLVED] All tests passing again',
-  html,
-})
+// Guarded the same way as send-alert.mjs, and for the same two reasons. A resolution mail that
+// dies on a refused login used to die in this log only; now it is filed on the board. And a
+// resolution mail that GOES OUT is the first proof that the mail server is back, so the success
+// path withdraws the "could not email you" row the failed run before it filed — on 2026-09-05
+// that row stayed CRITICAL + needs_human for a server that delivered this very email at 08:19:56Z.
+// The transport is built INSIDE the guarded call: it pins the MX A record, so DNS/connect
+// failures throw there, before sendMail is ever reached.
+await sendOrEscalate(
+  async () => {
+    const transporter = await createMailTransport({
+      host: SMTP_HOST,
+      port: SMTP_PORT,
+      user: SMTP_USER,
+      pass: SMTP_PASS,
+    })
+    return transporter.sendMail({
+      from: `Production Monitor <${SMTP_USER}>`,
+      to: ALERT_EMAIL,
+      subject,
+      html,
+    })
+  },
+  {
+    subject,
+    failures: [],
+    runUrl: GITHUB_RUN_URL,
+    smtpHost: SMTP_HOST,
+    smtpUser: SMTP_USER,
+    // The password is never wanted in a log or on the board; an SMTP server can echo it back.
+    secrets: [SMTP_PASS],
+  },
+  { secret: process.env.BOARD_SUPABASE_SECRET || process.env.BACKOFFICE_SERVICE_ROLE_KEY },
+)
 
 console.log(`Resolution email sent to ${ALERT_EMAIL}`)

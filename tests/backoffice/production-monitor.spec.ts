@@ -100,18 +100,15 @@ test.describe('BackOffice — Production Monitor', () => {
         try {
           await expect(otpGroup).toBeVisible({ timeout: 30_000 })
         } catch {
-          test.skip(true, `OTP rate limit cooldown too long (${errText}) — skipping`)
-          return
+          skipOrStand('BackOffice', `OTP rate limit cooldown too long (${errText}) — skipping`)
         }
       } else {
         // Non-rate-limit error (user not found, etc.) — skip
-        test.skip(true, `OTP request failed: ${errText}`)
-        return
+        skipOrStand('BackOffice', `OTP request failed: ${errText}`)
       }
     } else if (result === 'timeout') {
       // Neither OTP group nor error appeared — skip
-      test.skip(true, 'OTP form did not respond within 20s')
-      return
+      skipOrStand('BackOffice', 'OTP form did not respond within 20s')
     }
 
     // 5. Read OTP email from IMAP (may fail due to Supabase email delivery delays)
@@ -125,8 +122,7 @@ test.describe('BackOffice — Production Monitor', () => {
       if (err instanceof MailboxUnreachableError) {
         throw new Error(describeOtpFailure(err, 'BackOffice'))
       }
-      test.skip(true, 'OTP email not delivered within 90s — mailbox was readable, email never arrived (Supabase SMTP delay)')
-      return
+      skipOrStand('BackOffice', 'OTP email not delivered within 90s — mailbox was readable, email never arrived (Supabase SMTP delay)')
     }
     expect(email.otp, 'Email should contain a 6-digit OTP code').toBeTruthy()
     expect(email.otp).toMatch(/^\d{6}$/)
@@ -157,8 +153,7 @@ test.describe('BackOffice — Production Monitor', () => {
       expiredAlert.waitFor({ timeout: 30_000 }).then(() => 'expired' as const),
     ]).catch(() => 'timeout' as const)
     if (outcome === 'expired') {
-      test.skip(true, 'OTP code rejected as expired/invalid — Supabase SMTP delivery latency, not a code bug')
-      return
+      skipOrStand('BackOffice', 'OTP code rejected as expired/invalid — Supabase SMTP delivery latency, not a code bug')
     }
     if (outcome === 'timeout') {
       throw new Error('OTP entered but no redirect and no error within 30s — possible auth outage')
@@ -188,8 +183,7 @@ test.describe('BackOffice — Production Monitor', () => {
       error = retry.error
     }
     if (isRateLimited(error)) {
-      test.skip(true, 'Rate limited — skipping email link test this run')
-      return
+      skipOrStand('BackOffice', 'Rate limited — skipping email link test this run')
     }
     expect(error, `signInWithOtp failed: ${error?.message}`).toBeNull()
 
@@ -204,8 +198,7 @@ test.describe('BackOffice — Production Monitor', () => {
       if (err instanceof MailboxUnreachableError) {
         throw new Error(describeOtpFailure(err, 'BackOffice'))
       }
-      test.skip(true, 'OTP email not delivered within 90s — mailbox was readable, email never arrived (Supabase SMTP delay)')
-      return
+      skipOrStand('BackOffice', 'OTP email not delivered within 90s — mailbox was readable, email never arrived (Supabase SMTP delay)')
     }
 
     // 4. If there's a confirmation link, verify it doesn't 404

@@ -896,6 +896,12 @@ jobs:
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           GH_TOKEN: ${{ github.token }}
           FORCE_RESOLVED_EMAIL: ${{ inputs.force_resolved_email }}
+          # Two jobs for one credential: (1) if THIS mail fails, the failure is filed on the board
+          # instead of dying in a log (sendOrEscalate, same as the alert step above); (2) if it
+          # succeeds, the open "could not email you" row from the failed run before it is withdrawn.
+          # 2026-09-05: the resolution mail went out at 08:19:58Z and that row stayed CRITICAL +
+          # needs_human on the board for a mail server that had been answering for 13 minutes.
+          BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
 
       # Dead-man's-switch: ping healthchecks.io on every successful run. If this monitor
       # ever stops firing (GitHub disables the cron on repo inactivity, runner never starts),
