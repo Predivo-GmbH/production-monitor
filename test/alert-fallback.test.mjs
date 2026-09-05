@@ -200,8 +200,9 @@ await t('a successful send files nothing: with no open "could not email you" row
 //
 // 2026-09-05: send-alert.mjs filed alert-email-undeliverable (CRITICAL, needs_human) at 08:06Z when
 // the runner could not route to the mail host; the next run's resolution mail was DELIVERED at
-// 08:19:56Z and the row stayed open, paging for a server that was answering. Nothing wrote
-// `resolved` because nothing here ever had.
+// 08:19:56Z and the row stayed open until the board-drainer on the laptop closed it at 08:23:46Z
+// after its own live SMTP probe. Nothing in this repo wrote `resolved` because nothing here ever had;
+// the producer that proved delivery is the one that should take the row back.
 
 /** A board whose read returns `row` and records every write body. */
 const boardWith = (row, opts = {}) => {

@@ -328,14 +328,17 @@ export async function deliverToBoard(body, { secret, fetchImpl = fetch, url = SI
 /**
  * Take back the "could not email you" row once a mail has actually gone out.
  *
- * A signal filed by this file had no way home. On 2026-09-05 07:38Z the runner lost its route
- * to the mail host, send-alert.mjs filed `alert-email-undeliverable` as CRITICAL + needs_human at
- * 08:06Z, and at 08:19:58Z the very next run's resolution email was delivered — proof the server
- * was reachable again — while the row stayed open on the board, paging for a fault that was
- * already over. Every neighbouring sensor resolves its own rows on recovery (check-products-down
- * resolved `products-down:host:80.74.145.155` in that same run); this one did not, because
- * nothing here ever wrote `resolved`. A delivered mail IS the recovery, so this runs after every
- * successful send.
+ * A signal filed by this file had no way home from HERE. On 2026-09-05 07:38Z the runner lost its
+ * route to the mail host, send-alert.mjs filed `alert-email-undeliverable` as CRITICAL + needs_human
+ * at 08:06:44Z, and at 08:19:56Z the very next run's resolution email was delivered — proof the
+ * server was reachable again — while the row stayed open. It was closed at 08:23:46Z, but by the
+ * board-drainer on the laptop, after it ran its OWN live SMTP login probe: a second machine
+ * re-proving what the mail log already held, four minutes later, with paging meanwhile suppressed
+ * only because the key had flapped before. Every neighbouring sensor resolves its own rows on
+ * recovery (check-products-down resolved `products-down:host:80.74.145.155` in that same run);
+ * this one did not, because nothing in this repo ever wrote `resolved`. A delivered mail IS the
+ * recovery, so this runs after every successful send — the producer takes its own row back, in
+ * the run that proved it, without depending on a sweeper elsewhere.
  *
  * Only an OPEN or ACKNOWLEDGED row is touched: re-posting `resolved` on a settled row every hour
  * would re-stamp it and pollute the self-resolved tile (the fleet-signal.mjs readSignal rule).

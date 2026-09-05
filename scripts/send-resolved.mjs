@@ -96,7 +96,8 @@ const subject = forceSend ? '[TEST] Resolution email — notification path check
 // dies on a refused login used to die in this log only; now it is filed on the board. And a
 // resolution mail that GOES OUT is the first proof that the mail server is back, so the success
 // path withdraws the "could not email you" row the failed run before it filed — on 2026-09-05
-// that row stayed CRITICAL + needs_human for a server that delivered this very email at 08:19:56Z.
+// that row stayed CRITICAL + needs_human for four minutes after this very email was delivered at
+// 08:19:56Z, until the board-drainer on the laptop re-proved the server with its own SMTP probe.
 // The transport is built INSIDE the guarded call: it pins the MX A record, so DNS/connect
 // failures throw there, before sendMail is ever reached.
 await sendOrEscalate(

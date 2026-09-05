@@ -899,8 +899,9 @@ jobs:
           # Two jobs for one credential: (1) if THIS mail fails, the failure is filed on the board
           # instead of dying in a log (sendOrEscalate, same as the alert step above); (2) if it
           # succeeds, the open "could not email you" row from the failed run before it is withdrawn.
-          # 2026-09-05: the resolution mail went out at 08:19:58Z and that row stayed CRITICAL +
-          # needs_human on the board for a mail server that had been answering for 13 minutes.
+          # 2026-09-05: the resolution mail was delivered at 08:19:56Z and that row stayed CRITICAL +
+          # needs_human until 08:23:46Z, when the board-drainer on the laptop closed it after its own
+          # live SMTP probe — a second machine re-proving what this step's own send had already shown.
           BOARD_SUPABASE_SECRET: ${{ secrets.BACKOFFICE_SERVICE_ROLE_KEY }}
 
       # Dead-man's-switch: ping healthchecks.io on every successful run. If this monitor
