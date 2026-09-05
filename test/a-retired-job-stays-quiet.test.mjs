@@ -69,6 +69,11 @@ const RETIRED = [
     job: 'KB Phase0 Daily',
     why: 'Phase 0 completed and documented 2026-08-27; the scheduled task was disabled on purpose.',
   },
+  {
+    check: 'knowledge-apply-loop',
+    job: 'KB Apply Loop Daily',
+    why: 'Proposal-writing switched off by Roger 2026-09-02 (913 proposals since 13 Aug, zero ever approved or applied - the output had no consumer). The scheduled task "KB Apply Loop Daily" is disabled on LAPTOP-88N97BGG and write_proposals.py refuses even by hand. See BackOffice/knowledge-apply/config.json (switched_off) and DECISION-kb-apply-suggestion-writing-switched-off-2026-09-02.md. A stray ping on 2026-09-03 un-paused the check and, with the task disabled, it could never recover, so it stuck DOWN and paged over a retired job; re-paused 2026-09-05. Turn-back-on is Roger\'s alone.',
+  },
 ]
 
 let n = 0
