@@ -10,3 +10,4 @@ heartbeat-findings.json
 ci-runner-findings.json
 mailer-findings.json
 ci-budget-findings.json
+machine-persistence-findings.json
